@@ -36,8 +36,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 SCRIPT_VERSION = "2.1"
 # Separate from SCRIPT_VERSION so feature releases can bump the script version
@@ -288,6 +290,54 @@ def write_map_layout(path, tile_w, tile_h, zoom=18, line_width=6):
     )
 
 
+def retime_samples(clip_samples, clip_fps, clip_durations, offset, grid_dur):
+    """Re-time per-clip GPS samples onto the CONCATENATED grid timeline.
+
+    Pure arithmetic/filtering extracted from build_map_tile so it can be tested
+    in isolation. Given each clip's already-extracted samples (dicts carrying
+    frame_index/lat/lon and optional speed_mps/heading), that clip's fps, and its
+    already-resolved duration, place every sample at
+    time = (sum of prior clip durations) + frame_index/fps -- minus the trim
+    `offset` pre-applied to clip 0's concat -- and drop anything outside the
+    [0, grid_dur] window. The first/last known positions are then held out to the
+    window edges (the tail pad runs slightly long so vstack's shortest=1 trims
+    the map to the cameras, never the reverse).
+
+    `clip_samples`, `clip_fps` and `clip_durations` are parallel lists (one entry
+    per clip). Returns the re-timed sample list, or [] if nothing lands in-window.
+    Times are datetimes anchored to a fixed base epoch (their spacing is what
+    matters downstream, not the absolute value).
+    """
+    base = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    retimed = []
+    concat_start = -offset  # clip 0 was pre-trimmed by `offset` in the concat
+    for samples, fps, dur in zip(clip_samples, clip_fps, clip_durations):
+        for s in samples:
+            ct = concat_start + s["frame_index"] / fps
+            if ct < -0.001 or ct > grid_dur + 0.001:
+                continue  # outside the trim window
+            retimed.append({
+                "lat": s["lat"], "lon": s["lon"],
+                "speed_mps": s.get("speed_mps"), "heading": s.get("heading"),
+                "time": base + timedelta(seconds=max(0.0, ct)),
+            })
+        concat_start += dur
+
+    if not retimed:
+        return []
+
+    # Hold the first/last known position out to the window edges so the rendered
+    # map spans the whole grid (the car sat still where SEI is absent). The tail
+    # pad runs slightly long so vstack's shortest=1 trims the map to the cameras,
+    # never the other way round.
+    if (retimed[0]["time"] - base).total_seconds() > 0.05:
+        retimed.insert(0, {**retimed[0], "time": base})
+    if grid_dur - (retimed[-1]["time"] - base).total_seconds() > 0.05:
+        retimed.append({**retimed[-1],
+                        "time": base + timedelta(seconds=grid_dur + 0.5)})
+    return retimed
+
+
 def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
                    venv_py, gopro_script, font, zoom, mag, out_path, tmpdir, dry_run):
     """Build the live route-map tile from the car's GPS. Returns out_path, or
@@ -342,21 +392,12 @@ def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
         return out_path
 
     log("== [--map] extracting GPS + re-timing onto grid timeline ==")
-    base = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    retimed = []
-    concat_start = -offset  # clip 0 was pre-trimmed by `offset` in the concat
+    # Gather each clip's samples/fps/duration (the ffmpeg/tesla_gps side effects),
+    # then hand the plain data to retime_samples for the pure re-timing math.
+    clip_samples, clip_fps, clip_durs = [], [], []
     for idx, clip in enumerate(source_clips):
-        samples = tesla_gps.extract_samples(str(clip), ffmpeg, ffprobe)
-        fps = tesla_gps.probe_fps(str(clip), ffprobe)
-        for s in samples:
-            ct = concat_start + s["frame_index"] / fps
-            if ct < -0.001 or ct > grid_dur + 0.001:
-                continue  # outside the trim window
-            retimed.append({
-                "lat": s["lat"], "lon": s["lon"],
-                "speed_mps": s.get("speed_mps"), "heading": s.get("heading"),
-                "time": base + timedelta(seconds=max(0.0, ct)),
-            })
+        clip_samples.append(tesla_gps.extract_samples(str(clip), ffmpeg, ffprobe))
+        clip_fps.append(tesla_gps.probe_fps(str(clip), ffprobe))
         dur = probe_duration(ffprobe, clip)
         if dur is None:
             # Never silently add 0 -- that would shift every later clip's GPS
@@ -369,22 +410,14 @@ def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
             dur = (there - here).total_seconds() if (here and there) else 60.0
             log(f"WARNING: [--map] could not probe {Path(clip).name}; estimating "
                 f"{dur:.1f}s to keep the map in sync.")
-        concat_start += dur
+        clip_durs.append(dur)
+
+    retimed = retime_samples(clip_samples, clip_fps, clip_durs, offset, grid_dur)
 
     if not retimed:
         log("== [--map] the selected clips carry no GPS/SEI telemetry -- skipping "
             "map tile; the grid is built without it ==")
         return None
-
-    # Hold the first/last known position out to the window edges so the rendered
-    # map spans the whole grid (the car sat still where SEI is absent). The tail
-    # pad runs slightly long so vstack's shortest=1 trims the map to the cameras,
-    # never the other way round.
-    if (retimed[0]["time"] - base).total_seconds() > 0.05:
-        retimed.insert(0, {**retimed[0], "time": base})
-    if grid_dur - (retimed[-1]["time"] - base).total_seconds() > 0.05:
-        retimed.append({**retimed[-1],
-                        "time": base + timedelta(seconds=grid_dur + 0.5)})
 
     tesla_gps.write_gpx(retimed, str(gpx_path), track_name="Tesla route",
                         tz=timezone.utc)
@@ -740,9 +773,9 @@ def parse_trim(value, session_start):
     if ":" in value:
         try:
             h, m, s = (int(x) for x in value.split(":"))
+            trim_dt = session_start.replace(hour=h, minute=m, second=s, microsecond=0)
         except ValueError:
             die(f"Could not read '{value}' as a time. Use HH:MM:SS or a number of seconds.")
-        trim_dt = session_start.replace(hour=h, minute=m, second=s, microsecond=0)
         offset = (trim_dt - session_start).total_seconds()
         if offset < 0:
             die(f"--trim value {value} is before the session start "
@@ -812,7 +845,7 @@ def report_gap(ffprobe, clips, out_path, offset, duration, session_start):
     return drift
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("folder", type=Path, help="Tesla event folder containing the *-<angle>.mp4 clips")
     ap.add_argument("--output-dir", type=Path, default=None, help="default: same as input folder")
@@ -864,19 +897,41 @@ def main():
                     help="rebuild the per-camera concats even if matching ones already exist")
     ap.add_argument("--skip-space-check", action="store_true", help="don't pre-flight free disk space")
     ap.add_argument("--dry-run", action="store_true", help="print the ffmpeg commands without running them")
-    args = ap.parse_args()
+    return ap
 
-    t_job = time.monotonic()
-    stats = {"concat_s": 0.0, "grid_s": 0.0, "reused": 0, "built": 0,
-             "blur_s": 0.0, "blurred": 0, "blur_reused": 0, "map_s": 0.0}
 
-    folder = args.folder.resolve()
-    if not folder.is_dir():
-        die(f"Not a folder: {folder}")
-    out_dir = (args.output_dir or folder).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    session_name = folder.name
+@dataclass
+class Tools:
+    """Resolved external tool paths + label/blur/map capability flags for one run."""
+    ffmpeg: str
+    ffprobe: str
+    has_text: bool
+    font: Optional[str]
+    deface_bin: Optional[str] = None
+    map_venv_py: Optional[Path] = None
+    map_gopro: Optional[Path] = None
+    map_font: Optional[str] = None
 
+
+@dataclass
+class Plan:
+    """The job plan: discovered clips, per-camera selections, source dims and the
+    burned-in-clock epoch -- everything the build phases need after setup."""
+    folder: Path
+    out_dir: Path
+    session_name: str
+    by_angle: Dict[str, list]
+    session_start: datetime
+    n_clips: int
+    in_bytes: int
+    selections: Dict[str, tuple]              # angle -> (sel_paths, offset, duration)
+    dims: Dict[str, Tuple[int, int]]          # angle -> (w, h) from SOURCE clips
+    epoch: int
+
+
+def setup_tools(args) -> Tools:
+    """Discover ffmpeg/ffprobe and the optional deface/gopro tooling, and validate
+    the flags that gate them. Dies (via die()) on anything missing or out of range."""
     ffmpeg, has_drawtext = find_ffmpeg()
     sibling_ffprobe = Path(ffmpeg).parent / "ffprobe"
     ffprobe = str(sibling_ffprobe) if sibling_ffprobe.exists() else shutil.which("ffprobe")
@@ -885,16 +940,16 @@ def main():
     has_text = has_drawtext and not args.no_labels
     font = find_font() if has_text else None
 
-    deface_bin = None
+    tools = Tools(ffmpeg=ffmpeg, ffprobe=ffprobe, has_text=has_text, font=font)
+
     if args.blur_faces:
-        deface_bin = find_deface()
-        if not deface_bin:
+        tools.deface_bin = find_deface()
+        if not tools.deface_bin:
             die("--blur-faces needs the `deface` tool, which isn't installed.\n"
                 "Install it with:  python3 -m pip install deface\n"
                 "(CPU-only works -- no GPU required; the first run downloads a ~36MB "
                 "face-detection model.)")
 
-    map_venv_py = map_gopro = map_font = None
     if args.map:
         script_dir = Path(__file__).resolve().parent
         map_venv_py, map_gopro, map_missing = find_map_tooling(script_dir)
@@ -909,8 +964,17 @@ def main():
         if not 1.0 <= args.map_mag <= 4.0:
             die(f"--map-mag {args.map_mag} is out of range; use 1.0 (off) to 4.0. "
                 f"Higher magnifies more (tighter) but softer.")
-        map_font = find_map_font()
+        tools.map_venv_py, tools.map_gopro = map_venv_py, map_gopro
+        tools.map_font = find_map_font()
 
+    return tools
+
+
+def plan_job(args, tools: Tools, folder: Path, out_dir: Path,
+             session_name: str) -> Plan:
+    """Discover clips, apply the feature/trim validation, probe source dims, and
+    pre-flight the disk-space estimate. Returns everything the build phases need."""
+    ffprobe = tools.ffprobe
     by_angle, session_start = discover_clips(folder)
     n_clips = sum(len(v) for v in by_angle.values())
     in_bytes = sum(p.stat().st_size for v in by_angle.values() for _, p in v)
@@ -939,16 +1003,16 @@ def main():
 
     # Work out the clip selection per angle up front, so the space estimate and
     # the plan reflect the trim rather than the whole session.
-    plan = {}
+    selections = {}
     for angle, clips in by_angle.items():
         sel, off, dur = select_clips(ffprobe, clips, session_start, trim_start, trim_end)
-        plan[angle] = (sel, off, dur)
+        selections[angle] = (sel, off, dur)
     if trim_start is not None or trim_end is not None:
-        any_sel = next(iter(plan.values()))[0]
+        any_sel = next(iter(selections.values()))[0]
         log(f"Trim window selects {len(any_sel)} of {len(next(iter(by_angle.values())))} "
             f"clips per camera")
 
-    _, _, sample_dur = next(iter(plan.values()))
+    _, _, sample_dur = next(iter(selections.values()))
     grid_rows, hero = build_rows([a for a in CAMERA_ANGLES if a in dims], args.feature)
     est_dims = dims
     if args.map:
@@ -964,9 +1028,9 @@ def main():
         fit_dims(probe_w, probe_h, args.max_dim)
         if hw_fit_scale(probe_w, probe_h, args.max_dim) else (probe_w, probe_h))
 
-    sel_bytes = sum(p.stat().st_size for sel, _, _ in plan.values() for p in sel)
-    est_seconds = sample_dur if sample_dur else 60.0 * max(len(s) for s, _, _ in plan.values())
-    est = sel_bytes * (min(1.0, est_seconds / (60.0 * max(len(s) for s, _, _ in plan.values())))
+    sel_bytes = sum(p.stat().st_size for sel, _, _ in selections.values() for p in sel)
+    est_seconds = sample_dur if sample_dur else 60.0 * max(len(s) for s, _, _ in selections.values())
+    est = sel_bytes * (min(1.0, est_seconds / (60.0 * max(len(s) for s, _, _ in selections.values())))
                        if sample_dur else 1.0)
     est += auto_bitrate(est_w, est_h) * est_seconds / 8
     if args.blur_faces:
@@ -977,142 +1041,162 @@ def main():
     if not args.dry_run:
         check_space(out_dir, est, args.skip_space_check)
 
-    cache = load_cache(out_dir)
+    return Plan(folder=folder, out_dir=out_dir, session_name=session_name,
+                by_angle=by_angle, session_start=session_start, n_clips=n_clips,
+                in_bytes=in_bytes, selections=selections, dims=dims, epoch=epoch)
+
+
+def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
+                     stats: dict, tmpdir: Path):
+    """Concat each camera's clips (reusing cached concats), optionally blur faces,
+    and record per-camera clock drift. Mutates `cache`/`stats`, saves the cache,
+    and returns (angle_paths, drifts)."""
+    ffmpeg, ffprobe = tools.ffmpeg, tools.ffprobe
+    out_dir, session_name = plan.out_dir, plan.session_name
+    angle_paths = {}
     drifts = {}
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmpdir = Path(tmp)
-
-        angle_paths = {}
-        for angle, (sel, off, dur) in plan.items():
-            out_path = out_dir / f"{session_name}_{angle}_combined.mp4"
-            key = concat_key(sel, off, dur)
-            cached = cache.get(out_path.name)
-            fresh = (not args.force_concat and cached == key and out_path.exists()
-                     and probe_duration(ffprobe, out_path) is not None)
-            if fresh:
-                log(f"\n== {angle}: reusing existing concat ({len(sel)} clips) ==")
-                stats["reused"] += 1
-            else:
-                log(f"\n== concatenating {angle} ({len(sel)} clips) ==")
-                t0 = time.monotonic()
-                concat_angle(ffmpeg, ffprobe, sel, off, dur, out_path, tmpdir, args.dry_run)
-                stats["concat_s"] += time.monotonic() - t0
-                stats["built"] += 1
-                if not args.dry_run:
-                    cache[out_path.name] = key
-
-            # Anonymize faces on the FULL-RES per-camera concat, then feed the
-            # blurred copy into the grid so the composite inherits the blurring
-            # too. Detecting on the full-res source (rather than the downscaled
-            # grid, where each tile is small) is what makes the detection work.
-            source_path = out_path
-            if args.blur_faces:
-                blur_path = out_dir / f"{session_name}_{angle}_blurred.mp4"
-                bkey = blur_key(key, args.blur_mode, args.blur_thresh, args.blur_scale)
-                bcached = cache.get(blur_path.name)
-                bfresh = (not args.force_concat and bcached == bkey and blur_path.exists()
-                          and probe_duration(ffprobe, blur_path) is not None)
-                if bfresh:
-                    log(f"== {angle}: reusing existing blurred video ==")
-                    stats["blur_reused"] += 1
-                else:
-                    log(f"== blurring faces in {angle} (deface re-encode -- slow) ==")
-                    t0 = time.monotonic()
-                    deface_video(deface_bin, out_path, blur_path, args.blur_mode,
-                                 args.blur_thresh, args.blur_scale, args.dry_run)
-                    stats["blur_s"] += time.monotonic() - t0
-                    stats["blurred"] += 1
-                    if not args.dry_run:
-                        cache[blur_path.name] = bkey
-                source_path = blur_path
-            angle_paths[angle] = source_path
-
-            if not args.dry_run:
-                d = report_gap(ffprobe, sel, out_path, off, dur, session_start)
-                if d is not None:
-                    drifts[angle] = d
-
-        if not args.dry_run:
-            save_cache(out_dir, cache)
-
-        # The grid's layout math must match the ACTUAL files it stacks. Concat is
-        # a stream copy so dims are unchanged, but deface re-encodes and its
-        # encoder rounds each dimension UP to a macroblock multiple (e.g.
-        # 1876 -> 1888), which would break the pad/scale math built from the
-        # source-clip dims. Re-probe the real inputs here. (Skipped under
-        # --dry-run, where these files don't exist yet and the source dims are
-        # the best available estimate for printing the plan.)
-        if not args.dry_run:
-            dims = {a: probe_dims(ffprobe, p) for a, p in angle_paths.items()}
-
-        # Build the optional live route-map tile and slot it in beside the back
-        # camera. GPS comes from the ORIGINAL front source clips (SEI lives in
-        # the source bitstream, not the concat/blurred outputs); the tile is
-        # sized to match the back camera so the pair hstacks cleanly.
-        if args.map:
-            t0 = time.monotonic()
-            map_source = "front" if "front" in plan else next(iter(plan))
-            src_sel, src_off, _ = plan[map_source]
-            src_concat = out_dir / f"{session_name}_{map_source}_combined.mp4"
-            grid_dur = (probe_duration(ffprobe, src_concat)
-                        if not args.dry_run else plan[map_source][2]) or 60.0
-            map_dims = dims.get("back") or dims.get(map_source) or (1280, 960)
-            # Persist the tile (not tmpdir): it's the slowest new step, it's a
-            # useful standalone artifact, and it survives a later grid-encode failure.
-            map_out = out_dir / f"{session_name}_maptile.mp4"
-            built = build_map_tile(src_sel, src_off, grid_dur, map_dims, ffmpeg,
-                                   ffprobe, map_venv_py, map_gopro, map_font,
-                                   args.map_zoom, args.map_mag, map_out, tmpdir,
-                                   args.dry_run)
-            stats["map_s"] += time.monotonic() - t0
-            if built is not None:
-                angle_paths[MAP_TILE_KEY] = built
-                dims[MAP_TILE_KEY] = map_dims
-
-        if len(angle_paths) < 2:
-            log("\nOnly one camera angle found -- skipping grid, per-angle concat above is the "
-                "final output.")
-            return
-
-        filter_text, input_order, final_w, final_h = build_filter(
-            dims, angle_paths, has_text, font, epoch, args.max_dim, args.native,
-            args.speed, args.feature
-        )
-        filter_path = tmpdir / "grid.filter"
-        filter_path.write_text(filter_text)
-        log(f"\n== filter graph ==\n{filter_text}\n")
-        log(f"final canvas: {final_w}x{final_h}")
-
-        cmd = [ffmpeg, "-y"]
-        for p in input_order:
-            cmd += ["-i", str(p)]
-        cmd += ["-filter_complex_script", str(filter_path), "-map", "[out]"]
-
-        needs_software = args.native and (final_w > args.max_dim or final_h > args.max_dim)
-        if needs_software:
-            log("WARNING: --native exceeds the hardware encoder's limit -- falling back to slow "
-                "software encoding (libx264). Expect this to take a while.")
-            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    for angle, (sel, off, dur) in plan.selections.items():
+        out_path = out_dir / f"{session_name}_{angle}_combined.mp4"
+        key = concat_key(sel, off, dur)
+        cached = cache.get(out_path.name)
+        fresh = (not args.force_concat and cached == key and out_path.exists()
+                 and probe_duration(ffprobe, out_path) is not None)
+        if fresh:
+            log(f"\n== {angle}: reusing existing concat ({len(sel)} clips) ==")
+            stats["reused"] += 1
         else:
-            cmd += ["-c:v", "h264_videotoolbox", "-b:v", str(auto_bitrate(final_w, final_h))]
+            log(f"\n== concatenating {angle} ({len(sel)} clips) ==")
+            t0 = time.monotonic()
+            concat_angle(ffmpeg, ffprobe, sel, off, dur, out_path, tmpdir, args.dry_run)
+            stats["concat_s"] += time.monotonic() - t0
+            stats["built"] += 1
+            if not args.dry_run:
+                cache[out_path.name] = key
 
-        suffix = "" if args.feature == "front" else f"_feature-{args.feature}"
-        suffix += "_blurred" if args.blur_faces else ""
-        suffix += "_map" if MAP_TILE_KEY in angle_paths else ""
-        out_grid = out_dir / f"{session_name}_grid{suffix}.mp4"
-        cmd += ["-an", "-movflags", "+faststart", str(out_grid)]
+        # Anonymize faces on the FULL-RES per-camera concat, then feed the
+        # blurred copy into the grid so the composite inherits the blurring
+        # too. Detecting on the full-res source (rather than the downscaled
+        # grid, where each tile is small) is what makes the detection work.
+        source_path = out_path
+        if args.blur_faces:
+            blur_path = out_dir / f"{session_name}_{angle}_blurred.mp4"
+            bkey = blur_key(key, args.blur_mode, args.blur_thresh, args.blur_scale)
+            bcached = cache.get(blur_path.name)
+            bfresh = (not args.force_concat and bcached == bkey and blur_path.exists()
+                      and probe_duration(ffprobe, blur_path) is not None)
+            if bfresh:
+                log(f"== {angle}: reusing existing blurred video ==")
+                stats["blur_reused"] += 1
+            else:
+                log(f"== blurring faces in {angle} (deface re-encode -- slow) ==")
+                t0 = time.monotonic()
+                deface_video(tools.deface_bin, out_path, blur_path, args.blur_mode,
+                             args.blur_thresh, args.blur_scale, args.dry_run)
+                stats["blur_s"] += time.monotonic() - t0
+                stats["blurred"] += 1
+                if not args.dry_run:
+                    cache[blur_path.name] = bkey
+            source_path = blur_path
+        angle_paths[angle] = source_path
 
-        log(f"\n== building grid -> {out_grid} ==")
+        if not args.dry_run:
+            d = report_gap(ffprobe, sel, out_path, off, dur, plan.session_start)
+            if d is not None:
+                drifts[angle] = d
+
+    if not args.dry_run:
+        save_cache(out_dir, cache)
+    return angle_paths, drifts
+
+
+def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
+               stats: dict, tmpdir: Path):
+    """Re-probe real input dims, build the optional map tile, assemble the filter
+    graph and encode the grid. Returns (out_grid, final_w, final_h), or None if
+    there's only one angle (no grid built)."""
+    ffmpeg, ffprobe = tools.ffmpeg, tools.ffprobe
+    out_dir, session_name = plan.out_dir, plan.session_name
+
+    # The grid's layout math must match the ACTUAL files it stacks. Concat is
+    # a stream copy so dims are unchanged, but deface re-encodes and its
+    # encoder rounds each dimension UP to a macroblock multiple (e.g.
+    # 1876 -> 1888), which would break the pad/scale math built from the
+    # source-clip dims. Re-probe the real inputs here. (Skipped under
+    # --dry-run, where these files don't exist yet and the source dims are
+    # the best available estimate for printing the plan.)
+    dims = dict(plan.dims)
+    if not args.dry_run:
+        dims = {a: probe_dims(ffprobe, p) for a, p in angle_paths.items()}
+
+    # Build the optional live route-map tile and slot it in beside the back
+    # camera. GPS comes from the ORIGINAL front source clips (SEI lives in
+    # the source bitstream, not the concat/blurred outputs); the tile is
+    # sized to match the back camera so the pair hstacks cleanly.
+    if args.map:
         t0 = time.monotonic()
-        run(cmd, args.dry_run, what="ffmpeg (grid)")
-        stats["grid_s"] = time.monotonic() - t0
+        map_source = "front" if "front" in plan.selections else next(iter(plan.selections))
+        src_sel, src_off, _ = plan.selections[map_source]
+        src_concat = out_dir / f"{session_name}_{map_source}_combined.mp4"
+        grid_dur = (probe_duration(ffprobe, src_concat)
+                    if not args.dry_run else plan.selections[map_source][2]) or 60.0
+        map_dims = dims.get("back") or dims.get(map_source) or (1280, 960)
+        # Persist the tile (not tmpdir): it's the slowest new step, it's a
+        # useful standalone artifact, and it survives a later grid-encode failure.
+        map_out = out_dir / f"{session_name}_maptile.mp4"
+        built = build_map_tile(src_sel, src_off, grid_dur, map_dims, ffmpeg,
+                               ffprobe, tools.map_venv_py, tools.map_gopro, tools.map_font,
+                               args.map_zoom, args.map_mag, map_out, tmpdir,
+                               args.dry_run)
+        stats["map_s"] += time.monotonic() - t0
+        if built is not None:
+            angle_paths[MAP_TILE_KEY] = built
+            dims[MAP_TILE_KEY] = map_dims
 
-    if args.dry_run:
-        log("\nDry run -- nothing was written.")
-        return
+    if len(angle_paths) < 2:
+        log("\nOnly one camera angle found -- skipping grid, per-angle concat above is the "
+            "final output.")
+        return None
 
-    # ---- stats ----
+    filter_text, input_order, final_w, final_h = build_filter(
+        dims, angle_paths, tools.has_text, tools.font, plan.epoch, args.max_dim,
+        args.native, args.speed, args.feature
+    )
+    filter_path = tmpdir / "grid.filter"
+    filter_path.write_text(filter_text)
+    log(f"\n== filter graph ==\n{filter_text}\n")
+    log(f"final canvas: {final_w}x{final_h}")
+
+    cmd = [ffmpeg, "-y"]
+    for p in input_order:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex_script", str(filter_path), "-map", "[out]"]
+
+    needs_software = args.native and (final_w > args.max_dim or final_h > args.max_dim)
+    if needs_software:
+        log("WARNING: --native exceeds the hardware encoder's limit -- falling back to slow "
+            "software encoding (libx264). Expect this to take a while.")
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    else:
+        cmd += ["-c:v", "h264_videotoolbox", "-b:v", str(auto_bitrate(final_w, final_h))]
+
+    suffix = "" if args.feature == "front" else f"_feature-{args.feature}"
+    suffix += "_blurred" if args.blur_faces else ""
+    suffix += "_map" if MAP_TILE_KEY in angle_paths else ""
+    out_grid = out_dir / f"{session_name}_grid{suffix}.mp4"
+    cmd += ["-an", "-movflags", "+faststart", str(out_grid)]
+
+    log(f"\n== building grid -> {out_grid} ==")
+    t0 = time.monotonic()
+    run(cmd, args.dry_run, what="ffmpeg (grid)")
+    stats["grid_s"] = time.monotonic() - t0
+    return out_grid, final_w, final_h
+
+
+def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
+                angle_paths: dict, out_grid: Path, final_w: int, final_h: int,
+                t_job: float) -> None:
+    """Print the final STATS block (sizes, timings, and any clock-drift note)."""
+    ffprobe = tools.ffprobe
     elapsed = time.monotonic() - t_job
     out_bytes = sum(p.stat().st_size for p in [out_grid] + list(angle_paths.values())
                     if p.exists())
@@ -1120,7 +1204,7 @@ def main():
     log("\n" + "=" * 60)
     log("STATS")
     log("=" * 60)
-    log(f"  input            {n_clips} clips, {human_bytes(in_bytes)}")
+    log(f"  input            {plan.n_clips} clips, {human_bytes(plan.in_bytes)}")
     log(f"  output           {human_bytes(out_bytes)} "
         f"(grid {human_bytes(out_grid.stat().st_size)} @ {final_w}x{final_h})")
     log(f"  footage          {human_time(grid_dur)} of combined video")
@@ -1149,5 +1233,44 @@ def main():
     log("=" * 60)
 
 
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.speed <= 0:
+        die(f"--speed {args.speed} is out of range; use a positive multiplier "
+            f"(e.g. 1 for normal, 2 for 2x, 0.5 for half speed).")
+
+    t_job = time.monotonic()
+    stats = {"concat_s": 0.0, "grid_s": 0.0, "reused": 0, "built": 0,
+             "blur_s": 0.0, "blurred": 0, "blur_reused": 0, "map_s": 0.0}
+
+    folder = args.folder.resolve()
+    if not folder.is_dir():
+        die(f"Not a folder: {folder}")
+    out_dir = (args.output_dir or folder).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    session_name = folder.name
+
+    tools = setup_tools(args)
+    plan = plan_job(args, tools, folder, out_dir, session_name)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        cache = load_cache(out_dir)
+        angle_paths, drifts = build_per_camera(args, tools, plan, cache, stats, tmpdir)
+        result = build_grid(args, tools, plan, angle_paths, stats, tmpdir)
+        if result is None:
+            return 0
+        out_grid, final_w, final_h = result
+
+    if args.dry_run:
+        log("\nDry run -- nothing was written.")
+        return 0
+
+    print_stats(args, tools, plan, stats, drifts, angle_paths, out_grid,
+                final_w, final_h, t_job)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
