@@ -82,6 +82,17 @@ python3.12 -m venv .venv
 The `--map` feature looks for `gopro-dashboard.py` inside `./.venv` and downloads
 OpenStreetMap tiles on first use (so it needs network access).
 
+### Running the tests
+
+The tools themselves are stdlib-only; only the test suite needs a dependency:
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest
+```
+
+CI runs the suite on every push (Python 3.9 and 3.12).
+
 ---
 
 ## Usage

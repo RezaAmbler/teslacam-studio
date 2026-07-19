@@ -1,0 +1,6 @@
+# Development dependencies (tests only).
+# The tools themselves (tesla_combine.py, tesla_gps.py) are stdlib-only and
+# need nothing from this file to run — install this only to run the test suite:
+#   python3 -m pip install -r requirements-dev.txt
+#   python3 -m pytest
+pytest>=8,<9
