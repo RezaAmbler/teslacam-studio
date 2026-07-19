@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# gopro-overlay virtualenv — recreate with:
+#   python3.12 -m venv .venv && ./.venv/bin/python -m pip install gopro-overlay
+.venv/
+
+# tesla_combine cache + generated media (never commit footage)
+.tesla_combine_cache.json
+*.mp4
+*.gpx
+*.csv
+
+# macOS
+.DS_Store
