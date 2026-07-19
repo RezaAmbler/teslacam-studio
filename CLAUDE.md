@@ -1,6 +1,8 @@
-# CLAUDE.md — teslacam-studio
+# CLAUDE.md
 
-Guidance for Claude Code working in this repo. See `README.md` for the user-facing docs.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Guidance for Claude Code working in teslacam-studio. See `README.md` for the user-facing docs.
 
 ## What this is
 A macOS tool that combines a Tesla Sentry/Dashcam event folder (6 per-camera
