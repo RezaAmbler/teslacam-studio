@@ -4,6 +4,8 @@ Turn a Tesla **Sentry / Dashcam** event folder into a single, labeled multi-came
 grid video — with a burned-in wall clock, optional face blurring, and an optional
 **live GPS route-map tile** built from the telemetry Tesla embeds in the footage.
 
+![teslacam-studio — six-camera grid with a burned-in clock and a live GPS route map (faces/plates blurred for privacy)](docs/example.jpg)
+
 Tesla saves each camera as its own ~1-minute clip. teslacam-studio stitches them
 per-camera, then composites them into one grid you can actually watch — front
 featured large, repeaters and pillars paired, back paired with a moving map that
