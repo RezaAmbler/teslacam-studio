@@ -441,10 +441,33 @@ def ffprobe_json(ffprobe, args):
         return None
 
 
+def looks_tesla_encrypted(path):
+    """True if the clip lacks an ISO-BMFF ftyp box -- the signature of Tesla's
+    'Encrypt Dashcam Recordings' output, which is opaque ciphertext."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return False
+    return len(head) == 12 and head[4:8] != b"ftyp"
+
+
+TESLA_ENCRYPTED_HINT = (
+    'This clip appears to be Tesla-encrypted ("Encrypt Dashcam Recordings" is ON '
+    "in the car). Decrypt clips at https://dashcam.tesla.com or in the car's "
+    "Dashcam app (select clips, then the padlock button), or turn encryption off: "
+    "Controls > Safety > Encrypt Dashcam Recordings. For batch decryption see "
+    "https://github.com/XGxF3/tesla-dashcam-decrypt. See -README_en.txt in the "
+    "clip folder."
+)
+
+
 def probe_dims(ffprobe, path):
     d = ffprobe_json(ffprobe, ["-select_streams", "v:0",
                                "-show_entries", "stream=width,height", str(path)])
     if not d or not d.get("streams"):
+        if looks_tesla_encrypted(path):
+            die(f"Could not read {path}\n{TESLA_ENCRYPTED_HINT}")
         die(f"Could not read video dimensions from {path} -- is it a valid mp4?")
     s = d["streams"][0]
     return s["width"], s["height"]
