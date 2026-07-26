@@ -114,6 +114,26 @@ def find_ffprobe(ffmpeg: str | None = None) -> str:
 # Low-level bitstream parsing
 # --------------------------------------------------------------------------
 
+def looks_tesla_encrypted(clip_path: str) -> bool:
+    """True if the clip lacks an ISO-BMFF ftyp box -- the signature of Tesla's
+    'Encrypt Dashcam Recordings' output, which is opaque ciphertext."""
+    try:
+        with open(clip_path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return False
+    return len(head) == 12 and head[4:8] != b"ftyp"
+
+
+TESLA_ENCRYPTED_HINT = (
+    'clip appears to be Tesla-encrypted ("Encrypt Dashcam Recordings" is ON in '
+    "the car). Decrypt clips at https://dashcam.tesla.com or in the car's "
+    "Dashcam app (select clips, then the padlock button), or turn encryption "
+    "off: Controls > Safety > Encrypt Dashcam Recordings. For batch decryption "
+    "see https://github.com/XGxF3/tesla-dashcam-decrypt."
+)
+
+
 def _demux_h264(clip_path: str, ffmpeg: str) -> bytes:
     """Return the clip's raw annex-b H.264 elementary stream."""
     proc = subprocess.run(
@@ -121,6 +141,8 @@ def _demux_h264(clip_path: str, ffmpeg: str) -> bytes:
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if proc.returncode != 0:
+        if looks_tesla_encrypted(clip_path):
+            raise RuntimeError(f"{clip_path}: {TESLA_ENCRYPTED_HINT}")
         raise RuntimeError(
             f"ffmpeg demux failed for {clip_path}: "
             f"{proc.stderr.decode('utf-8', 'replace').strip()}"
@@ -710,7 +732,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.probe:
-        _cmd_probe(folder, ffmpeg)
+        try:
+            _cmd_probe(folder, ffmpeg)
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         return 0
 
     clips = list_clips(folder, args.camera)
@@ -723,9 +749,13 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = None if args.no_telemetry else os.path.join(
         folder, f"{os.path.basename(folder)}_telemetry.csv")
     print(f"Extracting telemetry from {len(clips)} '{args.camera}' clips...")
-    result = build_gpx(clips, ffmpeg, ffprobe, out_path,
-                       track_name=f"{os.path.basename(folder)} ({args.camera})",
-                       csv_path=csv_path, tz=tz)
+    try:
+        result = build_gpx(clips, ffmpeg, ffprobe, out_path,
+                           track_name=f"{os.path.basename(folder)} ({args.camera})",
+                           csv_path=csv_path, tz=tz)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
     samples = result["samples"]
     if not samples:

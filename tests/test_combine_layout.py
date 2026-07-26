@@ -246,3 +246,25 @@ def test_retime_head_and_tail_edge_hold():
     assert times[-1] == pytest.approx(60.5)  # tail edge-hold
     # head/tail padding copies the nearest known position
     assert out[0]["lat"] == out[1]["lat"]
+
+
+# --- looks_tesla_encrypted ---------------------------------------------------
+
+def test_encrypted_sniff_real_mp4_header(tmp_path):
+    p = tmp_path / "clip.mp4"
+    p.write_bytes(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 16)
+    assert tc.looks_tesla_encrypted(p) is False
+
+
+def test_encrypted_sniff_ciphertext(tmp_path):
+    p = tmp_path / "clip.mp4"
+    # real header captured from an encrypted TeslaCam clip: no ftyp box
+    p.write_bytes(bytes.fromhex("0000000002f67870da22124fe6a3a5ba") + b"\x00" * 16)
+    assert tc.looks_tesla_encrypted(p) is True
+
+
+def test_encrypted_sniff_short_or_missing_file(tmp_path):
+    short = tmp_path / "short.mp4"
+    short.write_bytes(b"\x00\x00")
+    assert tc.looks_tesla_encrypted(short) is False   # too short to judge
+    assert tc.looks_tesla_encrypted(tmp_path / "nope.mp4") is False
