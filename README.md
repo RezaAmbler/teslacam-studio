@@ -27,7 +27,10 @@ traces where you drove.
 - **Hardware-accelerated** H.264 encode (Apple VideoToolbox), with automatic
   scale-to-fit so the output stays on the hardware decode path.
 - **Caching** — per-camera concats are cached; re-running with different grid
-  options doesn't re-stitch.
+  options doesn't re-stitch. Ctrl-C is safe: the half-written file is removed and
+  the finished cameras are reused on the next run.
+- **Live progress** — one display for the whole job: which step of how many is
+  running, how far into it, and an ETA for the run as a whole (below).
 
 ## How the GPS map works
 
@@ -51,6 +54,31 @@ python3 tesla_gps.py /path/to/clips --probe
 
 If a folder has no telemetry, `--map` prints a notice and builds the grid without
 the map — nothing breaks.
+
+## Watching a long run
+
+A six-camera session with `--blur-faces --map` can run for hours, so the tool
+plans the work up front and reports against that plan:
+
+```
+Plan: 14 steps (6 concat, 6 blur, map GPS, map render, grid) | ~31m 50s of footage per camera
+
+[ 3/14] blur faces front         ████████░░░░░░░░  38%  ETA 22m 40s
+        job                      ███░░░░░░░░░░░░░  11%  elapsed 6m 12s · ETA ~1h 48m
+```
+
+Nothing there is a guess from a timer — the percentages come from ffmpeg's own
+progress stream and `deface`'s frame counter. The job ETA starts from rough
+per-step estimates and **re-calibrates from measured throughput** as steps
+finish, so it settles quickly (after the first camera's blur, the other five are
+predicted from that measurement).
+
+- Press **Ctrl-T** (macOS/BSD) at any time to print where the run is.
+- Press **Ctrl-C** to stop: the incomplete output file is deleted, and re-running
+  the same command picks up from the cameras already finished.
+- Piping to a file switches to a plain progress line every ~15s (no escape codes).
+- `--verbose` shows every command and the raw ffmpeg/deface output instead —
+  what you want when something fails and you need to watch it happen.
 
 ---
 
@@ -136,6 +164,8 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--map-mag` | Magnify beyond OSM's limit, 1.0–4.0 (default 2.0; 1 = off) |
 | `--native` | True native resolution (slow software encode) |
 | `--output-dir` | Where outputs go (default: next to the input folder) |
+| `-v` / `--verbose` | Full ffmpeg/deface output instead of the progress display |
+| `--no-progress` | Plain progress lines, no live redraw (automatic when piped) |
 | `--dry-run` | Print ffmpeg commands, do nothing |
 
 ## Input

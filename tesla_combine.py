@@ -19,7 +19,13 @@ Usage:
     python3 tesla_combine.py /path/to/event/folder --map      # add a live GPS route-map tile (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --map --map-mag 3   # tighter, navigation-style map view
     python3 tesla_combine.py /path/to/event/folder --map --map-mag 1 --map-zoom 16  # wider, sharper (e.g. highway)
+    python3 tesla_combine.py /path/to/event/folder --verbose  # raw ffmpeg/deface output instead of the progress display
     python3 tesla_combine.py /path/to/event/folder --dry-run  # print commands, do nothing
+
+While it runs, a two-line display shows which step of how many is going, how far
+into it, and an ETA for the whole job. Ctrl-T prints that status on demand;
+Ctrl-C stops cleanly (the half-written output is removed and the cameras already
+finished are cached, so re-running resumes).
 
 Output (written next to the input folder unless --output-dir is given):
     <session>_<angle>_combined.mp4   -- one lossless concat per camera angle
@@ -29,9 +35,11 @@ Output (written next to the input folder unless --output-dir is given):
 """
 
 import argparse
+import collections
 import json
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-SCRIPT_VERSION = "2.1"
+SCRIPT_VERSION = "2.2"
 # Separate from SCRIPT_VERSION so feature releases can bump the script version
 # without invalidating every cached per-camera concat (concat semantics are
 # unchanged). Bump this ONLY when the concat output itself would change.
@@ -85,14 +93,25 @@ MAP_FONT_CANDIDATES = [
 ]
 
 
+# The live progress display, if one is running. log()/die() consult it so an
+# ordinary log line never lands on top of a half-drawn bar.
+_PROGRESS = None
+
+
 def log(msg=""):
     # flush: when stdout is a pipe or a file rather than a terminal, Python
     # block-buffers it, so a long run prints nothing until it finishes --
     # exactly when progress no longer helps.
+    if _PROGRESS is not None:
+        _PROGRESS.clear()
     print(msg, flush=True)
+    if _PROGRESS is not None:
+        _PROGRESS.restore()
 
 
 def die(msg):
+    if _PROGRESS is not None:
+        _PROGRESS.close()
     print(f"\nERROR: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
 
@@ -112,6 +131,383 @@ def human_time(sec):
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+# --- progress reporting -------------------------------------------------------
+# Stdlib only, deliberately: this script has no third-party dependencies and a
+# progress bar isn't worth adding tqdm/rich for. Nothing here is timer-guesswork --
+# every fraction comes from output the child tools already emit (ffmpeg's
+# `-progress pipe:1` key=value stream, deface's tqdm frame counter, or, for the
+# GPS pass, our own loop counter).
+
+@dataclass
+class Step:
+    """One unit of work in the job plan. `work` is in seconds of footage (output
+    seconds for the grid), the unit every rate below is relative to."""
+    kind: str        # concat | blur | map_gps | map_render | map_scale | grid
+    label: str
+    work: float
+
+
+# Throughput priors in footage-seconds per wall-clock second, used only until a
+# step of that kind finishes and reports its real rate. Ballpark figures from a
+# 6-camera, ~32-clips-per-camera run on Apple silicon with the footage on an
+# external SSD; being wrong here only makes the first ETA rough.
+RATE_PRIORS = {
+    "concat": 7.0,       # stream copy, I/O bound
+    "blur": 0.6,         # deface CPU face detection -- the slow one
+    "map_gps": 5.0,      # demux + SEI decode, per clip
+    "map_render": 1.0,   # gopro-overlay route render
+    "map_scale": 8.0,    # small libx264 upscale pass
+    "grid": 2.0,         # VideoToolbox hardware encode
+}
+KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "map GPS",
+               "map_render": "map render", "map_scale": "map upscale", "grid": "grid"}
+BAR_FULL, BAR_EMPTY = "█", "░"
+BAR_FULL_ASCII, BAR_EMPTY_ASCII = "#", "-"
+LABEL_W = 26
+
+
+class Progress:
+    """A job-wide progress display: one line for the running step, one for the
+    whole job.
+
+    The job ETA is adaptive. Each step is costed as work/rate[kind], and a kind's
+    rate is replaced by the measured one as soon as the first step of that kind
+    finishes -- the six per-camera blurs are near-identical, so the estimate
+    settles after the first of them rather than staying on a guess for an hour.
+
+    Rendering degrades in two steps: a redrawn two-line display on a terminal, a
+    plain appended line every 5%/15s when stdout is a pipe or a log file, and
+    nothing at all under --verbose (where the child tools' own output is doing
+    the talking).
+    """
+
+    def __init__(self, steps, stream=None, ansi=None, verbose=False,
+                 now=time.monotonic):
+        self.steps = list(steps)
+        self.state = ["pending"] * len(self.steps)
+        self.stream = stream if stream is not None else sys.stdout
+        self.verbose = verbose
+        if ansi is None:
+            ansi = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.ansi = bool(ansi) and not verbose
+        self.now = now
+        self.rates = dict(RATE_PRIORS)
+        self.i = -1
+        self.frac = 0.0
+        self.speed = None
+        self.determinate = True
+        self.out = None           # file the running step is writing, if any
+        self.closed = False
+        self.t_job = now()
+        self.t_step = self.t_job
+        self.drawn = 0            # lines currently on screen
+        self.last_draw = 0.0
+        self.last_plain = 0.0
+        self.plain_frac = -1.0
+        uni = self._supports_unicode()
+        self.full = BAR_FULL if uni else BAR_FULL_ASCII
+        self.empty = BAR_EMPTY if uni else BAR_EMPTY_ASCII
+        self.sep = "·" if uni else "|"
+        self.cut = "…" if uni else "~"
+
+    # -- plan/cost math --------------------------------------------------------
+
+    def _supports_unicode(self):
+        """Block-drawing characters unless the stream can't encode them (writing
+        one that it can't would raise mid-render and kill the run)."""
+        enc = getattr(self.stream, "encoding", None) or "ascii"
+        try:
+            (BAR_FULL + BAR_EMPTY + "·…").encode(enc)
+        except (LookupError, UnicodeEncodeError):
+            return False
+        return True
+
+    def _cost(self, step):
+        return step.work / max(1e-6, self.rates.get(step.kind, 1.0))
+
+    def remaining(self):
+        """Estimated wall-clock seconds left in the whole job."""
+        rem = sum(self._cost(s) for j, s in enumerate(self.steps)
+                  if self.state[j] == "pending")
+        if 0 <= self.i < len(self.steps) and self.state[self.i] == "running":
+            cost = self._cost(self.steps[self.i])
+            spent = self.now() - self.t_step
+            rem += max(0.0, cost * (1.0 - self.frac) if self.determinate
+                       else cost - spent)
+        return rem
+
+    def job_fraction(self):
+        elapsed = self.now() - self.t_job
+        rem = self.remaining()
+        return elapsed / (elapsed + rem) if elapsed + rem > 0 else 0.0
+
+    def _advance(self, kind, label, work=0.0):
+        """Move to the next pending step of `kind`. Falls back to appending one so
+        an unplanned step (or a plan/execution mismatch) still displays."""
+        for j in range(self.i + 1, len(self.steps)):
+            if self.steps[j].kind == kind and self.state[j] == "pending":
+                self.i = j
+                if label:
+                    self.steps[j].label = label
+                return
+        self.steps.append(Step(kind, label or kind, work))
+        self.state.append("pending")
+        self.i = len(self.steps) - 1
+
+    # -- step lifecycle --------------------------------------------------------
+
+    def begin(self, kind, label, work=0.0, determinate=True, out=None):
+        """Start a step. `out` is the file it is writing, remembered so an
+        interrupted run can clean up the half-written thing it leaves behind."""
+        self._advance(kind, label, work)
+        self.state[self.i] = "running"
+        self.out = out
+        self.frac, self.speed, self.determinate = 0.0, None, determinate
+        self.t_step = self.now()
+        self.plain_frac = -1.0
+        if self.verbose:
+            log(f"\n== [{self.i + 1}/{len(self.steps)}] {label} ==")
+        else:
+            self.redraw(force=True)
+
+    def update(self, frac=None, speed=None):
+        if frac is not None:
+            # Totals can be estimates; never let a step sit at a smug 100% while
+            # it's still running, and never go backwards.
+            self.frac = max(self.frac, min(0.999, max(0.0, frac)))
+        if speed is not None:
+            self.speed = speed
+        self.redraw()
+
+    def indeterminate(self):
+        """Give up on a percentage for this step and show elapsed time instead --
+        for a tool that turned out not to report anything we can parse."""
+        self.determinate = False
+
+    def end(self, work=None):
+        """Finish the running step. `work` corrects the amount of work it turned
+        out to be (a probed duration beats an estimate), so the rate learned from
+        it -- and every remaining ETA -- is based on what really happened."""
+        if self.i < 0:
+            return
+        step = self.steps[self.i]
+        if work:
+            step.work = work
+        spent = self.now() - self.t_step
+        # Recalibrate this kind's rate from what actually happened. Anything
+        # shorter than a blink is too noisy to learn from, and a rate that high
+        # rounds the rest of that kind down to free anyway.
+        if spent > 0.25 and step.work > 0:
+            self.rates[step.kind] = min(10_000.0, step.work / spent)
+        self.state[self.i] = "done"
+        self.frac = 1.0
+        self.out = None
+        if not self.verbose:
+            # The finished step scrolls away as a one-liner, so the run leaves a
+            # readable history of what took how long.
+            rate = (f" ({step.work / spent:.1f}x realtime)"
+                    if self.determinate and step.work > 0 and spent > 0.25 else "")
+            log(f"[{self.i + 1}/{len(self.steps)}] {step.label} -- done in "
+                f"{human_time(spent)}{rate}")
+
+    def rescale_pending(self, ratio):
+        """Apply a correction factor to every step not yet started. The footage
+        estimate is shared by every camera, so one measured concat fixes the lot.
+        Absurd ratios are ignored -- they'd mean the estimate wasn't comparable."""
+        if not 0.1 < ratio < 10.0:
+            return
+        for j, s in enumerate(self.steps):
+            if self.state[j] == "pending":
+                s.work *= ratio
+
+    def abandon(self, *kinds):
+        """Silently drop every pending step of these kinds -- work the run has
+        just determined will never happen (e.g. no GPS, so no map to render)."""
+        for j, s in enumerate(self.steps):
+            if s.kind in kinds and self.state[j] == "pending":
+                self.state[j] = "skipped"
+
+    def skip(self, kind, label, message):
+        """Mark a planned step as not needed (a cache hit), dropping its weight
+        from the job estimate so the ETA reflects the work actually left."""
+        self._advance(kind, label)
+        self.state[self.i] = "skipped"
+        log(f"[{self.i + 1}/{len(self.steps)}] {message}")
+
+    # -- rendering -------------------------------------------------------------
+
+    def _bar(self, frac, width):
+        filled = int(round(max(0.0, min(1.0, frac)) * width))
+        return self.full * filled + self.empty * (width - filled)
+
+    def _lines(self, width):
+        """The display as a list of strings -- kept separate from the writing so
+        it can be tested without a terminal."""
+        step = self.steps[self.i]
+        head = f"[{self.i + 1:>2}/{len(self.steps)}] "
+        label = (step.label if len(step.label) <= LABEL_W
+                 else step.label[:LABEL_W - 1] + self.cut)
+        spent = self.now() - self.t_step
+        if self.determinate:
+            speed = f"  {self.speed:.1f}x" if self.speed else ""
+            eta = self._step_eta(spent)
+            tail = f" {int(self.frac * 100):3d}%{speed}  ETA {eta}"
+        else:
+            tail = f"  {human_time(spent)} elapsed"
+        job_tail = (f" {int(self.job_fraction() * 100):3d}%  elapsed "
+                    f"{human_time(self.now() - self.t_job)} {self.sep} "
+                    f"ETA ~{human_eta(self.remaining())}")
+
+        # Fit to the terminal by giving up the least useful thing first: the
+        # label's padding, then the bar. The numbers on the right are the point of
+        # the display, so they never get truncated away on a narrow window.
+        avail = max(0, width - len(head) - max(len(tail), len(job_tail)))
+        if avail >= LABEL_W + 9:
+            label_w, bar_w = LABEL_W, min(22, avail - LABEL_W - 1)
+        elif avail >= 23:
+            label_w, bar_w = avail - 11, 10
+        else:
+            label_w, bar_w = avail, 0
+        gap = " " if bar_w else ""
+        label = label[:label_w]
+        step_bar = self._bar(self.frac, bar_w) if self.determinate else " " * bar_w
+        return [
+            f"{head}{label:<{label_w}}{gap}{step_bar}{tail}",
+            f"{' ' * len(head)}{'job':<{label_w}}{gap}"
+            f"{self._bar(self.job_fraction(), bar_w)}{job_tail}",
+        ]
+
+    def _step_eta(self, spent):
+        if self.frac <= 0.01:
+            return "--"
+        return human_eta(spent * (1.0 - self.frac) / self.frac)
+
+    def _plain_line(self):
+        step = self.steps[self.i]
+        # Nothing measured yet (a step that just started, or --verbose, where the
+        # child isn't reporting to us at all): elapsed time beats a fake 0%.
+        pct = (f"{int(self.frac * 100)}%" if self.determinate and self.frac > 0
+               else f"{human_time(self.now() - self.t_step)} elapsed")
+        return (f"[{self.i + 1}/{len(self.steps)}] {step.label}  {pct}"
+                f"  {self.sep}  job {int(self.job_fraction() * 100)}%"
+                f" {self.sep} ETA ~{human_eta(self.remaining())}")
+
+    def clear(self):
+        if not self.ansi or not self.drawn:
+            return
+        # Up N lines, then erase everything from here down.
+        self.stream.write(f"\r\x1b[{self.drawn}A\x1b[J")
+        self.stream.flush()
+        self.drawn = 0
+
+    def restore(self):
+        """Redraw after something else printed a line. Only the in-place display
+        needs restoring -- in plain mode, re-printing the same status after every
+        log line is just noise."""
+        if self.ansi:
+            self.redraw(force=True)
+
+    def redraw(self, force=False):
+        if self.closed or self.verbose or self.i < 0 or self.state[self.i] != "running":
+            return
+        t = self.now()
+        if self.ansi:
+            if not force and t - self.last_draw < 0.2:
+                return
+            self.last_draw = t
+            width = shutil.get_terminal_size((100, 24)).columns
+            lines = self._lines(width - 1)
+            self.clear()
+            self.stream.write("".join(line[:width - 1] + "\n" for line in lines))
+            self.stream.flush()
+            self.drawn = len(lines)
+            return
+        # No terminal to redraw in: append a line at most every 15s, or whenever
+        # the step advances another 5%, so piped logs stay readable.
+        if not force and t - self.last_plain < 15.0 and self.frac - self.plain_frac < 0.05:
+            return
+        self.last_plain, self.plain_frac = t, self.frac
+        self.stream.write(self._plain_line() + "\n")
+        self.stream.flush()
+
+    def running_step(self):
+        if 0 <= self.i < len(self.steps) and self.state[self.i] == "running":
+            return self.steps[self.i]
+        return None
+
+    def status_line(self):
+        """One line saying where the run is, for printing on demand (Ctrl-T) --
+        including under --verbose, where there's no bar to look at."""
+        if self.running_step() is None:
+            done = sum(1 for s in self.state if s in ("done", "skipped"))
+            return f"[{done}/{len(self.steps)}] between steps"
+        return self._plain_line()
+
+    def close(self):
+        """The display is done for good -- anything printed from here on is plain
+        output (the STATS block, an interrupt report, an error)."""
+        self.clear()
+        self.closed = True
+
+
+def parse_ffmpeg_progress(line):
+    """One `key=value` line of ffmpeg's `-progress` stream -> (key, value), with
+    the values we care about coerced: out_time_us to seconds, speed to a float.
+    Returns (None, None) for anything unusable (ffmpeg emits 'N/A' early on)."""
+    key, sep, value = line.strip().partition("=")
+    if not sep:
+        return None, None
+    value = value.strip()
+    if key in ("out_time_us", "out_time_ms"):
+        # out_time_ms is misnamed in ffmpeg -- it holds microseconds too.
+        try:
+            return "out_time", int(value) / 1_000_000.0
+        except ValueError:
+            return None, None
+    if key == "out_time":
+        # The same instant again as HH:MM:SS.ffffff. Normalize it to seconds so
+        # every "out_time" this returns is a number, whichever line it came from.
+        try:
+            h, m, s = value.split(":")
+            return "out_time", int(h) * 3600 + int(m) * 60 + float(s)
+        except ValueError:
+            return None, None
+    if key == "speed":
+        try:
+            return "speed", float(value.rstrip("x"))
+        except ValueError:
+            return None, None
+    return key, value
+
+
+TQDM_COUNT_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*\[")
+
+
+def parse_tqdm_fraction(text):
+    """Pull a completed fraction out of a tqdm bar such as
+    ` 12%|###  | 5500/45800 [01:23<10:11, 66.0it/s]` (deface's progress).
+    Returns None when the chunk holds no counter."""
+    m = None
+    for m in TQDM_COUNT_RE.finditer(text):
+        pass  # the last match in the chunk is the most recent update
+    if not m:
+        return None
+    done, total = int(m.group(1)), int(m.group(2))
+    if total <= 0:
+        return None
+    return min(1.0, done / total)
+
+
+def human_eta(sec):
+    """Coarser than human_time, for estimates: an ETA of "1h 09m 47s" is false
+    precision, and the seconds field churns distractingly while you watch it."""
+    if sec < 600:
+        return human_time(sec)
+    minutes = int(round(sec / 60.0))
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
 def build_rows(present_angles, feature):
@@ -168,15 +564,135 @@ def inject_map_row(rows, hero_angles=()):
     return rows
 
 
-def run(cmd, dry_run=False, what="ffmpeg"):
-    printable = " ".join(f"'{c}'" if " " in c else c for c in cmd)
-    log(f"$ {printable}")
-    if dry_run:
+def printable_cmd(cmd):
+    return " ".join(f"'{c}'" if " " in c else c for c in cmd)
+
+
+def run(cmd, dry_run=False, what="ffmpeg", progress=None, total=None):
+    """Run a child tool, dying with its own error text if it fails.
+
+    Without an active `progress` (so: --verbose, --dry-run, or any caller that
+    doesn't track progress) this is the original path -- echo the command, let the
+    child write straight to the terminal.
+
+    With one, the child goes quiet so it can't scribble over the progress display,
+    and drives it instead:
+      * `total` given -> an ffmpeg command; ask it for a `-progress` stream and
+        track the output time against `total` seconds;
+      * `total` None  -> some other tool; track elapsed time only.
+    Quiet never means silent on failure: the tail of the child's captured output
+    is printed before dying.
+    """
+    if progress is None or progress.verbose or dry_run:
+        log(f"$ {printable_cmd(cmd)}")
+        if dry_run:
+            return
+        r = subprocess.run(cmd)
+        if r.returncode != 0:
+            die(f"{what} failed with exit code {r.returncode}. Its own output is above -- "
+                f"that message usually says exactly what went wrong.")
         return
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        die(f"{what} failed with exit code {r.returncode}. Its own output is above -- "
-            f"that message usually says exactly what went wrong.")
+
+    if total is not None:
+        cmd = [cmd[0], "-nostdin", "-loglevel", "error", "-nostats",
+               "-progress", "pipe:1"] + list(cmd[1:])
+        _run_ffmpeg_tracked(cmd, what, progress, total)
+    else:
+        _run_tracked(cmd, what, progress)
+
+
+def reap(proc, grace=5.0):
+    """Make sure a child is gone before we are. On Ctrl-C the terminal already
+    sent SIGINT to the whole foreground group, so the child is usually on its way
+    out -- this just waits for it, and insists if it isn't."""
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except Exception:
+        pass
+
+
+def fail_child(cmd, what, code, tail):
+    """Report a child that failed while its output was being captured: the command,
+    the tail of what it printed, then the usual die()."""
+    log(f"$ {printable_cmd(cmd)}")
+    if tail:
+        log("--- last output from " + what + " ---")
+        for line in tail:
+            log(line)
+        log("--- end of output ---")
+    die(f"{what} failed with exit code {code}. Its own output is above -- "
+        f"that message usually says exactly what went wrong. "
+        f"(Re-run with --verbose to watch it live.)")
+
+
+def _run_ffmpeg_tracked(cmd, what, progress, total):
+    """ffmpeg with `-progress pipe:1`: parse the key=value stream off stdout,
+    park stderr in a temp file so a chatty encoder can't fill a pipe and deadlock."""
+    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as errf:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
+                                text=True, bufsize=1)
+        try:
+            for line in proc.stdout:
+                key, value = parse_ffmpeg_progress(line)
+                if key == "out_time" and total > 0:
+                    progress.update(frac=value / total)
+                elif key == "speed":
+                    progress.update(speed=value)
+            code = proc.wait()
+        except KeyboardInterrupt:
+            reap(proc)
+            raise
+        if code != 0:
+            errf.seek(0)
+            fail_child(cmd, what, code, errf.read().splitlines()[-30:])
+
+
+def _run_tracked(cmd, what, progress, parse=None, drop=()):
+    """Run a non-ffmpeg tool with its output captured, optionally deriving a
+    completed fraction from it (deface's tqdm counter). Output arrives in
+    \\r-separated bursts, so read raw chunks rather than lines.
+
+    `drop` lists substrings of lines not worth keeping for the failure tail
+    (progress redraws, known-harmless warnings)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    tail, residual, saw_frac = collections.deque(maxlen=30), "", False
+    t0 = progress.now()
+    while True:
+        try:
+            chunk = proc.stdout.read1(4096)
+        except KeyboardInterrupt:
+            reap(proc)
+            raise
+        if not chunk:
+            break
+        text = residual + chunk.decode("utf-8", "replace")
+        pieces = re.split(r"[\r\n]", text)
+        residual = pieces.pop()
+        if parse is not None:
+            frac = parse(text)
+            if frac is not None:
+                saw_frac = True
+                progress.update(frac=frac)
+        for piece in pieces:
+            piece = piece.strip()
+            if piece and not any(d in piece for d in drop):
+                tail.append(piece)
+        # Some tools report nothing parseable at all; after a grace period stop
+        # pretending we know how far along it is and just show elapsed time.
+        if parse is not None and not saw_frac and progress.now() - t0 > 20:
+            progress.indeterminate()
+        progress.redraw()
+    if residual.strip():
+        tail.append(residual.strip())
+    code = proc.wait()
+    if code != 0:
+        fail_child(cmd, what, code, list(tail))
 
 
 def find_ffmpeg():
@@ -235,7 +751,8 @@ def find_deface():
     return None
 
 
-def deface_video(deface_bin, in_path, out_path, mode, thresh, scale, dry_run):
+def deface_video(deface_bin, in_path, out_path, mode, thresh, scale, dry_run,
+                 progress=None):
     """
     Run deface over one video, writing an anonymized copy. deface detects faces
     per frame (CenterFace net) and replaces each with a blur/solid box/mosaic.
@@ -250,7 +767,14 @@ def deface_video(deface_bin, in_path, out_path, mode, thresh, scale, dry_run):
            "--thresh", str(thresh), "--replacewith", mode]
     if scale:
         cmd += ["--scale", scale]
-    run(cmd, dry_run, what="deface")
+    if progress is None or progress.verbose or dry_run:
+        run(cmd, dry_run, what="deface")
+        return
+    # deface drives a tqdm bar over the frame count, which is an exact progress
+    # source -- better than anything we could estimate. Its own redraws and
+    # imageio's macro-block warning are noise once we're rendering the bar.
+    _run_tracked(cmd, "deface", progress, parse=parse_tqdm_fraction,
+                 drop=("it/s]", "IMAGEIO", "?it/s"))
 
 
 def find_map_tooling(script_dir):
@@ -339,7 +863,8 @@ def retime_samples(clip_samples, clip_fps, clip_durations, offset, grid_dur):
 
 
 def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
-                   venv_py, gopro_script, font, zoom, mag, out_path, tmpdir, dry_run):
+                   venv_py, gopro_script, font, zoom, mag, out_path, tmpdir, dry_run,
+                   progress):
     """Build the live route-map tile from the car's GPS. Returns out_path, or
     None if the selected clips carry no GPS telemetry.
 
@@ -391,11 +916,12 @@ def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
             log(f"$ {printable}")
         return out_path
 
-    log("== [--map] extracting GPS + re-timing onto grid timeline ==")
+    progress.begin("map_gps", "map GPS extract", grid_dur)
     # Gather each clip's samples/fps/duration (the ffmpeg/tesla_gps side effects),
     # then hand the plain data to retime_samples for the pure re-timing math.
     clip_samples, clip_fps, clip_durs = [], [], []
     for idx, clip in enumerate(source_clips):
+        progress.update(frac=idx / max(1, len(source_clips)))
         clip_samples.append(tesla_gps.extract_samples(str(clip), ffmpeg, ffprobe))
         clip_fps.append(tesla_gps.probe_fps(str(clip), ffprobe))
         dur = probe_duration(ffprobe, clip)
@@ -413,10 +939,14 @@ def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
         clip_durs.append(dur)
 
     retimed = retime_samples(clip_samples, clip_fps, clip_durs, offset, grid_dur)
+    progress.end()
 
     if not retimed:
         log("== [--map] the selected clips carry no GPS/SEI telemetry -- skipping "
             "map tile; the grid is built without it ==")
+        # The render/upscale steps will never happen; drop them so the job ETA
+        # stops counting work that isn't coming.
+        progress.abandon("map_render", "map_scale")
         return None
 
     tesla_gps.write_gpx(retimed, str(gpx_path), track_name="Tesla route",
@@ -424,9 +954,17 @@ def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
     log(f"== [--map] rendering route-map tile ({render_w}x{render_h}"
         f"{f' ->{tile_w}x{tile_h} ({mag}x magnified)' if magnifying else ''}, "
         f"{len(retimed)} points) ==")
-    run(gopro_cmd, dry_run=False, what="gopro-dashboard (map tile)")
+    # gopro-overlay's runtime tracks the route, not the footage length, and it
+    # reports no parseable progress -- show elapsed time rather than a fake bar.
+    progress.begin("map_render", "route map render", grid_dur, determinate=False,
+                   out=gopro_out)
+    run(gopro_cmd, dry_run=False, what="gopro-dashboard (map tile)", progress=progress)
+    progress.end()
     if magnifying:
-        run(scale_cmd, dry_run=False, what="ffmpeg (map magnify)")
+        progress.begin("map_scale", f"map upscale ({mag}x)", grid_dur, out=out_path)
+        run(scale_cmd, dry_run=False, what="ffmpeg (map magnify)",
+            progress=progress, total=grid_dur)
+        progress.end()
     return out_path
 
 
@@ -569,6 +1107,34 @@ def select_clips(ffprobe, clips, session_start, trim_start, trim_end):
     return [p for _, p in selected], offset, duration
 
 
+def estimate_concat_seconds(ffprobe, clips, offset, duration):
+    """How many seconds of footage one camera's concat will hold -- the total the
+    progress display measures ffmpeg's output time against.
+
+    With --trim-end the answer is exact. Otherwise, rather than probing every clip
+    (188 of them on a long session, on an external drive), lean on Tesla naming
+    each clip by its wall-clock start: clip i's length is at most the gap to clip
+    i+1's start, capped at the nominal 60s. Only the last clip has no successor,
+    so it costs one probe. Gaps in the recording make this an over-estimate, which
+    a completed concat then corrects (see refine_footage_estimate)."""
+    if duration:
+        return duration
+    if not clips:
+        return 0.0
+    starts = []
+    for c in clips:
+        m = FILENAME_RE.match(Path(c).name)
+        starts.append(datetime.strptime(m.group(1), "%Y-%m-%d_%H-%M-%S") if m else None)
+    total = 0.0
+    for i in range(len(clips) - 1):
+        if starts[i] and starts[i + 1]:
+            total += min(60.0, max(0.0, (starts[i + 1] - starts[i]).total_seconds()))
+        else:
+            total += 60.0
+    total += probe_duration(ffprobe, clips[-1]) or 60.0
+    return max(1.0, total - (offset or 0.0))
+
+
 def load_cache(out_dir):
     p = out_dir / CACHE_FILE
     if not p.exists():
@@ -601,7 +1167,8 @@ def blur_key(concat_k, mode, thresh, scale):
     return {"concat": concat_k, "mode": mode, "thresh": thresh, "scale": scale}
 
 
-def concat_angle(ffmpeg, ffprobe, clips, offset, duration, out_path, tmpdir, dry_run):
+def concat_angle(ffmpeg, ffprobe, clips, offset, duration, out_path, tmpdir, dry_run,
+                 progress=None, total=None):
     """
     Losslessly stitch one camera's ~1-minute clips into a single file, applying
     the trim window during the concat rather than after it -- so pulling 10
@@ -626,13 +1193,14 @@ def concat_angle(ffmpeg, ffprobe, clips, offset, duration, out_path, tmpdir, dry
             cmd += ["-t", str(duration)]
         cmd += ["-i", str(clips[0].resolve()), "-c", "copy",
                 "-movflags", "+faststart", str(out_path)]
-        run(cmd, dry_run, what="ffmpeg (trim)")
+        run(cmd, dry_run, what="ffmpeg (trim)", progress=progress, total=total)
         return
 
     if offset:
         pre = tmpdir / f"{out_path.stem}_pre.mp4"
         run([ffmpeg, "-y", "-ss", str(offset), "-i", str(clips[0].resolve()),
-             "-c", "copy", str(pre)], dry_run, what="ffmpeg (trim first clip)")
+             "-c", "copy", str(pre)], dry_run, what="ffmpeg (trim first clip)",
+            progress=progress)
         clips = [pre] + list(clips[1:])
 
     list_path = tmpdir / f"{out_path.stem}_concat.txt"
@@ -644,7 +1212,7 @@ def concat_angle(ffmpeg, ffprobe, clips, offset, duration, out_path, tmpdir, dry
     if duration:
         cmd += ["-t", str(duration)]
     cmd += ["-i", str(list_path), "-c", "copy", "-movflags", "+faststart", str(out_path)]
-    run(cmd, dry_run, what="ffmpeg (concat)")
+    run(cmd, dry_run, what="ffmpeg (concat)", progress=progress, total=total)
 
 
 def hw_fit_scale(w, h, max_dim):
@@ -919,6 +1487,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--force-concat", action="store_true",
                     help="rebuild the per-camera concats even if matching ones already exist")
     ap.add_argument("--skip-space-check", action="store_true", help="don't pre-flight free disk space")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="show every command and let ffmpeg/deface print in full, instead of "
+                         "the progress display. Use this when something fails and you want to "
+                         "watch it happen.")
+    ap.add_argument("--no-progress", action="store_true",
+                    help="don't redraw a live progress bar; print a plain progress line "
+                         "every so often instead (this is automatic when the output isn't a "
+                         "terminal, e.g. piped to a log file)")
     ap.add_argument("--dry-run", action="store_true", help="print the ffmpeg commands without running them")
     return ap
 
@@ -950,6 +1526,8 @@ class Plan:
     selections: Dict[str, tuple]              # angle -> (sel_paths, offset, duration)
     dims: Dict[str, Tuple[int, int]]          # angle -> (w, h) from SOURCE clips
     epoch: int
+    footage: Dict[str, float]                 # angle -> seconds of footage selected
+    steps: list                               # Step list, in execution order
 
 
 def setup_tools(args) -> Tools:
@@ -1064,13 +1642,46 @@ def plan_job(args, tools: Tools, folder: Path, out_dir: Path,
     if not args.dry_run:
         check_space(out_dir, est, args.skip_space_check)
 
+    footage = {angle: estimate_concat_seconds(ffprobe, sel, off, dur)
+               for angle, (sel, off, dur) in selections.items()}
+    steps = plan_steps(args, selections, footage)
+    kinds = collections.Counter(KIND_LABELS.get(s.kind, s.kind) for s in steps)
+    log(f"Plan: {len(steps)} steps ("
+        + ", ".join(f"{n} {k}" if n > 1 else k for k, n in kinds.items())
+        + f") | ~{human_time(max(footage.values()))} of footage per camera")
+
     return Plan(folder=folder, out_dir=out_dir, session_name=session_name,
                 by_angle=by_angle, session_start=session_start, n_clips=n_clips,
-                in_bytes=in_bytes, selections=selections, dims=dims, epoch=epoch)
+                in_bytes=in_bytes, selections=selections, dims=dims, epoch=epoch,
+                footage=footage, steps=steps)
+
+
+def plan_steps(args, selections, footage):
+    """The ordered list of steps the run will work through, in the order the build
+    phases actually execute them: per camera concat (then its blur), then the map
+    tile, then the grid. Cache hits still appear here -- they're marked skipped
+    when the build finds them, which is also when their weight leaves the ETA."""
+    steps = []
+    for angle in selections:
+        steps.append(Step("concat", f"concat {angle}", footage[angle]))
+        if args.blur_faces:
+            steps.append(Step("blur", f"blur faces {angle}", footage[angle]))
+    if args.map:
+        map_source = "front" if "front" in selections else next(iter(selections))
+        map_work = footage[map_source]
+        steps.append(Step("map_gps", "map GPS extract", map_work))
+        steps.append(Step("map_render", "route map render", map_work))
+        if args.map_mag and args.map_mag != 1.0:
+            steps.append(Step("map_scale", f"map upscale ({args.map_mag}x)", map_work))
+    if len(selections) > 1 or args.map:
+        # The grid encodes the OUTPUT timeline, which --speed has already scaled.
+        steps.append(Step("grid", "grid encode",
+                          max(footage.values()) / max(0.01, args.speed)))
+    return steps
 
 
 def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
-                     stats: dict, tmpdir: Path):
+                     stats: dict, tmpdir: Path, progress: Progress):
     """Concat each camera's clips (reusing cached concats), optionally blur faces,
     and record per-camera clock drift. Mutates `cache`/`stats`, saves the cache,
     and returns (angle_paths, drifts)."""
@@ -1078,21 +1689,35 @@ def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
     out_dir, session_name = plan.out_dir, plan.session_name
     angle_paths = {}
     drifts = {}
+    refined = False   # has a finished concat corrected the footage estimate yet?
     for angle, (sel, off, dur) in plan.selections.items():
         out_path = out_dir / f"{session_name}_{angle}_combined.mp4"
         key = concat_key(sel, off, dur)
         cached = cache.get(out_path.name)
         fresh = (not args.force_concat and cached == key and out_path.exists()
                  and probe_duration(ffprobe, out_path) is not None)
+        footage = plan.footage.get(angle, 0.0)
         if fresh:
-            log(f"\n== {angle}: reusing existing concat ({len(sel)} clips) ==")
+            progress.skip("concat", f"concat {angle}",
+                          f"{angle}: reusing existing concat ({len(sel)} clips)")
             stats["reused"] += 1
         else:
-            log(f"\n== concatenating {angle} ({len(sel)} clips) ==")
+            progress.begin("concat",
+                           f"concat {angle} ({len(sel)} clip{'' if len(sel) == 1 else 's'})",
+                           footage, out=out_path)
             t0 = time.monotonic()
-            concat_angle(ffmpeg, ffprobe, sel, off, dur, out_path, tmpdir, args.dry_run)
+            concat_angle(ffmpeg, ffprobe, sel, off, dur, out_path, tmpdir, args.dry_run,
+                         progress=progress, total=footage)
             stats["concat_s"] += time.monotonic() - t0
             stats["built"] += 1
+            # The concat's real length settles what every later step is working
+            # on: the footage estimate ignores gaps in the recording, and every
+            # camera shares the same gaps.
+            actual = None if args.dry_run else probe_duration(ffprobe, out_path)
+            progress.end(work=actual)
+            if actual and footage > 0 and not refined:
+                refined = True
+                progress.rescale_pending(actual / footage)
             if not args.dry_run:
                 cache[out_path.name] = key
 
@@ -1108,15 +1733,18 @@ def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
             bfresh = (not args.force_concat and bcached == bkey and blur_path.exists()
                       and probe_duration(ffprobe, blur_path) is not None)
             if bfresh:
-                log(f"== {angle}: reusing existing blurred video ==")
+                progress.skip("blur", f"blur faces {angle}",
+                              f"{angle}: reusing existing blurred video")
                 stats["blur_reused"] += 1
             else:
-                log(f"== blurring faces in {angle} (deface re-encode -- slow) ==")
+                progress.begin("blur", f"blur faces {angle}", footage, out=blur_path)
                 t0 = time.monotonic()
                 deface_video(tools.deface_bin, out_path, blur_path, args.blur_mode,
-                             args.blur_thresh, args.blur_scale, args.dry_run)
+                             args.blur_thresh, args.blur_scale, args.dry_run,
+                             progress=progress)
                 stats["blur_s"] += time.monotonic() - t0
                 stats["blurred"] += 1
+                progress.end()
                 if not args.dry_run:
                     cache[blur_path.name] = bkey
             source_path = blur_path
@@ -1126,14 +1754,15 @@ def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
             d = report_gap(ffprobe, sel, out_path, off, dur, plan.session_start)
             if d is not None:
                 drifts[angle] = d
+            # Save after every camera rather than once at the end: a run that gets
+            # interrupted three cameras in should resume from three cameras in.
+            save_cache(out_dir, cache)
 
-    if not args.dry_run:
-        save_cache(out_dir, cache)
     return angle_paths, drifts
 
 
 def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
-               stats: dict, tmpdir: Path):
+               stats: dict, tmpdir: Path, progress: Progress):
     """Re-probe real input dims, build the optional map tile, assemble the filter
     graph and encode the grid. Returns (out_grid, final_w, final_h), or None if
     there's only one angle (no grid built)."""
@@ -1169,7 +1798,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
         built = build_map_tile(src_sel, src_off, grid_dur, map_dims, ffmpeg,
                                ffprobe, tools.map_venv_py, tools.map_gopro, tools.map_font,
                                args.map_zoom, args.map_mag, map_out, tmpdir,
-                               args.dry_run)
+                               args.dry_run, progress)
         stats["map_s"] += time.monotonic() - t0
         if built is not None:
             angle_paths[MAP_TILE_KEY] = built
@@ -1178,6 +1807,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     if len(angle_paths) < 2:
         log("\nOnly one camera angle found -- skipping grid, per-angle concat above is the "
             "final output.")
+        progress.abandon("grid")
         return None
 
     filter_text, input_order, final_w, final_h = build_filter(
@@ -1186,7 +1816,10 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     )
     filter_path = tmpdir / "grid.filter"
     filter_path.write_text(filter_text)
-    log(f"\n== filter graph ==\n{filter_text}\n")
+    # The graph is debugging detail -- worth printing when someone asked to see
+    # the commands, just noise above a progress bar.
+    if progress.verbose:
+        log(f"\n== filter graph ==\n{filter_text}\n")
     log(f"final canvas: {final_w}x{final_h}")
 
     cmd = [ffmpeg, "-y"]
@@ -1209,9 +1842,17 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     cmd += ["-an", "-movflags", "+faststart", str(out_grid)]
 
     log(f"\n== building grid -> {out_grid} ==")
+    # ffmpeg reports the OUTPUT time, which --speed has already scaled, so the
+    # total to measure it against is the source length divided by --speed.
+    grid_seconds = None
+    if not args.dry_run:
+        grid_seconds = probe_duration(ffprobe, next(iter(angle_paths.values())))
+    grid_seconds = (grid_seconds or max(plan.footage.values())) / max(0.01, args.speed)
+    progress.begin("grid", "grid encode", grid_seconds, out=out_grid)
     t0 = time.monotonic()
-    run(cmd, args.dry_run, what="ffmpeg (grid)")
+    run(cmd, args.dry_run, what="ffmpeg (grid)", progress=progress, total=grid_seconds)
     stats["grid_s"] = time.monotonic() - t0
+    progress.end()
     return out_grid, final_w, final_h
 
 
@@ -1256,7 +1897,32 @@ def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
     log("=" * 60)
 
 
+def report_interrupt(args, progress: Progress, out_dir: Path) -> int:
+    """Ctrl-C: say what was in flight, bin the half-written file it was producing,
+    and point out that the finished work is cached. A partial mp4 left lying about
+    is worse than useless -- it looks like a real output, and (for a concat) the
+    next run's cache check would have to notice it isn't."""
+    progress.close()
+    step = progress.running_step()
+    log("")
+    log(f"Interrupted{f' during: {step.label}' if step else ''}.")
+    partial = progress.out
+    if partial is not None and not args.dry_run and Path(partial).exists():
+        try:
+            Path(partial).unlink()
+            log(f"Removed the incomplete {Path(partial).name}.")
+        except OSError as e:
+            log(f"NOTE: could not remove the incomplete {partial} ({e}) -- "
+                f"delete it before re-running.")
+    done = sum(1 for s in progress.state if s in ("done", "skipped"))
+    log(f"{done} of {len(progress.steps)} steps finished. Completed per-camera "
+        f"videos are cached in {out_dir / CACHE_FILE},")
+    log("so re-running the same command resumes rather than starting over.")
+    return 130
+
+
 def main(argv=None) -> int:
+    global _PROGRESS
     args = build_parser().parse_args(argv)
 
     if args.speed <= 0:
@@ -1277,14 +1943,33 @@ def main(argv=None) -> int:
     tools = setup_tools(args)
     plan = plan_job(args, tools, folder, out_dir, session_name)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmpdir = Path(tmp)
-        cache = load_cache(out_dir)
-        angle_paths, drifts = build_per_camera(args, tools, plan, cache, stats, tmpdir)
-        result = build_grid(args, tools, plan, angle_paths, stats, tmpdir)
-        if result is None:
-            return 0
-        out_grid, final_w, final_h = result
+    # --dry-run prints commands rather than running them, so there's nothing to
+    # measure -- it takes the same path as --verbose.
+    progress = Progress(plan.steps, verbose=args.verbose or args.dry_run,
+                        ansi=False if args.no_progress else None)
+    _PROGRESS = progress
+    if hasattr(signal, "SIGINFO"):
+        # macOS/BSD Ctrl-T asks a running program where it's at. Answer it -- it
+        # costs nothing and it's the only status you get under --verbose or when
+        # the output is a log file rather than a terminal.
+        signal.signal(signal.SIGINFO, lambda *_: log(progress.status_line()))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cache = load_cache(out_dir)
+            angle_paths, drifts = build_per_camera(args, tools, plan, cache, stats,
+                                                   tmpdir, progress)
+            result = build_grid(args, tools, plan, angle_paths, stats, tmpdir, progress)
+            if result is None:
+                return 0
+            out_grid, final_w, final_h = result
+    except KeyboardInterrupt:
+        return report_interrupt(args, progress, out_dir)
+    finally:
+        # Leave the terminal in a sane state on Ctrl-C or a crash, not halfway
+        # through a redrawn bar.
+        progress.close()
+        _PROGRESS = None
 
     if args.dry_run:
         log("\nDry run -- nothing was written.")
@@ -1296,4 +1981,10 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Ctrl-C outside a build step (during discovery/probing) -- nothing to
+        # clean up, and a Python traceback would only obscure that.
+        print("\nInterrupted.", file=sys.stderr, flush=True)
+        sys.exit(130)

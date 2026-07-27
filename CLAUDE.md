@@ -65,6 +65,20 @@ burned-in clock, optional face blur, and an optional live GPS route-map overlay.
   map smaller then upscales to fill the tile — tighter/navigation-style but softer.
 - **Design constraint:** cameras are NOT frame-locked on `frame_seq_no` — extract
   GPS from the specific camera being overlaid; don't join cameras on it.
+- **Progress (`Progress`, stdlib only):** the run is planned up front as a list of
+  `Step(kind, label, work)` (`plan_steps`), `work` in footage-seconds. Fractions
+  are never timer guesses — ffmpeg is run with `-progress pipe:1 -loglevel error`
+  and its `out_time` parsed, `deface`'s tqdm counter is regex'd, the GPS pass uses
+  its own loop counter. Job ETA = sum of `work/rate[kind]`, where each kind's rate
+  is replaced by the measured one when the first step of that kind ends
+  (`end(work=...)` also corrects the footage estimate from the probed concat).
+  Quiet-by-default means **children are captured**: `fail_child` must keep printing
+  the tail of that capture, or a failure becomes invisible. `--verbose` restores
+  the old raw-output path; `--dry-run` takes it too.
+- **Interrupts:** Ctrl-C removes the half-written file the running step was
+  producing (`Progress.out`) and reports resumability; the concat cache is saved
+  after *each* camera so that resume is real. Ctrl-T (SIGINFO) prints a status
+  line, which is the only progress you get under `--verbose`.
 - **Conventions:** opt-in feature flags keep default runs lean; `die()`/`log()`/
   `run()` helpers; every path works under `--dry-run`.
 
@@ -81,3 +95,5 @@ burned-in clock, optional face blur, and an optional live GPS route-map overlay.
 - The encode path is macOS/VideoToolbox-specific.
 - `report_gap` reports clock drift from squeezed recording gaps; fixed to work
   under `--trim-end` too.
+- Anything printed mid-run must go through `log()` — it clears and redraws the
+  progress display around the print. A bare `print()` will be scribbled over.
