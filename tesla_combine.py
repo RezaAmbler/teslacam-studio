@@ -274,6 +274,10 @@ class Progress:
 
     def update(self, frac=None, speed=None):
         if frac is not None:
+            # A real number retracts an earlier give-up: a slow starter (deface
+            # spends minutes opening a multi-hour input before its first tqdm
+            # tick) must not be stuck on elapsed-time for the rest of the step.
+            self.determinate = True
             # Totals can be estimates; never let a step sit at a smug 100% while
             # it's still running, and never go backwards.
             self.frac = max(self.frac, min(0.999, max(0.0, frac)))
@@ -1719,7 +1723,11 @@ def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
                 refined = True
                 progress.rescale_pending(actual / footage)
             if not args.dry_run:
+                # Flush as soon as the concat is real, not at the end of the
+                # camera: the blur that follows takes hours, so an interrupt
+                # almost always lands there and would otherwise throw this away.
                 cache[out_path.name] = key
+                save_cache(out_dir, cache)
 
         # Anonymize faces on the FULL-RES per-camera concat, then feed the
         # blurred copy into the grid so the composite inherits the blurring
@@ -1747,6 +1755,7 @@ def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
                 progress.end()
                 if not args.dry_run:
                     cache[blur_path.name] = bkey
+                    save_cache(out_dir, cache)
             source_path = blur_path
         angle_paths[angle] = source_path
 

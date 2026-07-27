@@ -226,6 +226,23 @@ def test_indeterminate_step_shows_elapsed_not_a_percentage():
     assert "%" not in step_line.split("elapsed")[0]
 
 
+def test_late_fraction_revokes_an_earlier_give_up():
+    """deface can spend minutes opening a multi-hour input before its first tqdm
+    tick, long past the grace period that gives up on a percentage. When the real
+    counter finally arrives the bar has to come back, or the longest steps in the
+    job show elapsed-time only for hours."""
+    p, clock = make_progress()
+    p.ansi = True
+    p.begin("blur", "blur faces front", 600.0)
+    clock.tick(200.0)
+    p.indeterminate()
+    assert "elapsed" in p._lines(100)[0]
+    p.update(frac=0.25)                        # the counter finally reports
+    step_line = p._lines(100)[0]
+    assert " 25%" in step_line
+    assert "elapsed" not in step_line
+
+
 def test_plain_mode_emits_no_ansi_escapes():
     stream = io.StringIO()
     p, clock = make_progress(stream=stream, ansi=False)
