@@ -729,6 +729,24 @@ def find_ffmpeg():
     die("No ffmpeg binary found on this machine. Install it with: brew install ffmpeg-full")
 
 
+def filter_graph_args(ffmpeg, filter_path):
+    """
+    ffmpeg args that read a filter_complex graph in from a file.
+
+    Reading the graph from a file sidesteps shell quoting entirely. ffmpeg 9
+    dropped -filter_complex_script in favour of the generic "read this option's
+    value from a file" spelling, -/filter_complex, so use whichever this binary
+    actually understands.
+    """
+    try:
+        r = subprocess.run([ffmpeg, "-hide_banner", "-h", "full"],
+                           capture_output=True, text=True, timeout=30)
+        legacy = "filter_complex_script" in r.stdout
+    except Exception:
+        legacy = False
+    return ["-filter_complex_script" if legacy else "-/filter_complex", str(filter_path)]
+
+
 def find_font():
     for f in FONT_CANDIDATES:
         if Path(f).exists():
@@ -1243,7 +1261,7 @@ def fit_dims(w, h, max_dim):
 def build_filter(dims, angle_paths, has_text, font, epoch, max_dim, native, speed, feature):
     """
     Build the filter_complex graph as a text block (fed to ffmpeg via
-    -filter_complex_script, which sidesteps shell-quoting entirely -- the
+    a file (see filter_graph_args), which sidesteps shell-quoting entirely -- the
     drawtext pts:localtime escaping in particular is finicky enough that
     building it as a string and passing through the shell is asking for
     trouble). Returns (filter_text, input_order, final_width, final_height).
@@ -1834,7 +1852,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     cmd = [ffmpeg, "-y"]
     for p in input_order:
         cmd += ["-i", str(p)]
-    cmd += ["-filter_complex_script", str(filter_path), "-map", "[out]"]
+    cmd += filter_graph_args(ffmpeg, filter_path) + ["-map", "[out]"]
 
     needs_software = args.native and (final_w > args.max_dim or final_h > args.max_dim)
     if needs_software:
