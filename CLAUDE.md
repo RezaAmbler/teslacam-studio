@@ -48,9 +48,23 @@ burned-in clock, optional face blur, and an optional live GPS route-map overlay.
   true video `frame_index`, not the SEI ordinal.
 - **Grid:** per-camera lossless concat (cached in `.tesla_combine_cache.json`,
   keyed by `CONCAT_CACHE_VERSION` — kept separate from `SCRIPT_VERSION` so feature
-  bumps don't invalidate concats), then `hstack`/`vstack` with per-input
-  `fps=OUTPUT_FPS` normalization, a burned-in clock, and a hw-fit scale to stay
-  ≤4096px (VideoToolbox limit).
+  bumps don't invalidate concats), then two composable layouts (`build_filter`
+  default / `build_filter_landscape` for `--landscape`, chosen by `build_grid`)
+  with per-input `fps=OUTPUT_FPS` normalization, a burned-in clock, and a hw-fit
+  scale to stay ≤4096px (VideoToolbox limit). Default is a tall `hstack`/`vstack`
+  of rows top to bottom, which can push canvas *height* past the cap on a full
+  6-camera+map session — forcing a whole-canvas downscale that also softens the
+  featured camera. `--landscape` avoids this structurally: the hero tile(s) stay
+  at native resolution with no scale filter at all, and every other present
+  camera (+ map) is stacked single-file into a thin sidebar column
+  (`landscape_layout` — the shared geometry used by the filter builder, the
+  map-tile pre-sizing, and the pre-flight space estimate) sized so the sidebar's
+  stacked height matches the hero's height exactly, keeping total canvas height
+  bounded by the hero alone.
+- **`--quality high`:** forces the software libx264/veryfast path (`encoder_args`)
+  at CRF 18 for its own sake, reusing the same CRF already used for the map-tile
+  upscale pass — distinct from the CRF 20 fallback that only fires when
+  `--native` alone pushes the canvas over the hardware cap.
 - **Map tile (`--map`):** extract GPS from the front (or first available) source
   clips → **re-time onto the CONCATENATED grid timeline** (`sum of prior clip
   durations + frame_index/fps`) so it stays synced when the grid squeezes out

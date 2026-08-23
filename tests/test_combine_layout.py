@@ -88,6 +88,17 @@ def _dims_paths(angles):
     return dims, paths
 
 
+def _realistic_dims(angles=ALL6, with_map=False):
+    """The real confirmed Tesla dims (HW4 car): front is genuinely higher-res
+    than the other 5 cameras, all sharing one aspect ratio (~1.5437:1)."""
+    dims = {a: ((2896, 1876) if a == "front" else (1448, 938)) for a in angles}
+    paths = {a: Path(f"/x/{a}.mp4") for a in angles}
+    if with_map:
+        dims[tc.MAP_TILE_KEY] = (1448, 938)
+        paths[tc.MAP_TILE_KEY] = Path("/x/map.mp4")
+    return dims, paths
+
+
 def test_build_filter_invariants_speed_1():
     dims, paths = _dims_paths(ALL6)
     text, order, w, h = tc.build_filter(
@@ -119,6 +130,123 @@ def test_build_filter_hero_upscales_to_canvas_width():
         native=False, speed=1.0, feature="front")
     # pair rows are 2560 wide; the 1280-wide front hero scales up to match
     assert "scale=2560:" in text
+
+
+# --- landscape_layout --------------------------------------------------------
+
+def test_landscape_layout_worked_example():
+    # front hero + 5 other cams + map -> sidebar ~483px, canvas ~3378x1876
+    dims, _ = _realistic_dims(with_map=True)
+    hero, sidebar, hero_w, H, w_side, canvas_w, canvas_h = tc.landscape_layout(dims, "front")
+    assert hero == ["front"]
+    assert len(sidebar) == 6  # 5 other cams + map
+    assert sidebar[-1] == tc.MAP_TILE_KEY  # map always last
+    assert hero_w == 2896
+    assert H == 1876
+    assert 470 <= w_side <= 495
+    assert 3350 <= canvas_w <= 3400
+    assert canvas_h == 1876
+    aspect = canvas_w / canvas_h
+    assert 1.7 <= aspect <= 1.95
+
+
+def test_landscape_layout_pair_hero():
+    dims, _ = _realistic_dims()
+    hero, sidebar, hero_w, H, w_side, canvas_w, canvas_h = tc.landscape_layout(dims, "repeaters")
+    assert hero == ["left_repeater", "right_repeater"]
+    assert set(sidebar) == {"front", "back", "left_pillar", "right_pillar"}
+    assert hero_w == 1448 * 2
+    assert H == 938
+    assert w_side > 0
+    assert canvas_w == hero_w + w_side
+
+
+def test_landscape_layout_fewer_cameras_present():
+    dims, _ = _realistic_dims(angles=["front", "back", "left_pillar"])
+    hero, sidebar, hero_w, H, w_side, canvas_w, canvas_h = tc.landscape_layout(dims, "front")
+    assert hero == ["front"]
+    assert sidebar == ["back", "left_pillar"]
+    assert canvas_w == hero_w + w_side
+
+
+def test_landscape_layout_hero_only_no_sidebar():
+    dims, _ = _realistic_dims(angles=["left_repeater", "right_repeater"])
+    hero, sidebar, hero_w, H, w_side, canvas_w, canvas_h = tc.landscape_layout(dims, "repeaters")
+    assert sidebar == []
+    assert w_side == 0
+    assert canvas_w == hero_w
+
+
+# --- build_filter_landscape --------------------------------------------------
+
+def test_build_filter_landscape_hero_not_upscaled():
+    # Contrast with test_build_filter_hero_upscales_to_canvas_width: the
+    # landscape hero gets no scale filter at all -- native resolution.
+    dims, paths = _realistic_dims(with_map=True)
+    text, order, w, h = tc.build_filter_landscape(
+        dims, paths, has_text=False, font=None, epoch=0, max_dim=4096,
+        native=False, speed=1.0, feature="front")
+    # v0 is the hero (front, first present angle) -- it flows straight into
+    # the hstack with no intervening scale= on that tag.
+    assert "[v0]scale=" not in text
+
+
+def test_build_filter_landscape_sidebar_shares_one_scale_width():
+    dims, paths = _realistic_dims(with_map=True)
+    _, _, _, _, w_side, _, _ = tc.landscape_layout(dims, "front")
+    text, order, w, h = tc.build_filter_landscape(
+        dims, paths, has_text=False, font=None, epoch=0, max_dim=4096,
+        native=False, speed=1.0, feature="front")
+    assert text.count(f"scale={w_side}:") == 6  # 5 cams + map, all one width
+
+
+def test_build_filter_landscape_pair_hero_hstacks():
+    dims, paths = _realistic_dims()
+    text, order, w, h = tc.build_filter_landscape(
+        dims, paths, has_text=False, font=None, epoch=0, max_dim=4096,
+        native=False, speed=1.0, feature="repeaters")
+    assert "hstack=inputs=2:shortest=1[hero];" in text
+
+
+def test_build_filter_landscape_map_present_and_label_less():
+    dims, paths = _realistic_dims(with_map=True)
+    text, order, w, h = tc.build_filter_landscape(
+        dims, paths, has_text=True, font="/font.ttf", epoch=0, max_dim=4096,
+        native=False, speed=1.0, feature="front")
+    assert paths[tc.MAP_TILE_KEY] in order
+    # map tile's own chain has no drawtext label (it's the only input with no
+    # LABEL_TEXT entry, so no fontsize=20 label chain references it)
+    map_idx = order.index(paths[tc.MAP_TILE_KEY])
+    map_chunk = text.split(f"[{map_idx}:v]")[1].split(";")[0]
+    assert "drawtext" not in map_chunk
+
+
+def test_build_filter_landscape_speed_and_fps_invariants():
+    dims, paths = _realistic_dims(with_map=True)
+    text, order, w, h = tc.build_filter_landscape(
+        dims, paths, has_text=False, font=None, epoch=0, max_dim=4096,
+        native=False, speed=2.0, feature="front")
+    assert "setpts=0.5*PTS" in text
+    assert text.count(f"fps={tc.OUTPUT_FPS}") == len(order) + 1
+
+
+def test_build_filter_landscape_native_skips_cap():
+    dims, paths = _realistic_dims(with_map=True)
+    text, order, w, h = tc.build_filter_landscape(
+        dims, paths, has_text=False, font=None, epoch=0, max_dim=100,
+        native=True, speed=1.0, feature="front")
+    assert "scale=100" not in text
+    assert w > 100 and h > 100
+
+
+def test_build_filter_landscape_sidebar_heights_sum_to_hero_height():
+    dims, paths = _realistic_dims(with_map=True)
+    _, _, _, H, w_side, _, _ = tc.landscape_layout(dims, "front")
+    text, order, w, h = tc.build_filter_landscape(
+        dims, paths, has_text=False, font=None, epoch=0, max_dim=4096,
+        native=False, speed=1.0, feature="front")
+    heights = [int(m.split("[")[0]) for m in text.split(f"scale={w_side}:")[1:]]
+    assert sum(heights) == H
 
 
 # --- hw_fit_scale / fit_dims ----------------------------------------------
@@ -268,3 +396,66 @@ def test_encrypted_sniff_short_or_missing_file(tmp_path):
     short.write_bytes(b"\x00\x00")
     assert tc.looks_tesla_encrypted(short) is False   # too short to judge
     assert tc.looks_tesla_encrypted(tmp_path / "nope.mp4") is False
+
+
+# --- CLI parsing: --landscape / --quality -----------------------------------
+
+def test_cli_landscape_default_off():
+    args = tc.build_parser().parse_args(["/some/folder"])
+    assert args.landscape is False
+
+
+def test_cli_landscape_flag():
+    args = tc.build_parser().parse_args(["/some/folder", "--landscape"])
+    assert args.landscape is True
+
+
+def test_cli_quality_default_fast():
+    args = tc.build_parser().parse_args(["/some/folder"])
+    assert args.quality == "fast"
+
+
+def test_cli_quality_high():
+    args = tc.build_parser().parse_args(["/some/folder", "--quality", "high"])
+    assert args.quality == "high"
+
+
+def test_cli_quality_bad_value_dies():
+    with pytest.raises(SystemExit):
+        tc.build_parser().parse_args(["/some/folder", "--quality", "ultra"])
+
+
+# --- encoder_args ------------------------------------------------------------
+
+def test_encoder_args_fast_default_is_hardware():
+    args, warning = tc.encoder_args(native=False, quality="fast", max_dim=4096,
+                                     final_w=1920, final_h=1080)
+    assert "h264_videotoolbox" in args
+    assert warning is None
+
+
+def test_encoder_args_quality_high_is_crf18_software():
+    args, warning = tc.encoder_args(native=False, quality="high", max_dim=4096,
+                                     final_w=1920, final_h=1080)
+    assert "libx264" in args
+    assert "18" in args
+    assert warning is None
+
+
+def test_encoder_args_oversized_native_falls_back_crf20():
+    args, warning = tc.encoder_args(native=True, quality="fast", max_dim=4096,
+                                     final_w=5000, final_h=3000)
+    assert "libx264" in args
+    assert "20" in args
+    assert warning is not None
+
+
+def test_encoder_args_quality_high_overrides_oversized_native_no_warning():
+    # --native alone would have fallen back to CRF 20 with a warning; explicit
+    # --quality high wins instead, at CRF 18, with no "falling back" warning.
+    args, warning = tc.encoder_args(native=True, quality="high", max_dim=4096,
+                                     final_w=5000, final_h=3000)
+    assert "libx264" in args
+    assert "18" in args
+    assert "20" not in args
+    assert warning is None

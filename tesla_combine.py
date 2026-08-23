@@ -49,7 +49,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-SCRIPT_VERSION = "2.2"
+SCRIPT_VERSION = "2.3"
 # Separate from SCRIPT_VERSION so feature releases can bump the script version
 # without invalidating every cached per-camera concat (concat semantics are
 # unchanged). Bump this ONLY when the concat output itself would change.
@@ -66,6 +66,11 @@ LABEL_TEXT = {
 }
 HERO_FONT_SIZE = 64
 NORMAL_FONT_SIZE = 40
+# --landscape's sidebar tiles are ~480-500px wide, much narrower than tall
+# mode's ~1265px-wide non-hero rows -- a starting guess, must be checked
+# against a real rendered frame and adjusted if labels look clipped,
+# oversized, or illegible.
+SIDEBAR_FONT_SIZE = 20
 # Cameras that are normally paired side-by-side. --feature can name either a
 # single angle (solo hero, its ex-partner gets its own row instead of being
 # dropped) or one of these pair keywords (both cameras large together as the
@@ -1258,6 +1263,48 @@ def fit_dims(w, h, max_dim):
     return new_w, new_h
 
 
+def _tile_chain(idx, angle, dims, angle_paths, has_text, font, font_size):
+    """One tile's `[N:v]fps=...[+drawtext][vN]` filter chain -- the per-camera
+    line every composition (tall-mode row, landscape hero/sidebar tile) emits
+    before stacking. `dims`/`angle_paths` are the same dicts every layout
+    function is handed; `font_size` is the caller's choice (hero vs. normal
+    vs. sidebar) rather than an inline pick, so this one chain-builder serves
+    every composition. Returns (filter_line, tag, input_path) -- `filter_line`
+    already carries its trailing ';'.
+    """
+    tag = f"v{idx}"
+    chain = f"[{idx}:v]fps={OUTPUT_FPS}"
+    if has_text and angle in LABEL_TEXT:  # map tile is deliberately label-less
+        text = LABEL_TEXT[angle]
+        chain += (f",drawtext=fontfile={font}:text='{text}':fontcolor=white:"
+                  f"fontsize={font_size}:box=1:boxcolor=black@0.6:boxborderw=10:x=20:y=20")
+    chain += f"[{tag}];"
+    return chain, tag, angle_paths[angle]
+
+
+def _apply_tail(lines, stage, has_text, font, epoch, speed):
+    """Append the shared closing stages -- burned-in timestamp (if labels are
+    on), then the speed/fps remap (or a passthrough `null`) -- to `lines`, and
+    join it all into the final filter_complex text. Every build_filter*
+    function's composition-specific stacking is done by the time it calls
+    this; only this tail is common to all of them.
+    """
+    if has_text:
+        lines.append(
+            f"[{stage}]drawtext=fontfile={font}:text='%{{pts\\:localtime\\:{epoch}}}':"
+            f"fontcolor=white:fontsize=56:box=1:boxcolor=black@0.5:boxborderw=12:"
+            f"x=20:y=h-th-20[timestamped];"
+        )
+        stage = "timestamped"
+
+    if speed != 1.0:
+        lines.append(f"[{stage}]setpts={1/speed}*PTS,fps={OUTPUT_FPS}[out]")
+    else:
+        lines.append(f"[{stage}]null[out]")
+
+    return "\n".join(lines)
+
+
 def build_filter(dims, angle_paths, has_text, font, epoch, max_dim, native, speed, feature):
     """
     Build the filter_complex graph as a text block (fed to ffmpeg via
@@ -1265,6 +1312,9 @@ def build_filter(dims, angle_paths, has_text, font, epoch, max_dim, native, spee
     drawtext pts:localtime escaping in particular is finicky enough that
     building it as a string and passing through the shell is asking for
     trouble). Returns (filter_text, input_order, final_width, final_height).
+
+    This is the TALL-mode layout: rows stacked top to bottom. See
+    build_filter_landscape for the sibling hero+sidebar layout (--landscape).
 
     dims comes from the ORIGINAL source clips, not the concat outputs, so this
     works under --dry-run when the concat outputs don't exist yet.
@@ -1298,17 +1348,11 @@ def build_filter(dims, angle_paths, has_text, font, epoch, max_dim, native, spee
     for row in rows:
         tile_tags = []
         for angle in row:
-            tag = f"v{idx}"
-            chain = f"[{idx}:v]fps={OUTPUT_FPS}"
-            if has_text and angle in LABEL_TEXT:  # map tile is deliberately label-less
-                text = LABEL_TEXT[angle]
-                size = HERO_FONT_SIZE if angle in hero_angles else NORMAL_FONT_SIZE
-                chain += (f",drawtext=fontfile={font}:text='{text}':fontcolor=white:"
-                          f"fontsize={size}:box=1:boxcolor=black@0.6:boxborderw=10:x=20:y=20")
-            chain += f"[{tag}]"
-            lines.append(chain + ";")
+            size = HERO_FONT_SIZE if angle in hero_angles else NORMAL_FONT_SIZE
+            line, tag, path = _tile_chain(idx, angle, dims, angle_paths, has_text, font, size)
+            lines.append(line)
             tile_tags.append(tag)
-            input_order.append(angle_paths[angle])
+            input_order.append(path)
             idx += 1
 
         if len(tile_tags) > 1:
@@ -1359,20 +1403,151 @@ def build_filter(dims, angle_paths, has_text, font, epoch, max_dim, native, spee
             stage = "gridscaled"
             final_w, final_h = fit_dims(canvas_w, canvas_h, max_dim)
 
-    if has_text:
-        lines.append(
-            f"[{stage}]drawtext=fontfile={font}:text='%{{pts\\:localtime\\:{epoch}}}':"
-            f"fontcolor=white:fontsize=56:box=1:boxcolor=black@0.5:boxborderw=12:"
-            f"x=20:y=h-th-20[timestamped];"
-        )
-        stage = "timestamped"
+    filter_text = _apply_tail(lines, stage, has_text, font, epoch, speed)
+    return filter_text, input_order, final_w, final_h
 
-    if speed != 1.0:
-        lines.append(f"[{stage}]setpts={1/speed}*PTS,fps={OUTPUT_FPS}[out]")
+
+def landscape_layout(dims, feature):
+    """
+    Pure geometry for the --landscape layout: the featured camera(s) at full
+    native resolution on the left, every other present tile (cameras plus the
+    map, if MAP_TILE_KEY is in `dims`) stacked single-file into a thin
+    sidebar column on the right, sized so the sidebar's stacked height
+    matches the hero's height exactly. Structurally avoids the tall grid's
+    4096px hardware-encoder height cap for the common case (a chunkier
+    multi-column sidebar would just re-trigger it).
+
+    dims: {angle: (w, h)}, same shape as everywhere else in this file --
+    may include MAP_TILE_KEY. feature: the --feature choice (a single angle
+    for a solo hero, or a PAIR_DEFS key for a two-camera hero).
+
+    Each sidebar tile is scaled to a common width W_side, preserving its own
+    aspect ratio, so its height is W_side/aspect_i. For the stacked column to
+    sum to exactly H: sum_i(W_side/aspect_i) = H, i.e.
+    W_side = H / sum(1/aspect_i) -- which reduces to H*aspect/N when every
+    sidebar tile shares one aspect (the common case: Tesla's 6 camera angles
+    are all the same ~1.5437:1, whatever their native resolution).
+
+    Returns (hero_angles, sidebar_angles, hero_w, H, w_side, canvas_w,
+    canvas_h). sidebar_angles is in CAMERA_ANGLES order with the map (if
+    present) last -- mirroring the tall grid's own back+map pairing, and
+    guaranteeing the map (which has no fixed native aspect of its own) is
+    always the sidebar's remainder-clamped last tile in
+    build_filter_landscape, never a middle one.
+    """
+    hero_angles = list(PAIR_DEFS[feature]) if feature in PAIR_DEFS else [feature]
+    sidebar_angles = [a for a in CAMERA_ANGLES if a in dims and a not in hero_angles]
+    if MAP_TILE_KEY in dims and MAP_TILE_KEY not in hero_angles:
+        sidebar_angles.append(MAP_TILE_KEY)
+
+    hero_w = sum(dims[a][0] for a in hero_angles)
+    # A pair hero is hstacked with shortest=1, which crops to the SHORTER
+    # input's height -- min, not max, so this matches what ffmpeg actually
+    # produces. In practice PAIR_DEFS pairs always share identical native
+    # dims (both pillars, both repeaters), so this never bites on real
+    # footage, but a mismatched pair would otherwise make canvas_h a lie.
+    H = min(dims[a][1] for a in hero_angles)
+
+    if sidebar_angles:
+        inv_aspect_sum = sum(dims[a][1] / dims[a][0] for a in sidebar_angles)
+        w_side = round(H / inv_aspect_sum / 2) * 2 if inv_aspect_sum > 0 else 0
     else:
-        lines.append(f"[{stage}]null[out]")
+        w_side = 0
 
-    return "\n".join(lines), input_order, final_w, final_h
+    canvas_w = hero_w + w_side
+    canvas_h = H
+    return hero_angles, sidebar_angles, hero_w, H, w_side, canvas_w, canvas_h
+
+
+def build_filter_landscape(dims, angle_paths, has_text, font, epoch, max_dim, native, speed, feature):
+    """
+    Sibling to build_filter for the --landscape layout: the hero tile(s) at
+    full native resolution (NO scale filter -- that's the whole point, unlike
+    the tall grid's hero-row upscale-to-canvas-width) hstacked on the left,
+    every other present tile scaled to a common sidebar width and vstacked
+    single-file on the right, then hero+sidebar hstacked into the final grid.
+    Kept as a separate function (not a branch inside build_filter) so the
+    default tall-mode path can't regress, and each composition algorithm
+    stays readable on its own. Same return shape as build_filter:
+    (filter_text, input_order, final_width, final_height).
+
+    The map tile needs no special-casing here: once dims[MAP_TILE_KEY] exists
+    it's just another sidebar entry (landscape_layout always places it last),
+    and _tile_chain's existing `angle in LABEL_TEXT` check already keeps it
+    label-less, same as tall mode.
+    """
+    hero_angles, sidebar_angles, hero_w, H, w_side, canvas_w, canvas_h = (
+        landscape_layout(dims, feature))
+
+    lines = []
+    input_order = []
+    idx = 0
+
+    hero_tags = []
+    for angle in hero_angles:
+        line, tag, path = _tile_chain(idx, angle, dims, angle_paths, has_text,
+                                      font, HERO_FONT_SIZE)
+        lines.append(line)
+        hero_tags.append(tag)
+        input_order.append(path)
+        idx += 1
+
+    if len(hero_tags) > 1:
+        hero_stage = "hero"
+        lines.append("".join(f"[{t}]" for t in hero_tags)
+                     + f"hstack=inputs={len(hero_tags)}:shortest=1[{hero_stage}];")
+    else:
+        hero_stage = hero_tags[0]
+
+    if sidebar_angles:
+        side_tags = []
+        heights = []
+        for i, angle in enumerate(sidebar_angles):
+            line, tag, path = _tile_chain(idx, angle, dims, angle_paths, has_text,
+                                          font, SIDEBAR_FONT_SIZE)
+            lines.append(line)
+            input_order.append(path)
+            idx += 1
+
+            if i < len(sidebar_angles) - 1:
+                w, h = dims[angle]
+                tile_h = round(w_side * h / w / 2) * 2
+            else:
+                # Last tile absorbs whatever rounding drift the others left,
+                # so the stacked column sums to exactly H -- no black gap,
+                # no overflow. The map (always last, see landscape_layout)
+                # lands here, which is also right for it: it has no native
+                # aspect of its own to preserve.
+                tile_h = H - sum(heights)
+                tile_h = max(2, tile_h - (tile_h % 2))
+            heights.append(tile_h)
+
+            scaled_tag = f"{tag}s"
+            lines.append(f"[{tag}]scale={w_side}:{tile_h}[{scaled_tag}];")
+            side_tags.append(scaled_tag)
+
+        if len(side_tags) > 1:
+            side_stage = "sidebar"
+            lines.append("".join(f"[{t}]" for t in side_tags)
+                         + f"vstack=inputs={len(side_tags)}:shortest=1[{side_stage}];")
+        else:
+            side_stage = side_tags[0]
+
+        stage = "grid"
+        lines.append(f"[{hero_stage}][{side_stage}]hstack=inputs=2:shortest=1[{stage}];")
+    else:
+        stage = hero_stage
+
+    final_w, final_h = canvas_w, canvas_h
+    if not native:
+        scale_expr = hw_fit_scale(canvas_w, canvas_h, max_dim)
+        if scale_expr:
+            lines.append(f"[{stage}]scale={scale_expr}[gridscaled];")
+            stage = "gridscaled"
+            final_w, final_h = fit_dims(canvas_w, canvas_h, max_dim)
+
+    filter_text = _apply_tail(lines, stage, has_text, font, epoch, speed)
+    return filter_text, input_order, final_w, final_h
 
 
 def auto_bitrate(w, h, fps=OUTPUT_FPS, bits_per_pixel=0.07):
@@ -1472,10 +1647,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "camera large, its old pair-partner (if any) gets its own row instead of "
                          "being dropped. Pair: pillars, repeaters -- both L/R cameras large "
                          "together. e.g. --feature back if you got rear-ended.")
+    ap.add_argument("--landscape", action="store_true",
+                    help="landscape layout instead of the tall stacked-row grid: the featured "
+                         "camera at full native resolution on the left, every other present "
+                         "camera (and the map, if any) in a thin single-file sidebar column on "
+                         "the right, sized to match the hero's height. Produces a real landscape "
+                         "aspect ratio (good for YouTube/social feed video) and, for the common "
+                         "case, avoids the tall grid's height-inflation softness by construction.")
     ap.add_argument("--native", action="store_true",
-                    help="skip the hardware-fit scale-down; true native resolution but forces a slow "
-                         "software encode and may not play smoothly on all hardware")
+                    help="skip the hardware-fit scale-down; true native resolution. Only forces a "
+                         "slow software encode if the native size ALSO exceeds --max-dim -- use "
+                         "--quality high if you want software encoding for its own sake.")
     ap.add_argument("--max-dim", type=int, default=4096, help="hardware encode/decode ceiling to fit under")
+    ap.add_argument("--quality", default="fast", choices=["fast", "high"],
+                    help="fast (default): today's hardware encode (h264_videotoolbox). high: force "
+                         "software encoding (libx264, veryfast, CRF 18) regardless of canvas size "
+                         "or --native -- sharper than the hardware encoder at an equivalent "
+                         "bitrate, but much slower.")
     ap.add_argument("--blur-faces", action="store_true",
                     help="auto-detect and anonymize people's faces in every camera (and thus the "
                          "grid). Needs the `deface` tool: python3 -m pip install deface. Re-encodes "
@@ -1636,17 +1824,24 @@ def plan_job(args, tools: Tools, folder: Path, out_dir: Path,
             f"clips per camera")
 
     _, _, sample_dur = next(iter(selections.values()))
-    grid_rows, hero = build_rows([a for a in CAMERA_ANGLES if a in dims], args.feature)
     est_dims = dims
     if args.map:
-        # Same layout the grid will use, so the space estimate reflects the extra
-        # map row. The tile matches the back camera's dimensions.
-        grid_rows = inject_map_row([list(r) for r in grid_rows], hero)
         # Mirror the tile-sizing fallback used at render time (back, else the map
         # source camera, else a default) so the estimate matches when back is absent.
         est_dims = {**dims, MAP_TILE_KEY: dims.get("back") or dims.get("front") or (1280, 960)}
-    probe_w = max(sum(est_dims[a][0] for a in row) for row in grid_rows)
-    probe_h = sum(max(est_dims[a][1] for a in row) for row in grid_rows)
+    if args.landscape:
+        # landscape_layout is the single source of truth for canvas size in
+        # this layout -- same function the filter builder and the map-tile
+        # sizing use, so the pre-flight estimate matches what actually renders.
+        _, _, _, _, _, probe_w, probe_h = landscape_layout(est_dims, args.feature)
+    else:
+        grid_rows, hero = build_rows([a for a in CAMERA_ANGLES if a in dims], args.feature)
+        if args.map:
+            # Same layout the grid will use, so the space estimate reflects the
+            # extra map row.
+            grid_rows = inject_map_row([list(r) for r in grid_rows], hero)
+        probe_w = max(sum(est_dims[a][0] for a in row) for row in grid_rows)
+        probe_h = sum(max(est_dims[a][1] for a in row) for row in grid_rows)
     est_w, est_h = (probe_w, probe_h) if args.native else (
         fit_dims(probe_w, probe_h, args.max_dim)
         if hw_fit_scale(probe_w, probe_h, args.max_dim) else (probe_w, probe_h))
@@ -1788,6 +1983,31 @@ def build_per_camera(args, tools: Tools, plan: Plan, cache: dict,
     return angle_paths, drifts
 
 
+def encoder_args(native, quality, max_dim, final_w, final_h):
+    """
+    Pick the grid encode's `-c:v ...` args. Returns (cmd_args, warning_or_None)
+    -- this never prints; the caller logs the warning (if any).
+
+    `quality == "high"` always wins: CRF 18 software (libx264, veryfast) --
+    the same CRF already used for the map-tile upscale pass (this repo's
+    existing precedent for "quality is the actual goal, not an unavoidable
+    fallback"), so no warning -- the user asked for this.
+
+    Otherwise, preserves the original --native-exceeds-the-cap fallback
+    verbatim (CRF 20, with its warning); anything else is the normal
+    hardware path.
+    """
+    if quality == "high":
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"], None
+
+    if native and (final_w > max_dim or final_h > max_dim):
+        warning = ("--native exceeds the hardware encoder's limit -- falling back to slow "
+                   "software encoding (libx264). Expect this to take a while.")
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"], warning
+
+    return ["-c:v", "h264_videotoolbox", "-b:v", str(auto_bitrate(final_w, final_h))], None
+
+
 def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                stats: dict, tmpdir: Path, progress: Progress):
     """Re-probe real input dims, build the optional map tile, assemble the filter
@@ -1818,7 +2038,19 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
         src_concat = out_dir / f"{session_name}_{map_source}_combined.mp4"
         grid_dur = (probe_duration(ffprobe, src_concat)
                     if not args.dry_run else plan.selections[map_source][2]) or 60.0
-        map_dims = dims.get("back") or dims.get(map_source) or (1280, 960)
+        if args.landscape:
+            # No fixed native aspect of its own -- landscape_layout always
+            # places the map last in the sidebar, where it gets the
+            # remainder-clamped height. Assume a real camera's aspect (same
+            # as every Tesla angle) just to solve for w_side/H here; the
+            # actual per-tile heights (and any rounding drift) are settled
+            # for real in build_filter_landscape once this dims entry exists.
+            placeholder = dims.get("back") or dims.get(map_source) or (1280, 960)
+            _, _, _, _, w_side, _, _ = landscape_layout(
+                {**dims, MAP_TILE_KEY: placeholder}, args.feature)
+            map_dims = (w_side, round(w_side * placeholder[1] / placeholder[0] / 2) * 2)
+        else:
+            map_dims = dims.get("back") or dims.get(map_source) or (1280, 960)
         # Persist the tile (not tmpdir): it's the slowest new step, it's a
         # useful standalone artifact, and it survives a later grid-encode failure.
         map_out = out_dir / f"{session_name}_maptile.mp4"
@@ -1837,7 +2069,8 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
         progress.abandon("grid")
         return None
 
-    filter_text, input_order, final_w, final_h = build_filter(
+    filter_fn = build_filter_landscape if args.landscape else build_filter
+    filter_text, input_order, final_w, final_h = filter_fn(
         dims, angle_paths, tools.has_text, tools.font, plan.epoch, args.max_dim,
         args.native, args.speed, args.feature
     )
@@ -1854,15 +2087,16 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
         cmd += ["-i", str(p)]
     cmd += filter_graph_args(ffmpeg, filter_path) + ["-map", "[out]"]
 
-    needs_software = args.native and (final_w > args.max_dim or final_h > args.max_dim)
-    if needs_software:
-        log("WARNING: --native exceeds the hardware encoder's limit -- falling back to slow "
-            "software encoding (libx264). Expect this to take a while.")
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
-    else:
-        cmd += ["-c:v", "h264_videotoolbox", "-b:v", str(auto_bitrate(final_w, final_h))]
+    enc_args, warning = encoder_args(args.native, args.quality, args.max_dim, final_w, final_h)
+    if warning:
+        log(f"WARNING: {warning}")
+    if args.quality == "high" and not warning:
+        log("NOTE: --quality high requested -- using software encode (libx264, CRF 18) "
+            "instead of hardware.")
+    cmd += enc_args
 
-    suffix = "" if args.feature == "front" else f"_feature-{args.feature}"
+    suffix = "_landscape" if args.landscape else ""
+    suffix += "" if args.feature == "front" else f"_feature-{args.feature}"
     suffix += "_blurred" if args.blur_faces else ""
     suffix += "_map" if MAP_TILE_KEY in angle_paths else ""
     out_grid = out_dir / f"{session_name}_grid{suffix}.mp4"

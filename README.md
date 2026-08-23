@@ -24,8 +24,15 @@ traces where you drove.
 - **Face blurring** for privacy (`--blur-faces`, via [`deface`](https://github.com/ORB-HD/deface)).
 - **Live GPS route map** (`--map`) — a moving map that follows the car and draws
   the route, extracted from the car's own GPS telemetry. Tunable zoom/magnification.
+- **Landscape layout** (`--landscape`) — the featured camera at full native
+  resolution on the left, every other camera (and the map, if any) in a thin
+  sidebar column on the right, sized to match. Produces a real landscape
+  aspect ratio instead of the default tall grid — use it for YouTube/social
+  feed video, or whenever the tall grid's height pushes past the hardware
+  encoder's cap and softens the featured camera.
 - **Hardware-accelerated** H.264 encode (Apple VideoToolbox), with automatic
-  scale-to-fit so the output stays on the hardware decode path.
+  scale-to-fit so the output stays on the hardware decode path — or force
+  software encoding for its own sake with `--quality high` (libx264, CRF 18).
 - **Caching** — per-camera concats are cached; re-running with different grid
   options doesn't re-stitch. Ctrl-C is safe: the half-written file is removed and
   the finished cameras are reused on the next run.
@@ -145,6 +152,12 @@ python3 tesla_combine.py /path/to/event/folder --map
 python3 tesla_combine.py /path/to/event/folder --map --map-mag 3
 python3 tesla_combine.py /path/to/event/folder --map --map-mag 1 --map-zoom 16
 
+# Landscape layout (real 16:9-ish aspect ratio) instead of the tall grid
+python3 tesla_combine.py /path/to/event/folder --landscape --map
+
+# Force software encoding for sharper output (slower)
+python3 tesla_combine.py /path/to/event/folder --quality high
+
 # See the ffmpeg commands without running anything
 python3 tesla_combine.py /path/to/event/folder --dry-run
 ```
@@ -162,7 +175,9 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--map` | Add the live GPS route-map tile |
 | `--map-zoom` | OSM tile zoom 1–19 (default 19) |
 | `--map-mag` | Magnify beyond OSM's limit, 1.0–4.0 (default 2.0; 1 = off) |
-| `--native` | True native resolution (slow software encode) |
+| `--landscape` | Hero camera at native res + thin sidebar column, instead of the tall grid |
+| `--native` | True native resolution (skips the hardware-fit scale-down) |
+| `--quality` | `fast` (default, hardware) or `high` (software libx264, CRF 18) |
 | `--output-dir` | Where outputs go (default: next to the input folder) |
 | `-v` / `--verbose` | Full ffmpeg/deface output instead of the progress display |
 | `--no-progress` | Plain progress lines, no live redraw (automatic when piped) |
@@ -188,7 +203,7 @@ Written next to the input folder unless `--output-dir` is given:
 | `<session>_<angle>_combined.mp4` | one lossless concat per camera angle |
 | `<session>_<angle>_blurred.mp4` | (with `--blur-faces`) that concat, faces anonymized |
 | `<session>_maptile.mp4` | (with `--map`) the standalone live route-map tile |
-| `<session>_grid[_feature-X][_blurred][_map].mp4` | the labeled multi-camera composite |
+| `<session>_grid[_landscape][_feature-X][_blurred][_map].mp4` | the labeled multi-camera composite |
 
 `playcheck.sh <file.mp4>` runs headless playback sanity checks (decode integrity,
 faststart index, hardware-decodable dimensions, constant frame rate).
