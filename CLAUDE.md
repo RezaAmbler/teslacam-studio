@@ -112,6 +112,60 @@ and an optional speed/compass dashboard overlay.
   default. `course_deg` stays unused — the `compass` widget reads `cog`, which
   gopro-overlay computes itself from consecutive lat/lon (geodesic bearing), so
   the compass needs zero data changes, same as the existing map tile.
+- **FSD showcase overlays — foundation (`tesla_fsd_overlay.py` /
+  `tesla_fsd_metrics.py`):** groundwork for four deferred visual ideas (a
+  hands-free/corner-count streak scoreboard, a friction-circle G-force meter,
+  a scrolling "note highway" anticipation ribbon, rally pace-notes), each its
+  own follow-up branch off `fsd-overlay-foundation` — not yet wired into
+  `tesla_combine.py`'s CLI at all. Two findings drove the design:
+  - **IMU axis mapping resolved with real data**, since Tesla documents none
+    of this: correlated 28,000 telemetry points (17.5km of real mountain
+    driving) against two independent signals — `linear_acceleration_mps2_x`
+    correlates with steering angle (r=0.31) → **lateral**;
+    `linear_acceleration_mps2_y` correlates with speed-derivative (r=-0.36) →
+    **longitudinal**; `_z` correlates with neither and has the smallest
+    variance → **vertical**, by elimination, unused by any of the four ideas'
+    v1. `brake_applied` never fired once across that whole stretch (FSD's
+    regen braking apparently never touches the physical brake), so "braking"
+    for these features is read off measured deceleration, not that flag.
+    `autopilot_state` was `1` (engaged) for the entire 17.5km — no
+    disengagement captured yet, so no other value's meaning is confirmed;
+    `tesla_fsd_metrics.AUTOPILOT_ENGAGED_STATE` treats anything else as
+    disengaged, the conservative reading.
+  - **gopro-overlay's normal CLI/XML pipeline can't carry any of this.** No
+    G-force/scatter/ribbon widget exists among its ~25 built-in types, and
+    even the "just text" ideas need per-frame *state* (a running timer, a
+    corner counter) that its `metric="speed"`-style "read one live value"
+    model doesn't support — `metric_accessor_from` (`gopro_overlay/
+    layout_xml.py`) is a hardcoded ~33-name dict with no fallback, so a new
+    derived field can't be read via `metric=` without patching the library.
+    Fix: `gopro-dashboard.py`'s CLI is a thin, non-importable
+    `__main__`-only wrapper around plain library classes that *are* usable
+    directly — `Overlay(framemeta, create_widgets)`'s `create_widgets` is
+    just any `entry -> list[Widget]` callable (proven by the library's own
+    non-XML `speed_awareness_layout`), and `FrameMeta.process()` (`gopro_
+    overlay/framemeta.py`) is the library's own mechanism for adding
+    arbitrary new computed per-entry fields (`Entry.__getattr__` has no
+    fixed schema at all — any key a processor returns becomes a live
+    attribute). `tesla_fsd_overlay.py` is a new driver script (own file,
+    must run under `./.venv` same as `--map`/`--gauge`'s subprocess
+    boundary) built by mirroring `gopro-dashboard.py`'s own `--use-gpx-only
+    --input <video>` render loop, with our own `process()` steps and a
+    diagnostic `Widget` instead of XML.
+  - **Data plumbing:** only `linear_acceleration_mps2_x/y` and
+    `autopilot_state` needed to newly reach the GPX (speed/lat/lon/`cog`
+    are already there) — `tesla_gps.write_gpx()` repurposes three more of
+    gopro-overlay's fixed extension-tag names (`<cad>`, `<power>`, `<hr>` —
+    same precedented trick as the `--gauge` `speed_mps` → `<speed>` fix
+    above) and `retime_samples` (`tesla_combine.py`) carries the raw values
+    through to it. `tesla_fsd_metrics.py` (zero `gopro_overlay` dependency,
+    stdlib only) decodes those back into `lateral_g`/`longitudinal_g`/
+    `autopilot_engaged` and derives `corner_count` (a hysteresis
+    threshold-crossing detector on `|lateral_g|`) and `hands_free_seconds`
+    — kept dependency-free so `tests/` (system Python, no gopro-overlay
+    installed) can test the derivation math directly; `tesla_fsd_overlay.py`
+    unwraps gopro-overlay's `pint` `Quantity` values to plain floats before
+    calling into it.
 - **Progress (`Progress`, stdlib only):** the run is planned up front as a list of
   `Step(kind, label, work)` (`plan_steps`), `work` in footage-seconds. Fractions
   are never timer guesses — ffmpeg is run with `-progress pipe:1 -loglevel error`
@@ -136,6 +190,21 @@ and an optional speed/compass dashboard overlay.
 - **Open:** the `--map-mag` magnification was functionally tested (dry-run,
   validation, real render, frame inspection) but did NOT go through the adversarial
   review loop the rest of the code did.
+- FSD showcase overlays foundation: `tesla_fsd_overlay.py` verified end-to-end
+  against real footage (a real FSD-engaged mountain drive) — diagnostic overlay
+  composited cleanly onto native-res video, `hands_free_seconds` tracked
+  elapsed time exactly, `corner_count` climbed plausibly with real curves.
+  Also verified a partial-GPX-coverage case (a GPX covering less than the
+  video's real duration) both warns and freezes FSD values at their last
+  known state past the uncovered tail rather than drifting out of sync with
+  the video — this caught a real bug (see git history: an earlier timelapse-
+  factor divisor was reused from a different upstream branch than the one
+  this driver actually mirrors, so it stretched telemetry timing whenever
+  GPX coverage fell short of the video; full-coverage footage happened to
+  mask it, since the ratio was ~1.0 either way). The IMU axis-mapping
+  correlation itself (not just the plumbing) is a real empirical finding,
+  not a spec, and hasn't been cross-checked against a second, independent
+  drive yet.
 
 ## Gotchas
 - Never commit footage or rendered outputs.

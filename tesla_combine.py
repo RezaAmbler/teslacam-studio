@@ -996,6 +996,14 @@ def retime_samples(clip_samples, clip_fps, clip_durations, offset, grid_dur):
             retimed.append({
                 "lat": s["lat"], "lon": s["lon"],
                 "speed_mps": s.get("speed_mps"), "heading": s.get("heading"),
+                # Pass through for the FSD-overlay foundation (tesla_fsd_overlay.py /
+                # tesla_fsd_metrics.py) -- write_gpx() repurposes these into <cad>/
+                # <power>/<hr> extension tags the same way it already does for
+                # speed_mps -> <speed>. Without this, build_route_gpx's GPX would
+                # never carry them on real footage even though write_gpx supports it.
+                "linear_acceleration_mps2_x": s.get("linear_acceleration_mps2_x"),
+                "linear_acceleration_mps2_y": s.get("linear_acceleration_mps2_y"),
+                "autopilot_state": s.get("autopilot_state"),
                 "time": base + timedelta(seconds=max(0.0, ct)),
             })
         concat_start += dur
@@ -1007,10 +1015,20 @@ def retime_samples(clip_samples, clip_fps, clip_durations, offset, grid_dur):
     # map spans the whole grid (the car sat still where SEI is absent). The tail
     # pad runs slightly long so vstack's shortest=1 trims the map to the cameras,
     # never the other way round.
+    #
+    # Holding POSITION across the pad is correct -- the car really did sit at
+    # that lat/lon. Holding the FSD-overlay-foundation fields (accel/autopilot)
+    # is not: they'd claim autopilot was engaged (or a specific G reading) for
+    # a stretch where we have zero telemetry, fabricating time the eventual
+    # hands-free/corner-count scoreboard would count as real. Null them out on
+    # the pad points instead -- write_gpx() already omits a tag per-point when
+    # its value is None, so a padded point simply won't claim to know.
+    NO_FSD_DATA = {"linear_acceleration_mps2_x": None,
+                   "linear_acceleration_mps2_y": None, "autopilot_state": None}
     if (retimed[0]["time"] - base).total_seconds() > 0.05:
-        retimed.insert(0, {**retimed[0], "time": base})
+        retimed.insert(0, {**retimed[0], **NO_FSD_DATA, "time": base})
     if grid_dur - (retimed[-1]["time"] - base).total_seconds() > 0.05:
-        retimed.append({**retimed[-1],
+        retimed.append({**retimed[-1], **NO_FSD_DATA,
                         "time": base + timedelta(seconds=grid_dur + 0.5)})
     return retimed
 

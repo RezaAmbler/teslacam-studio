@@ -376,6 +376,53 @@ def test_retime_head_and_tail_edge_hold():
     assert out[0]["lat"] == out[1]["lat"]
 
 
+def test_retime_passes_through_fsd_overlay_fields():
+    # linear_acceleration_mps2_x/y and autopilot_state must survive retiming --
+    # write_gpx() repurposes them into <cad>/<power>/<hr> for tesla_fsd_overlay.py,
+    # and it can only do that if retime_samples doesn't drop them first.
+    s = _s(0)
+    s["linear_acceleration_mps2_x"] = 0.42
+    s["linear_acceleration_mps2_y"] = -1.5
+    s["autopilot_state"] = 1
+    out = tc.retime_samples([[s]], [10.0], [60.0], 0.0, 60.0)
+    real = out[0]  # frame 0 -> t=0.0, no head pad needed
+    assert real["linear_acceleration_mps2_x"] == 0.42
+    assert real["linear_acceleration_mps2_y"] == -1.5
+    assert real["autopilot_state"] == 1
+
+
+def test_retime_fsd_overlay_fields_default_none_when_absent():
+    # samples without these fields (e.g. older extraction, or a camera angle
+    # where they weren't decoded) shouldn't raise -- just carry through as None.
+    out = tc.retime_samples([[_s(0)]], [10.0], [60.0], 0.0, 60.0)
+    assert out[0]["linear_acceleration_mps2_x"] is None
+
+
+def test_retime_edge_pads_null_fsd_fields_but_keep_position():
+    # A held first/last position is correct (the car sat still) -- but holding
+    # the FSD-overlay fields across the same pad would fabricate autopilot/G
+    # data for a stretch with zero real telemetry (e.g. an eventual hands-free
+    # scoreboard counting time it shouldn't). Pads must null these three
+    # fields specifically while still copying lat/lon from the nearest sample.
+    s = _s(50)  # mid-window -> both a head pad (t=0) and tail pad appear
+    s["linear_acceleration_mps2_x"] = 0.9
+    s["linear_acceleration_mps2_y"] = -0.3
+    s["autopilot_state"] = 1
+    out = tc.retime_samples([[s]], [10.0], [60.0], 0.0, 60.0)
+    head_pad, real, tail_pad = out[0], out[1], out[-1]
+
+    for pad in (head_pad, tail_pad):
+        assert pad["linear_acceleration_mps2_x"] is None
+        assert pad["linear_acceleration_mps2_y"] is None
+        assert pad["autopilot_state"] is None
+        assert pad["lat"] == real["lat"]  # position still held, unlike FSD fields
+
+    assert real["linear_acceleration_mps2_x"] == 0.9
+    assert real["autopilot_state"] == 1
+    assert out[0]["linear_acceleration_mps2_y"] is None
+    assert out[0]["autopilot_state"] is None
+
+
 # --- looks_tesla_encrypted ---------------------------------------------------
 
 def test_encrypted_sniff_real_mp4_header(tmp_path):

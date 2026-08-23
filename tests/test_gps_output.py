@@ -131,6 +131,39 @@ def test_write_gpx_golden(tmp_path):
     assert "<tesla:frame_index>0</tesla:frame_index>" in text
 
 
+def test_write_gpx_fsd_overlay_repurposed_tags(tmp_path):
+    # <cad>/<power>/<hr> carry linear_acceleration_mps2_x/y/autopilot_state for
+    # the FSD-overlay foundation (tesla_fsd_overlay.py/tesla_fsd_metrics.py) --
+    # same repurposing trick as speed_mps -> <speed> above, see write_gpx's
+    # comment and CLAUDE.md's "FSD showcase overlays" section. This is the
+    # actual wire format gopro-overlay's fudge() parses; the golden test above
+    # doesn't set these fields, so it never exercises this path.
+    t0 = datetime(2026, 7, 14, 18, 57, 37)
+    s = _sample(0, 40.7128000, -74.0060000, t0)
+    s["linear_acceleration_mps2_x"] = 0.5
+    s["linear_acceleration_mps2_y"] = 1.0
+    s["autopilot_state"] = 1
+    out = tmp_path / "route.gpx"
+    g.write_gpx([s], str(out), track_name="Test route")
+    text = out.read_text()
+    assert "<cad>0.5000</cad>" in text
+    assert "<power>1.0000</power>" in text
+    assert "<hr>1</hr>" in text
+
+
+def test_write_gpx_fsd_overlay_tags_omitted_when_absent(tmp_path):
+    # A sample that never carries these fields (older extraction, or an angle
+    # tesla_gps never decoded them for) must not emit the tags at all --
+    # gopro-overlay's parser should see nothing, not a bogus "0" or "None".
+    t0 = datetime(2026, 7, 14, 18, 57, 37)
+    out = tmp_path / "route.gpx"
+    g.write_gpx([_sample(0, 40.0, -74.0, t0)], str(out))
+    text = out.read_text()
+    assert "<cad>" not in text
+    assert "<power>" not in text
+    assert "<hr>" not in text
+
+
 def test_write_gpx_with_utc_offset(tmp_path):
     t0 = datetime(2026, 7, 14, 18, 57, 37)
     out = tmp_path / "route.gpx"

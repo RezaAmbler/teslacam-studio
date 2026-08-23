@@ -529,6 +529,26 @@ def write_gpx(samples: list[dict], out_path: str,
             # to derive speed from consecutive lat/lon/time) avoids GPS-position
             # noise in a --gauge speedometer needle.
             ext.append(f"<speed>{s['speed_mps']:.3f}</speed>")
+        # Same repurposing trick as speed_mps above, for the FSD-overlay foundation
+        # (tesla_fsd_overlay.py / tesla_fsd_metrics.py): fudge() only recognizes a
+        # fixed handful of extension tag names -- atemp, hr, cad, power, speed --
+        # so a "tesla:lateral_g" tag would be silently dropped like "tesla:speed_mps"
+        # was. <cad> ("cadence", rpm) carries linear_acceleration_mps2_x (the
+        # confirmed lateral axis), <power> (watts) carries linear_acceleration_mps2_y
+        # (the confirmed longitudinal axis), and <hr> ("heart rate", bpm) carries
+        # autopilot_state -- none of that is actual cadence/power/heart-rate data,
+        # it's raw m/s^2 and a small integer state code smuggled through units
+        # gopro-overlay's GPX parser will accept without complaint. tesla_fsd_
+        # overlay.py's axis-decode step (tesla_fsd_metrics.decode_fsd_fields) is
+        # what turns these back into named fields. <atemp> is left free for now --
+        # a natural slot for linear_acceleration_mps2_z or steering_wheel_angle if
+        # a later branch needs them.
+        if s.get("linear_acceleration_mps2_x") is not None:
+            ext.append(f"<cad>{s['linear_acceleration_mps2_x']:.4f}</cad>")
+        if s.get("linear_acceleration_mps2_y") is not None:
+            ext.append(f"<power>{s['linear_acceleration_mps2_y']:.4f}</power>")
+        if s.get("autopilot_state") is not None:
+            ext.append(f"<hr>{s['autopilot_state']}</hr>")
         if s.get("heading") is not None:
             ext.append(f"<tesla:course_deg>{s['heading']:.2f}</tesla:course_deg>")
         if s.get("frame_seq") is not None:
