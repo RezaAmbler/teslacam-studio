@@ -84,7 +84,13 @@ def test_write_gauge_layout_contains_all_four_widgets(tmp_path):
     tc.write_gauge_layout(path, 2896, 1876, "mph")
     frame = _parse_gauge_layout(path)
     types = [c.get("type") for c in frame.iter("component")]
-    assert types == ["msi", "compass", "metric", "text", "chart"]
+    # Two <text> components: the "MPH" unit label under the speed readout,
+    # and the "SPEED, LAST 30s" label above the chart (the chart's own
+    # min/max axis numbers otherwise don't say what they're measuring).
+    # compass-arrow (not compass): fixed N/S/E/W ring, red rotating heading
+    # arrow -- gopro-overlay's plain "compass" has no color attribute at all
+    # to pick a heading marker out in a different color.
+    assert types == ["msi", "compass-arrow", "metric", "text", "text", "chart"]
 
 
 def test_write_gauge_layout_sections_dont_overlap_and_fit_panel(tmp_path):
@@ -107,6 +113,27 @@ def test_write_gauge_layout_sections_dont_overlap_and_fit_panel(tmp_path):
     assert chart_x + chart_w <= panel_w
 
 
+def test_write_gauge_layout_chart_has_a_label_above_it(tmp_path):
+    # The chart's own min/max axis numbers (gopro-overlay's default chart
+    # decoration) don't say what they're measuring on their own -- this label
+    # names the metric and the rolling window, kept in sync with the chart's
+    # own `seconds=` via GAUGE_CHART_SECONDS so they can't drift apart.
+    path = tmp_path / "gauge.xml"
+    tc.write_gauge_layout(path, 2896, 1876, "mph")
+    frame = _parse_gauge_layout(path)
+    chart_el = frame.find("./component[@type='chart']")
+    assert chart_el.get("seconds") == str(tc.GAUGE_CHART_SECONDS)
+
+    texts = frame.findall("./component[@type='text']")
+    chart_label = texts[-1]  # unit label ("MPH") comes first, chart label second
+    assert chart_label.text == f"SPEED, LAST {tc.GAUGE_CHART_SECONDS}s"
+    # Sits directly above the chart, same x, and doesn't overlap it vertically.
+    assert int(chart_label.get("x")) == int(chart_el.get("x"))
+    label_y = int(chart_label.get("y"))
+    chart_y = int(chart_el.get("y"))
+    assert label_y < chart_y
+
+
 @pytest.mark.parametrize("units", ["mph", "kph"])
 def test_write_gauge_layout_units_threaded_through_and_labelled(tmp_path, units):
     path = tmp_path / "gauge.xml"
@@ -123,15 +150,16 @@ def test_write_gauge_layout_units_threaded_through_and_labelled(tmp_path, units)
 
 
 def test_write_gauge_layout_msi_and_compass_need_translate_wrapper(tmp_path):
-    # gopro-overlay's msi/compass components don't accept x/y attributes of
-    # their own (unlike metric/text/chart) -- confirmed by reading
-    # gopro_overlay/layout_xml.py's @allow_attributes lists. If this ever
-    # regressed to emitting x/y directly on <component type="msi"|"compass">,
-    # gopro-dashboard.py would reject the layout outright.
+    # gopro-overlay's msi/compass-arrow components don't accept x/y
+    # attributes of their own (unlike metric/text/chart) -- confirmed by
+    # reading gopro_overlay/layout_xml.py's @allow_attributes lists. If this
+    # ever regressed to emitting x/y directly on <component
+    # type="msi"|"compass-arrow">, gopro-dashboard.py would reject the
+    # layout outright.
     path = tmp_path / "gauge.xml"
     tc.write_gauge_layout(path, 2896, 1876, "mph")
     frame = _parse_gauge_layout(path)
-    for tag in ("msi", "compass"):
+    for tag in ("msi", "compass-arrow"):
         el = frame.find(f".//component[@type='{tag}']")
         assert "x" not in el.attrib and "y" not in el.attrib
         parent_tag = None
@@ -139,6 +167,18 @@ def test_write_gauge_layout_msi_and_compass_need_translate_wrapper(tmp_path):
             if el in list(parent):
                 parent_tag = parent.tag
         assert parent_tag == "translate"
+
+
+def test_write_gauge_layout_compass_arrow_is_red(tmp_path):
+    # The heading arrow is colored (compass-arrow's `arrow=` attribute) so
+    # it reads distinctly from the fixed white N/S/E/W ring -- the standard
+    # red-arrow compass convention the plain "compass" widget can't do at
+    # all (single shared `fg` color for everything).
+    path = tmp_path / "gauge.xml"
+    tc.write_gauge_layout(path, 2896, 1876, "mph")
+    frame = _parse_gauge_layout(path)
+    el = frame.find(".//component[@type='compass-arrow']")
+    assert el.get("arrow") == tc.GAUGE_COMPASS_ARROW_RGB
 
 
 def test_write_gauge_layout_is_valid_xml_for_every_size():

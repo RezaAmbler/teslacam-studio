@@ -120,6 +120,8 @@ GAUGE_PAD_FRAC = 0.08       # inner padding, as a fraction of panel height
 # Left-to-right width shares of the panel's four sections: dial, compass,
 # speed readout, chart.
 GAUGE_SECTION_WEIGHTS = (3, 2, 2, 3)
+GAUGE_CHART_SECONDS = 30    # chart's rolling window -- also drives its label text
+GAUGE_COMPASS_ARROW_RGB = "255,0,0"   # heading arrow color (red -- standard compass convention)
 
 
 # The live progress display, if one is running. log()/die() consult it so an
@@ -879,8 +881,11 @@ def write_map_layout(path, tile_w, tile_h, zoom=18, line_width=6):
 def write_gauge_layout(path, tile_w, tile_h, units):
     """Write a gopro-overlay layout holding the --gauge dashboard panel: a
     dark rounded box positioned bottom-left over the tile, with (left to
-    right) a speedometer dial (msi), a compass, a big speed readout + unit
-    label, and a recent-speed sparkline chart.
+    right) a speedometer dial (msi), a compass-arrow (fixed N/S/E/W ring,
+    red rotating heading arrow), a big speed readout + unit label, and a
+    recent-speed sparkline chart with its own "SPEED, LAST 30s"-style label
+    (the chart's own min/max axis numbers don't say what they're measuring
+    on their own).
 
     `units` is "mph" or "kph" -- passed straight through as each gopro-overlay
     component's own `units=` attribute (Converters recognizes both directly),
@@ -920,6 +925,16 @@ def write_gauge_layout(path, tile_w, tile_h, units):
     speed_size = max(8, round(inner_h * 0.55))
     unit_size = max(6, round(inner_h * 0.22))
 
+    # The chart is an unlabeled sparkline otherwise -- its own min/max axis
+    # numbers (gopro-overlay's default chart decoration) don't say WHAT they're
+    # measuring. A small label above it, naming the metric and the rolling
+    # window (kept in sync with `seconds=` below via GAUGE_CHART_SECONDS so
+    # they can't drift apart), makes it self-explanatory at a glance.
+    chart_label_size = max(6, round(inner_h * 0.14))
+    chart_label_gap = max(2, round(chart_label_size * 0.3))
+    chart_y = pad + chart_label_size + chart_label_gap
+    chart_h = max(2, inner_h - chart_label_size - chart_label_gap)
+
     Path(path).write_text(
         "<layout>\n"
         f'    <frame x="{panel_x}" y="{panel_y}" width="{panel_w}" height="{panel_h}" '
@@ -929,14 +944,24 @@ def write_gauge_layout(path, tile_w, tile_h, units):
         f'units="{units}" needle="1"/>\n'
         "        </translate>\n"
         f'        <translate x="{compass_x}" y="{pad}">\n'
-        f'            <component type="compass" size="{dial}"/>\n'
+        # compass-arrow, not compass: a fixed N/S/E/W ring with a single
+        # arrow that rotates to the current heading, colored via `arrow=`
+        # (gopro-overlay's plain `compass` widget has no equivalent color
+        # attribute at all -- its ticks/triangles/dial all share one `fg`
+        # color, so there's no way to pick out a heading marker in a
+        # different color from that widget).
+        f'            <component type="compass-arrow" size="{dial}" '
+        f'arrow="{GAUGE_COMPASS_ARROW_RGB}"/>\n'
         "        </translate>\n"
         f'        <component type="metric" x="{speed_x}" y="{pad}" metric="speed" '
         f'units="{units}" dp="0" size="{speed_size}"/>\n'
         f'        <component type="text" x="{speed_x}" y="{pad + speed_size + 4}" '
         f'size="{unit_size}">{units.upper()}</component>\n'
-        f'        <component type="chart" x="{chart_x}" y="{pad}" metric="speed" '
-        f'units="{units}" width="{chart_w}" height="{inner_h}" seconds="30"/>\n'
+        f'        <component type="text" x="{chart_x}" y="{pad}" '
+        f'size="{chart_label_size}">SPEED, LAST {GAUGE_CHART_SECONDS}s</component>\n'
+        f'        <component type="chart" x="{chart_x}" y="{chart_y}" metric="speed" '
+        f'units="{units}" width="{chart_w}" height="{chart_h}" '
+        f'seconds="{GAUGE_CHART_SECONDS}"/>\n'
         "    </frame>\n"
         "</layout>\n"
     )
