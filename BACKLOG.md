@@ -48,3 +48,24 @@ Known work, roughly highest-value first. Each item links to the detail it needs.
   county pulls mostly-empty tiles it never displays. A corridor around the route
   would cut this hugely, but the change belongs in gopro-overlay, not here.
   → [`docs/map-zoom-findings.md`](docs/map-zoom-findings.md#why-bbox-not-corridor)
+
+## Research spikes (ideation only, not measured)
+
+- **Elevation on `--map`/`--gauge`.** Tesla's SEI telemetry has no altitude
+  field at all — not a parsing gap, never transmitted. Getting it means an
+  external elevation lookup by lat/lon (same shape as `--map`'s existing OSM
+  tile fetch — needs the same batching/caching discipline the `--map-zoom`
+  lesson taught, or it repeats that mistake with a different API), or a
+  much lower-fidelity IMU-integration cue with no network dependency.
+  → [`docs/elevation-findings.md`](docs/elevation-findings.md)
+
+- **A translucent map inset on the front camera, instead of a sidebar
+  tile.** HUD-style: the route map as a semi-transparent overlay in the
+  front tile's corner rather than a separate grid cell. Structurally very
+  close to how `--gauge` already composites a panel onto the hero camera
+  (same `--input`-driven gopro-dashboard.py overlay mechanism) — and the
+  translucency itself is already proven working (`--gauge`'s own panel
+  background is a translucent value rendering correctly today), so the
+  open questions are UX/design (replace the tile or add a mode?, exact
+  placement/opacity) rather than "can this even work".
+  → [`docs/translucent-map-overlay-findings.md`](docs/translucent-map-overlay-findings.md)
