@@ -371,6 +371,7 @@ class Args:
         self.blur_faces = False
         self.map = False
         self.map_mag = 2.0
+        self.gauge = False
         self.speed = 1.0
         self.__dict__.update(kw)
 

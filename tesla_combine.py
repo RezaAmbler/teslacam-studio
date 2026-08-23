@@ -19,6 +19,8 @@ Usage:
     python3 tesla_combine.py /path/to/event/folder --map      # add a live GPS route-map tile (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --map --map-mag 3   # tighter, navigation-style map view
     python3 tesla_combine.py /path/to/event/folder --map --map-mag 1 --map-zoom 16  # wider, sharper (e.g. highway)
+    python3 tesla_combine.py /path/to/event/folder --gauge     # composite a speed/compass dashboard onto the hero tile (needs gopro-overlay in ./.venv)
+    python3 tesla_combine.py /path/to/event/folder --gauge --gauge-units kph
     python3 tesla_combine.py /path/to/event/folder --verbose  # raw ffmpeg/deface output instead of the progress display
     python3 tesla_combine.py /path/to/event/folder --dry-run  # print commands, do nothing
 
@@ -31,7 +33,8 @@ Output (written next to the input folder unless --output-dir is given):
     <session>_<angle>_combined.mp4   -- one lossless concat per camera angle
     <session>_<angle>_blurred.mp4    -- (with --blur-faces) that concat, faces anonymized
     <session>_maptile.mp4            -- (with --map) the standalone live route-map tile
-    <session>_grid[_feature-X][_blurred][_map].mp4 -- labeled multi-camera composite w/ clock
+    <session>_<hero-angle>_gauge.mp4 -- (with --gauge) that hero tile, dashboard overlay composited on
+    <session>_grid[_feature-X][_blurred][_gauge][_map].mp4 -- labeled multi-camera composite w/ clock
 """
 
 import argparse
@@ -49,7 +52,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-SCRIPT_VERSION = "2.3"
+SCRIPT_VERSION = "2.4"
 # Separate from SCRIPT_VERSION so feature releases can bump the script version
 # without invalidating every cached per-camera concat (concat semantics are
 # unchanged). Bump this ONLY when the concat output itself would change.
@@ -96,6 +99,27 @@ MAP_FONT_CANDIDATES = [
     "/Library/Fonts/Arial.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
 ]
+
+# --- gauge dashboard overlay (--gauge) ----------------------------------------
+# A dark, semi-transparent rounded panel composited bottom-left onto the hero
+# camera tile, holding (left to right) a speedometer dial, a compass, a big
+# speed readout, and a recent-speed sparkline chart. Built the same way the
+# map tile is: gopro-overlay renders a gopro-overlay XML layout, but for the
+# gauge it composites straight onto our own video (see build_gauge_overlay)
+# rather than onto a synthetic-size widget layer, so no --overlay-size/scale
+# pass is needed here.
+#
+# Every fraction below is pixel-estimated off the one surviving sample render
+# (see the module docstring / CLAUDE.md) -- a starting point that must be
+# tuned against a real rendered frame, exactly like SIDEBAR_FONT_SIZE was for
+# --landscape.
+GAUGE_PANEL_W_FRAC = 0.47   # panel width, as a fraction of the tile width
+GAUGE_PANEL_H_FRAC = 0.17   # panel height, as a fraction of the tile height
+GAUGE_MARGIN = 24           # px from the tile's bottom-left corner
+GAUGE_PAD_FRAC = 0.08       # inner padding, as a fraction of panel height
+# Left-to-right width shares of the panel's four sections: dial, compass,
+# speed readout, chart.
+GAUGE_SECTION_WEIGHTS = (3, 2, 2, 3)
 
 
 # The live progress display, if one is running. log()/die() consult it so an
@@ -149,7 +173,7 @@ def human_time(sec):
 class Step:
     """One unit of work in the job plan. `work` is in seconds of footage (output
     seconds for the grid), the unit every rate below is relative to."""
-    kind: str        # concat | blur | map_gps | map_render | map_scale | grid
+    kind: str        # concat | blur | map_gps | map_render | map_scale | gauge_render | grid
     label: str
     work: float
 
@@ -164,10 +188,12 @@ RATE_PRIORS = {
     "map_gps": 5.0,      # demux + SEI decode, per clip
     "map_render": 1.0,   # gopro-overlay route render
     "map_scale": 8.0,    # small libx264 upscale pass
+    "gauge_render": 1.0, # gopro-overlay dashboard-panel render + ffmpeg overlay
     "grid": 2.0,         # VideoToolbox hardware encode
 }
-KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "map GPS",
-               "map_render": "map render", "map_scale": "map upscale", "grid": "grid"}
+KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "GPS extract",
+               "map_render": "map render", "map_scale": "map upscale",
+               "gauge_render": "gauge render", "grid": "grid"}
 BAR_FULL, BAR_EMPTY = "█", "░"
 BAR_FULL_ASCII, BAR_EMPTY_ASCII = "#", "-"
 LABEL_W = 26
@@ -519,6 +545,15 @@ def human_eta(sec):
     return f"{h}h {m:02d}m" if h else f"{m}m"
 
 
+def hero_angles_for(feature):
+    """The angle(s) making up the hero row/tile for a --feature choice: both
+    cameras of a PAIR_DEFS pair (e.g. 'repeaters'), or a single-item list for
+    a solo angle. Shared by build_rows, landscape_layout, and the --gauge
+    hero-tile lookup in build_grid -- one place for an expression all three
+    would otherwise duplicate."""
+    return list(PAIR_DEFS[feature]) if feature in PAIR_DEFS else [feature]
+
+
 def build_rows(present_angles, feature):
     """
     Lay out rows top to bottom given which camera angles are actually present
@@ -535,7 +570,7 @@ def build_rows(present_angles, feature):
     the hero row, used elsewhere to decide label font size and whether a row
     needs upscaling instead of padding.
     """
-    hero_angles = list(PAIR_DEFS[feature]) if feature in PAIR_DEFS else [feature]
+    hero_angles = hero_angles_for(feature)
     remaining = [a for a in present_angles if a not in hero_angles]
 
     rows = []
@@ -841,6 +876,72 @@ def write_map_layout(path, tile_w, tile_h, zoom=18, line_width=6):
     )
 
 
+def write_gauge_layout(path, tile_w, tile_h, units):
+    """Write a gopro-overlay layout holding the --gauge dashboard panel: a
+    dark rounded box positioned bottom-left over the tile, with (left to
+    right) a speedometer dial (msi), a compass, a big speed readout + unit
+    label, and a recent-speed sparkline chart.
+
+    `units` is "mph" or "kph" -- passed straight through as each gopro-overlay
+    component's own `units=` attribute (Converters recognizes both directly),
+    so no --units-speed flag on the gopro-dashboard.py invocation is needed.
+
+    Panel/section sizing is entirely in terms of tile_w/tile_h (see the
+    GAUGE_* fractions above), so this works unchanged for both the tall
+    grid's full-width hero row and landscape's native-res hero block -- no
+    orientation-specific logic needed here either.
+
+    gopro-overlay's msi/compass components don't accept x/y attributes of
+    their own (unlike metric/text/chart, which do) -- they're positioned by
+    wrapping each in a <translate>, the same mechanism write_map_layout
+    already uses for moving_journey_map.
+    """
+    panel_w = max(2, round(tile_w * GAUGE_PANEL_W_FRAC))
+    panel_h = max(2, round(tile_h * GAUGE_PANEL_H_FRAC))
+    panel_x = GAUGE_MARGIN
+    panel_y = tile_h - panel_h - GAUGE_MARGIN
+
+    pad = max(4, round(panel_h * GAUGE_PAD_FRAC))
+    inner_h = max(2, panel_h - 2 * pad)
+    dial = inner_h  # msi/compass are square, sized to the panel's inner height
+
+    inner_w = max(2, panel_w - 2 * pad)
+    total_weight = sum(GAUGE_SECTION_WEIGHTS)
+    dial_w, compass_w, speed_w, _ = (
+        max(2, round(inner_w * w / total_weight)) for w in GAUGE_SECTION_WEIGHTS
+    )
+
+    msi_x = pad
+    compass_x = msi_x + dial_w
+    speed_x = compass_x + compass_w
+    chart_x = speed_x + speed_w
+    chart_w = max(2, panel_w - pad - chart_x)
+
+    speed_size = max(8, round(inner_h * 0.55))
+    unit_size = max(6, round(inner_h * 0.22))
+
+    Path(path).write_text(
+        "<layout>\n"
+        f'    <frame x="{panel_x}" y="{panel_y}" width="{panel_w}" height="{panel_h}" '
+        f'cr="{pad}" bg="0,0,0,180">\n'
+        f'        <translate x="{msi_x}" y="{pad}">\n'
+        f'            <component type="msi" size="{dial}" metric="speed" '
+        f'units="{units}" needle="1"/>\n'
+        "        </translate>\n"
+        f'        <translate x="{compass_x}" y="{pad}">\n'
+        f'            <component type="compass" size="{dial}"/>\n'
+        "        </translate>\n"
+        f'        <component type="metric" x="{speed_x}" y="{pad}" metric="speed" '
+        f'units="{units}" dp="0" size="{speed_size}"/>\n'
+        f'        <component type="text" x="{speed_x}" y="{pad + speed_size + 4}" '
+        f'size="{unit_size}">{units.upper()}</component>\n'
+        f'        <component type="chart" x="{chart_x}" y="{pad}" metric="speed" '
+        f'units="{units}" width="{chart_w}" height="{inner_h}" seconds="30"/>\n'
+        "    </frame>\n"
+        "</layout>\n"
+    )
+
+
 def retime_samples(clip_samples, clip_fps, clip_durations, offset, grid_dur):
     """Re-time per-clip GPS samples onto the CONCATENATED grid timeline.
 
@@ -889,26 +990,80 @@ def retime_samples(clip_samples, clip_fps, clip_durations, offset, grid_dur):
     return retimed
 
 
-def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
-                   venv_py, gopro_script, font, zoom, mag, out_path, tmpdir, dry_run,
-                   progress):
-    """Build the live route-map tile from the car's GPS. Returns out_path, or
-    None if the selected clips carry no GPS telemetry.
+def build_route_gpx(source_clips, offset, grid_dur, ffmpeg, ffprobe, out_gpx_path,
+                    dry_run, progress):
+    """Extract GPS from the ORIGINAL source clips (SEI lives in the source
+    bitstream; concat/blurred outputs don't carry it) and write it as a GPX
+    re-timed onto the CONCATENATED grid timeline. Returns out_gpx_path, or
+    None if the selected clips carry no GPS/SEI telemetry.
 
-    Re-timing is the crux of keeping the map in sync with the grid. The grid
-    concatenates clips and squeezes out recording gaps, so a wall-clock map would
-    drift apart from the footage. Instead each GPS sample is placed on the
-    CONCATENATED timeline: time = (sum of prior clip durations) + frame_index/fps
-    -- using the per-frame provenance tesla_gps emits. The map is rendered at 1x;
-    the grid's own speed/fps filter then scales every tile (map included)
-    together, so they stay locked. GPS comes from the ORIGINAL source clips (SEI
-    lives in the source bitstream; the concat/deface outputs don't carry it).
+    Shared by build_map_tile and build_gauge_overlay's caller in build_grid,
+    so requesting --map --gauge together extracts and retimes GPS ONCE, not
+    twice -- a real cost (minutes on a long drive per CLAUDE.md).
+
+    (Two params beyond the ones named in the original design sketch --
+    `ffmpeg`/`ffprobe` -- are needed here: tesla_gps.extract_samples and
+    probe_duration can't run without them.)
+
+    Re-timing is the crux of keeping either overlay in sync with the grid. The
+    grid concatenates clips and squeezes out recording gaps, so a wall-clock
+    placement would drift apart from the footage. Instead each GPS sample is
+    placed at time = (sum of prior clip durations) + frame_index/fps -- using
+    the per-frame provenance tesla_gps emits (see retime_samples).
     """
-    import tesla_gps  # local import: only needed for --map, keeps base runs lean
+    import tesla_gps  # local import: only needed for --map/--gauge, keeps base runs lean
 
+    if dry_run:
+        log("== would extract GPS from the source clips, re-time onto the grid "
+            "timeline, and write a GPX ==")
+        return out_gpx_path
+
+    progress.begin("map_gps", "GPS extract", grid_dur)
+    # Gather each clip's samples/fps/duration (the ffmpeg/tesla_gps side effects),
+    # then hand the plain data to retime_samples for the pure re-timing math.
+    clip_samples, clip_fps, clip_durs = [], [], []
+    for idx, clip in enumerate(source_clips):
+        progress.update(frac=idx / max(1, len(source_clips)))
+        clip_samples.append(tesla_gps.extract_samples(str(clip), ffmpeg, ffprobe))
+        clip_fps.append(tesla_gps.probe_fps(str(clip), ffprobe))
+        dur = probe_duration(ffprobe, clip)
+        if dur is None:
+            # Never silently add 0 -- that would shift every later clip's GPS
+            # earlier on the concat timeline while its frames still play, quietly
+            # desyncing the overlay. Estimate from the next clip's filename start
+            # (else a nominal 60s) and say so.
+            nxt = source_clips[idx + 1] if idx + 1 < len(source_clips) else None
+            here = tesla_gps.parse_clip_time(str(clip))
+            there = tesla_gps.parse_clip_time(str(nxt)) if nxt else None
+            dur = (there - here).total_seconds() if (here and there) else 60.0
+            log(f"WARNING: could not probe {Path(clip).name}; estimating "
+                f"{dur:.1f}s to keep the overlay in sync.")
+        clip_durs.append(dur)
+
+    retimed = retime_samples(clip_samples, clip_fps, clip_durs, offset, grid_dur)
+    progress.end()
+
+    if not retimed:
+        log("== the selected clips carry no GPS/SEI telemetry -- skipping "
+            "--map/--gauge; the grid is built without them ==")
+        return None
+
+    tesla_gps.write_gpx(retimed, str(out_gpx_path), track_name="Tesla route",
+                        tz=timezone.utc)
+    log(f"== wrote {len(retimed)}-point route GPX ==")
+    return out_gpx_path
+
+
+def build_map_tile(gpx_path, grid_dur, tile_dims, ffmpeg, venv_py, gopro_script,
+                   font, zoom, mag, out_path, tmpdir, dry_run, progress):
+    """Render the live route-map tile from an already-built GPX (see
+    build_route_gpx). Returns out_path.
+
+    The map is rendered at 1x; the grid's own speed/fps filter then scales
+    every tile (map included) together, so they stay locked.
+    """
     tile_w, tile_h = tile_dims
     layout_path = tmpdir / "map_layout.xml"
-    gpx_path = tmpdir / "map_route.gpx"
     # To zoom tighter than OSM's max tile zoom (19), render fewer map pixels -- a
     # smaller ground area at the same zoom -- and upscale to fill the tile: a
     # `mag`x magnification. mag == 1 renders straight to the tile at native
@@ -935,52 +1090,15 @@ def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
                  str(out_path)]
 
     if dry_run:
-        log("== [--map] would extract GPS from the source clips, re-time onto the "
-            "grid timeline, write a GPX, and render the route-map tile"
+        log("== [--map] would render the route-map tile from the extracted GPX"
             f"{f' ({mag}x magnified)' if magnifying else ''} ==")
         for c in ([gopro_cmd, scale_cmd] if magnifying else [gopro_cmd]):
             printable = " ".join(f"'{a}'" if " " in a else a for a in c)
             log(f"$ {printable}")
         return out_path
 
-    progress.begin("map_gps", "map GPS extract", grid_dur)
-    # Gather each clip's samples/fps/duration (the ffmpeg/tesla_gps side effects),
-    # then hand the plain data to retime_samples for the pure re-timing math.
-    clip_samples, clip_fps, clip_durs = [], [], []
-    for idx, clip in enumerate(source_clips):
-        progress.update(frac=idx / max(1, len(source_clips)))
-        clip_samples.append(tesla_gps.extract_samples(str(clip), ffmpeg, ffprobe))
-        clip_fps.append(tesla_gps.probe_fps(str(clip), ffprobe))
-        dur = probe_duration(ffprobe, clip)
-        if dur is None:
-            # Never silently add 0 -- that would shift every later clip's GPS
-            # earlier on the concat timeline while its frames still play, quietly
-            # desyncing the map. Estimate from the next clip's filename start
-            # (else a nominal 60s) and say so.
-            nxt = source_clips[idx + 1] if idx + 1 < len(source_clips) else None
-            here = tesla_gps.parse_clip_time(str(clip))
-            there = tesla_gps.parse_clip_time(str(nxt)) if nxt else None
-            dur = (there - here).total_seconds() if (here and there) else 60.0
-            log(f"WARNING: [--map] could not probe {Path(clip).name}; estimating "
-                f"{dur:.1f}s to keep the map in sync.")
-        clip_durs.append(dur)
-
-    retimed = retime_samples(clip_samples, clip_fps, clip_durs, offset, grid_dur)
-    progress.end()
-
-    if not retimed:
-        log("== [--map] the selected clips carry no GPS/SEI telemetry -- skipping "
-            "map tile; the grid is built without it ==")
-        # The render/upscale steps will never happen; drop them so the job ETA
-        # stops counting work that isn't coming.
-        progress.abandon("map_render", "map_scale")
-        return None
-
-    tesla_gps.write_gpx(retimed, str(gpx_path), track_name="Tesla route",
-                        tz=timezone.utc)
     log(f"== [--map] rendering route-map tile ({render_w}x{render_h}"
-        f"{f' ->{tile_w}x{tile_h} ({mag}x magnified)' if magnifying else ''}, "
-        f"{len(retimed)} points) ==")
+        f"{f' ->{tile_w}x{tile_h} ({mag}x magnified)' if magnifying else ''}) ==")
     # gopro-overlay's runtime tracks the route, not the footage length, and it
     # reports no parseable progress -- show elapsed time rather than a fake bar.
     progress.begin("map_render", "route map render", grid_dur, determinate=False,
@@ -992,6 +1110,58 @@ def build_map_tile(source_clips, offset, grid_dur, tile_dims, ffmpeg, ffprobe,
         run(scale_cmd, dry_run=False, what="ffmpeg (map magnify)",
             progress=progress, total=grid_dur)
         progress.end()
+    return out_path
+
+
+def build_gauge_overlay(hero_video_path, gpx_path, tile_dims, units, ffmpeg, venv_py,
+                        gopro_script, font, out_path, tmpdir, dry_run, progress):
+    """Composite the speed/compass dashboard panel onto the hero camera tile.
+    Returns out_path.
+
+    Unlike build_map_tile (which renders a synthetic-size widget layer and
+    needs --overlay-size), this hands gopro-dashboard.py the hero video
+    itself as its positional `input` argument (immediately followed by
+    `output` -- gopro-dashboard.py's argparser has both `input` and `output`
+    as bare positionals, and with a run of optional flags in between the two
+    tokens it mis-assigns them, e.g. treating a lone leading `input` token as
+    satisfying the required `output` positional instead and erroring on the
+    trailing path as "unrecognized arguments"; confirmed by running it for
+    real. Keeping them adjacent, before any --flags, parses correctly): with
+    --use-gpx-only AND a video input, gopro-dashboard reads that video's real
+    dimensions/duration itself (find_recording(), a plain ffprobe of the
+    video stream -- no GoPro-specific metadata track needed) and runs its own
+    internal ffmpeg `[0:v][1:v]overlay` compositing pass (FFMPEGOverlayVideo,
+    in gopro_overlay/ffmpeg_overlay.py) -- producing a fully-composited output
+    video in one subprocess call. No filter-graph code of our own is
+    involved; build_filter/build_filter_landscape never learn a gauge was
+    composited -- they just see a different source file at the same
+    resolution (angle_paths[hero] is swapped in build_grid before either
+    runs).
+    """
+    tile_w, tile_h = tile_dims
+    layout_path = tmpdir / "gauge_layout.xml"
+    write_gauge_layout(layout_path, tile_w, tile_h, units=units)
+
+    gopro_cmd = [
+        str(venv_py), str(gopro_script), str(hero_video_path), str(out_path),
+        "--use-gpx-only", "--gpx", str(gpx_path),
+        "--layout", "xml", "--layout-xml", str(layout_path),
+        "--font", font, "--ffmpeg-dir", str(Path(ffmpeg).parent),
+    ]
+
+    if dry_run:
+        log("== [--gauge] would composite the speed/compass dashboard panel "
+            "onto the hero camera tile ==")
+        printable = " ".join(f"'{a}'" if " " in a else a for a in gopro_cmd)
+        log(f"$ {printable}")
+        return out_path
+
+    log(f"== [--gauge] compositing dashboard overlay onto {Path(hero_video_path).name} ==")
+    # Same as the map render: gopro-overlay reports no parseable progress here.
+    progress.begin("gauge_render", "gauge overlay render", determinate=False,
+                   out=out_path)
+    run(gopro_cmd, dry_run=False, what="gopro-dashboard (gauge overlay)", progress=progress)
+    progress.end()
     return out_path
 
 
@@ -1435,7 +1605,7 @@ def landscape_layout(dims, feature):
     always the sidebar's remainder-clamped last tile in
     build_filter_landscape, never a middle one.
     """
-    hero_angles = list(PAIR_DEFS[feature]) if feature in PAIR_DEFS else [feature]
+    hero_angles = hero_angles_for(feature)
     sidebar_angles = [a for a in CAMERA_ANGLES if a in dims and a not in hero_angles]
     if MAP_TILE_KEY in dims and MAP_TILE_KEY not in hero_angles:
         sidebar_angles.append(MAP_TILE_KEY)
@@ -1694,6 +1864,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "navigation-style view (default: 2.0; 1.0 = off/sharpest). The map is "
                          "rendered smaller then upscaled, so higher = tighter but softer. "
                          "e.g. 2 shows ~half the area, 3 ~a third. Try 3 for a very close view.")
+    ap.add_argument("--gauge", action="store_true",
+                    help="composite a speed/compass dashboard panel (dial, compass, big speed "
+                         "readout, sparkline chart) onto the hero camera tile. Same prerequisites "
+                         "as --map (SEI telemetry, gopro-overlay in ./.venv -- see --map's help). "
+                         "v1 only supports a solo hero: --feature must be a single camera, not a "
+                         "pair like 'repeaters'.")
+    ap.add_argument("--gauge-units", default="mph", choices=["mph", "kph"],
+                    help="speed units for --gauge (default: mph, matching US driving footage).")
     ap.add_argument("--force-concat", action="store_true",
                     help="rebuild the per-camera concats even if matching ones already exist")
     ap.add_argument("--skip-space-check", action="store_true", help="don't pre-flight free disk space")
@@ -1711,7 +1889,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 @dataclass
 class Tools:
-    """Resolved external tool paths + label/blur/map capability flags for one run."""
+    """Resolved external tool paths + label/blur/map/gauge capability flags for
+    one run. map_venv_py/map_gopro/map_font are shared by --map and --gauge --
+    both use the same gopro-overlay installation."""
     ffmpeg: str
     ffprobe: str
     has_text: bool
@@ -1761,22 +1941,31 @@ def setup_tools(args) -> Tools:
                 "(CPU-only works -- no GPU required; the first run downloads a ~36MB "
                 "face-detection model.)")
 
-    if args.map:
+    if args.map or args.gauge:
+        # --map and --gauge share the same gopro-overlay tooling and GPS
+        # extraction (see build_route_gpx) -- one discovery/validation block
+        # for both.
         script_dir = Path(__file__).resolve().parent
         map_venv_py, map_gopro, map_missing = find_map_tooling(script_dir)
         if map_missing:
-            die("--map needs the gopro-overlay tool in a sibling .venv next to this script.\n"
+            flag = "--map/--gauge" if (args.map and args.gauge) else ("--map" if args.map else "--gauge")
+            die(f"{flag} needs the gopro-overlay tool in a sibling .venv next to this script.\n"
                 "Set it up with:\n"
                 "  python3.12 -m venv .venv && ./.venv/bin/python -m pip install gopro-overlay\n"
                 f"Missing: {', '.join(map_missing)}")
-        if not 1 <= args.map_zoom <= 19:
-            die(f"--map-zoom {args.map_zoom} is out of range; OSM tiles support 1-19 "
-                f"(default 19; use --map-mag to go tighter).")
-        if not 1.0 <= args.map_mag <= 4.0:
-            die(f"--map-mag {args.map_mag} is out of range; use 1.0 (off) to 4.0. "
-                f"Higher magnifies more (tighter) but softer.")
+        if args.map:
+            if not 1 <= args.map_zoom <= 19:
+                die(f"--map-zoom {args.map_zoom} is out of range; OSM tiles support 1-19 "
+                    f"(default 19; use --map-mag to go tighter).")
+            if not 1.0 <= args.map_mag <= 4.0:
+                die(f"--map-mag {args.map_mag} is out of range; use 1.0 (off) to 4.0. "
+                    f"Higher magnifies more (tighter) but softer.")
         tools.map_venv_py, tools.map_gopro = map_venv_py, map_gopro
         tools.map_font = find_map_font()
+
+    if args.gauge and len(hero_angles_for(args.feature)) > 1:
+        die("--gauge needs a solo --feature (a pair like 'repeaters' has two hero "
+            "tiles) -- pick a single camera.")
 
     return tools
 
@@ -1883,13 +2072,18 @@ def plan_steps(args, selections, footage):
         steps.append(Step("concat", f"concat {angle}", footage[angle]))
         if args.blur_faces:
             steps.append(Step("blur", f"blur faces {angle}", footage[angle]))
-    if args.map:
+    if args.map or args.gauge:
+        # GPS extraction is shared -- one map_gps step regardless of whether
+        # --map, --gauge, or both were requested (see build_route_gpx).
         map_source = "front" if "front" in selections else next(iter(selections))
         map_work = footage[map_source]
-        steps.append(Step("map_gps", "map GPS extract", map_work))
-        steps.append(Step("map_render", "route map render", map_work))
-        if args.map_mag and args.map_mag != 1.0:
-            steps.append(Step("map_scale", f"map upscale ({args.map_mag}x)", map_work))
+        steps.append(Step("map_gps", "GPS extract", map_work))
+        if args.map:
+            steps.append(Step("map_render", "route map render", map_work))
+            if args.map_mag and args.map_mag != 1.0:
+                steps.append(Step("map_scale", f"map upscale ({args.map_mag}x)", map_work))
+        if args.gauge:
+            steps.append(Step("gauge_render", "gauge overlay render", map_work))
     if len(selections) > 1 or args.map:
         # The grid encodes the OUTPUT timeline, which --speed has already scaled.
         steps.append(Step("grid", "grid encode",
@@ -2027,41 +2221,74 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     if not args.dry_run:
         dims = {a: probe_dims(ffprobe, p) for a, p in angle_paths.items()}
 
-    # Build the optional live route-map tile and slot it in beside the back
-    # camera. GPS comes from the ORIGINAL front source clips (SEI lives in
-    # the source bitstream, not the concat/blurred outputs); the tile is
-    # sized to match the back camera so the pair hstacks cleanly.
-    if args.map:
+    # Build the optional live route-map tile and/or --gauge dashboard overlay.
+    # Both need the same GPS: extracted from the ORIGINAL front source clips
+    # (SEI lives in the source bitstream, not the concat/blurred outputs) and
+    # re-timed onto the grid timeline -- build_route_gpx does this ONCE and is
+    # shared by both, so --map --gauge together don't pay for it twice.
+    if args.map or args.gauge:
         t0 = time.monotonic()
         map_source = "front" if "front" in plan.selections else next(iter(plan.selections))
         src_sel, src_off, _ = plan.selections[map_source]
         src_concat = out_dir / f"{session_name}_{map_source}_combined.mp4"
         grid_dur = (probe_duration(ffprobe, src_concat)
                     if not args.dry_run else plan.selections[map_source][2]) or 60.0
-        if args.landscape:
-            # No fixed native aspect of its own -- landscape_layout always
-            # places the map last in the sidebar, where it gets the
-            # remainder-clamped height. Assume a real camera's aspect (same
-            # as every Tesla angle) just to solve for w_side/H here; the
-            # actual per-tile heights (and any rounding drift) are settled
-            # for real in build_filter_landscape once this dims entry exists.
-            placeholder = dims.get("back") or dims.get(map_source) or (1280, 960)
-            _, _, _, _, w_side, _, _ = landscape_layout(
-                {**dims, MAP_TILE_KEY: placeholder}, args.feature)
-            map_dims = (w_side, round(w_side * placeholder[1] / placeholder[0] / 2) * 2)
+        gpx_path = build_route_gpx(src_sel, src_off, grid_dur, ffmpeg, ffprobe,
+                                   tmpdir / "route.gpx", args.dry_run, progress)
+        stats["gps_s"] += time.monotonic() - t0
+
+        if gpx_path is None:
+            # No GPS/SEI telemetry at all -- neither overlay can be built.
+            # Drop their still-pending steps so the job ETA stops counting
+            # work that isn't coming.
+            progress.abandon("map_render", "map_scale", "gauge_render")
         else:
-            map_dims = dims.get("back") or dims.get(map_source) or (1280, 960)
-        # Persist the tile (not tmpdir): it's the slowest new step, it's a
-        # useful standalone artifact, and it survives a later grid-encode failure.
-        map_out = out_dir / f"{session_name}_maptile.mp4"
-        built = build_map_tile(src_sel, src_off, grid_dur, map_dims, ffmpeg,
-                               ffprobe, tools.map_venv_py, tools.map_gopro, tools.map_font,
-                               args.map_zoom, args.map_mag, map_out, tmpdir,
-                               args.dry_run, progress)
-        stats["map_s"] += time.monotonic() - t0
-        if built is not None:
-            angle_paths[MAP_TILE_KEY] = built
-            dims[MAP_TILE_KEY] = map_dims
+            if args.map:
+                t0 = time.monotonic()
+                if args.landscape:
+                    # No fixed native aspect of its own -- landscape_layout
+                    # always places the map last in the sidebar, where it
+                    # gets the remainder-clamped height. Assume a real
+                    # camera's aspect (same as every Tesla angle) just to
+                    # solve for w_side/H here; the actual per-tile heights
+                    # (and any rounding drift) are settled for real in
+                    # build_filter_landscape once this dims entry exists.
+                    placeholder = dims.get("back") or dims.get(map_source) or (1280, 960)
+                    _, _, _, _, w_side, _, _ = landscape_layout(
+                        {**dims, MAP_TILE_KEY: placeholder}, args.feature)
+                    map_dims = (w_side, round(w_side * placeholder[1] / placeholder[0] / 2) * 2)
+                else:
+                    map_dims = dims.get("back") or dims.get(map_source) or (1280, 960)
+                # Persist the tile (not tmpdir): it's a slow step, it's a
+                # useful standalone artifact, and it survives a later
+                # grid-encode failure.
+                map_out = out_dir / f"{session_name}_maptile.mp4"
+                built = build_map_tile(gpx_path, grid_dur, map_dims, ffmpeg,
+                                       tools.map_venv_py, tools.map_gopro, tools.map_font,
+                                       args.map_zoom, args.map_mag, map_out, tmpdir,
+                                       args.dry_run, progress)
+                stats["map_s"] += time.monotonic() - t0
+                angle_paths[MAP_TILE_KEY] = built
+                dims[MAP_TILE_KEY] = map_dims
+
+            if args.gauge:
+                t0 = time.monotonic()
+                # A solo hero is guaranteed by setup_tools (dies early on a
+                # paired --feature), so there's exactly one hero angle here.
+                hero_angle = hero_angles_for(args.feature)[0]
+                # Persist the composited hero (not tmpdir): same rationale as
+                # the map tile -- a real, potentially slow, standalone
+                # artifact, and it replaces angle_paths[hero_angle] below so
+                # both build_filter and build_filter_landscape pick it up
+                # without either needing to know a gauge was composited.
+                gauge_out = out_dir / f"{session_name}_{hero_angle}_gauge.mp4"
+                built = build_gauge_overlay(
+                    angle_paths[hero_angle], gpx_path, dims[hero_angle],
+                    args.gauge_units, ffmpeg, tools.map_venv_py, tools.map_gopro,
+                    tools.map_font, gauge_out, tmpdir, args.dry_run, progress)
+                stats["gauge_s"] += time.monotonic() - t0
+                angle_paths[hero_angle] = built
+                stats["gauge_built"] = True
 
     if len(angle_paths) < 2:
         log("\nOnly one camera angle found -- skipping grid, per-angle concat above is the "
@@ -2098,6 +2325,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     suffix = "_landscape" if args.landscape else ""
     suffix += "" if args.feature == "front" else f"_feature-{args.feature}"
     suffix += "_blurred" if args.blur_faces else ""
+    suffix += "_gauge" if stats.get("gauge_built") else ""
     suffix += "_map" if MAP_TILE_KEY in angle_paths else ""
     out_grid = out_dir / f"{session_name}_grid{suffix}.mp4"
     cmd += ["-an", "-movflags", "+faststart", str(out_grid)]
@@ -2135,10 +2363,15 @@ def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
     log(f"  footage          {human_time(grid_dur)} of combined video")
     log(f"  concat           {human_time(stats['concat_s'])} "
         f"({stats['built']} built, {stats['reused']} reused)")
-    if args.map and stats["map_s"] > 0:
+    if (args.map or args.gauge) and stats["gps_s"] > 0:
+        log(f"  GPS extract      {human_time(stats['gps_s'])}")
+    if args.map:
         map_built = MAP_TILE_KEY in angle_paths
         log(f"  route map        {human_time(stats['map_s'])}"
             f"{'' if map_built else '  (no GPS -- tile skipped)'}")
+    if args.gauge:
+        log(f"  gauge overlay    {human_time(stats['gauge_s'])}"
+            f"{'' if stats['gauge_built'] else '  (no GPS -- overlay skipped)'}")
     if args.blur_faces:
         log(f"  face blur        {human_time(stats['blur_s'])} "
             f"({stats['blurred']} blurred, {stats['blur_reused']} reused)")
@@ -2192,7 +2425,8 @@ def main(argv=None) -> int:
 
     t_job = time.monotonic()
     stats = {"concat_s": 0.0, "grid_s": 0.0, "reused": 0, "built": 0,
-             "blur_s": 0.0, "blurred": 0, "blur_reused": 0, "map_s": 0.0}
+             "blur_s": 0.0, "blurred": 0, "blur_reused": 0, "gps_s": 0.0,
+             "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False}
 
     folder = args.folder.resolve()
     if not folder.is_dir():

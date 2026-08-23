@@ -123,7 +123,10 @@ def test_write_gpx_golden(tmp_path):
     assert text.count("<trkpt") == 2
     assert 'lat="40.7128000" lon="-74.0060000"' in text
     assert "<time>2026-07-14T18:57:37.000</time>" in text
-    assert "<tesla:speed_mps>12.500</tesla:speed_mps>" in text
+    # Plain "speed" (no tesla: prefix): gopro-overlay's GPX parser only
+    # recognizes extension tags whose local name is exactly "speed" -- see
+    # write_gpx's comment and CLAUDE.md.
+    assert "<speed>12.500</speed>" in text
     assert "<tesla:course_deg>90.00</tesla:course_deg>" in text
     assert "<tesla:frame_index>0</tesla:frame_index>" in text
 

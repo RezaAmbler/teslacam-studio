@@ -24,6 +24,10 @@ traces where you drove.
 - **Face blurring** for privacy (`--blur-faces`, via [`deface`](https://github.com/ORB-HD/deface)).
 - **Live GPS route map** (`--map`) — a moving map that follows the car and draws
   the route, extracted from the car's own GPS telemetry. Tunable zoom/magnification.
+- **Speed/compass dashboard overlay** (`--gauge`) — a speedometer dial, compass,
+  big speed readout, and a recent-speed sparkline chart, composited onto the
+  hero camera tile. Same GPS telemetry as `--map` (and shared with it, so
+  `--map --gauge` together only extract GPS once); `--gauge-units mph|kph`.
 - **Landscape layout** (`--landscape`) — the featured camera at full native
   resolution on the left, every other camera (and the map, if any) in a thin
   sidebar column on the right, sized to match. Produces a real landscape
@@ -100,7 +104,7 @@ predicted from that measurement).
   ```
   The script auto-detects `ffmpeg-full` and falls back gracefully.
 - **Python 3.9+** for the core tool (standard library only).
-- For `--map`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
+- For `--map` / `--gauge`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
 - For `--blur-faces`: `pip install deface` (optional).
 
 ## Setup
@@ -109,13 +113,14 @@ predicted from that measurement).
 git clone https://github.com/RezaAmbler/teslacam-studio.git
 cd teslacam-studio
 
-# Optional — only needed for the --map route overlay:
+# Optional — only needed for the --map route overlay / --gauge dashboard overlay:
 python3.12 -m venv .venv
 ./.venv/bin/python -m pip install gopro-overlay
 ```
 
-The `--map` feature looks for `gopro-dashboard.py` inside `./.venv` and downloads
-OpenStreetMap tiles on first use (so it needs network access).
+The `--map`/`--gauge` features look for `gopro-dashboard.py` inside `./.venv`.
+`--map` downloads OpenStreetMap tiles on first use (so it needs network access);
+`--gauge` composites onto your own footage and needs no network access.
 
 ### Running the tests
 
@@ -152,6 +157,10 @@ python3 tesla_combine.py /path/to/event/folder --map
 python3 tesla_combine.py /path/to/event/folder --map --map-mag 3
 python3 tesla_combine.py /path/to/event/folder --map --map-mag 1 --map-zoom 16
 
+# Composite a speed/compass dashboard onto the hero tile (needs gopro-overlay in ./.venv)
+python3 tesla_combine.py /path/to/event/folder --gauge
+python3 tesla_combine.py /path/to/event/folder --gauge --gauge-units kph
+
 # Landscape layout (real 16:9-ish aspect ratio) instead of the tall grid
 python3 tesla_combine.py /path/to/event/folder --landscape --map
 
@@ -175,6 +184,8 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--map` | Add the live GPS route-map tile |
 | `--map-zoom` | OSM tile zoom 1–19 (default 19) |
 | `--map-mag` | Magnify beyond OSM's limit, 1.0–4.0 (default 2.0; 1 = off) |
+| `--gauge` | Composite a speed/compass dashboard panel onto the hero tile (solo `--feature` only) |
+| `--gauge-units` | `mph` (default) or `kph` |
 | `--landscape` | Hero camera at native res + thin sidebar column, instead of the tall grid |
 | `--native` | True native resolution (skips the hardware-fit scale-down) |
 | `--quality` | `fast` (default, hardware) or `high` (software libx264, CRF 18) |
@@ -203,7 +214,8 @@ Written next to the input folder unless `--output-dir` is given:
 | `<session>_<angle>_combined.mp4` | one lossless concat per camera angle |
 | `<session>_<angle>_blurred.mp4` | (with `--blur-faces`) that concat, faces anonymized |
 | `<session>_maptile.mp4` | (with `--map`) the standalone live route-map tile |
-| `<session>_grid[_landscape][_feature-X][_blurred][_map].mp4` | the labeled multi-camera composite |
+| `<session>_<hero-angle>_gauge.mp4` | (with `--gauge`) that hero tile, dashboard overlay composited on |
+| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_map].mp4` | the labeled multi-camera composite |
 
 `playcheck.sh <file.mp4>` runs headless playback sanity checks (decode integrity,
 faststart index, hardware-decodable dimensions, constant frame rate).

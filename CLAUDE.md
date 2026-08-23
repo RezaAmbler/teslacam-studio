@@ -7,7 +7,8 @@ Guidance for Claude Code working in teslacam-studio. See `README.md` for the use
 ## What this is
 A macOS tool that combines a Tesla Sentry/Dashcam event folder (6 per-camera
 `YYYY-MM-DD_HH-MM-SS-<angle>.mp4` clips) into one labeled grid video with a
-burned-in clock, optional face blur, and an optional live GPS route-map overlay.
+burned-in clock, optional face blur, an optional live GPS route-map overlay,
+and an optional speed/compass dashboard overlay.
 
 - `tesla_combine.py` — the main compositor (concat → grid via ffmpeg filter_complex).
 - `tesla_gps.py` — standalone SEI→GPX/telemetry extractor (stdlib only, no deps).
@@ -79,6 +80,38 @@ burned-in clock, optional face blur, and an optional live GPS route-map overlay.
   map smaller then upscales to fill the tile — tighter/navigation-style but softer.
 - **Design constraint:** cameras are NOT frame-locked on `frame_seq_no` — extract
   GPS from the specific camera being overlaid; don't join cameras on it.
+- **Gauge dashboard overlay (`--gauge`):** a speedometer dial, compass, big speed
+  readout, and a recent-speed sparkline chart, composited onto the hero camera
+  tile. Unlike the map tile, this does **not** go through this repo's own
+  `hstack`/`vstack`/`pad` filter-graph code at all — `gopro-dashboard.py` has a
+  built-in compositing mode (`--use-gpx-only --gpx <gpx> --input <video>`) that
+  renders the widget layer as raw RGBA and runs its own internal
+  `ffmpeg ... -filter_complex "[0:v][1:v]overlay"` (`FFMPEGOverlayVideo` in
+  `gopro_overlay/ffmpeg_overlay.py`), producing a fully-composited output video
+  in one subprocess call (`build_gauge_overlay`). The gauge step runs in
+  `build_grid`, *before* `build_filter`/`build_filter_landscape`, and simply
+  replaces the hero's entry in `angle_paths` with the composited file (same
+  pattern `--blur-faces` already uses) — neither filter-building function ever
+  learns a gauge was composited; it just sees a different source file at the
+  same resolution. `gopro-dashboard.py`'s `input`/`output` are bare *positional*
+  args (not `--input`/`--output` flags); they must be passed adjacent to each
+  other, before any `--flag`s, or argparse's positional-matching mis-assigns
+  them (confirmed by running it for real). v1 requires a **solo hero**
+  (`--feature` can't be a pair like `repeaters`) — validated in `setup_tools`.
+  GPS extraction (`build_route_gpx`, factored out of the old `build_map_tile`)
+  is **shared** with `--map`: `--map --gauge` together extract/retime GPS once,
+  not twice. `tesla_gps.write_gpx()` emits the speed extension tag as plain
+  `<speed>` (m/s) rather than `<tesla:speed_mps>` — gopro-overlay's GPX parser
+  (`gopro_overlay/gpx.py`) only recognizes extension tags whose *local name* is
+  exactly `speed` (namespace-agnostic) among a fixed small set, expects the
+  value in m/s (`units.Quantity(gpx.speed, units.mps)` — exactly what Tesla's
+  own `speed_mps` already is), and feeds it straight into `Entry.speed`
+  (`metric_accessor_from("speed")`), used by both the `msi` needle and the big
+  `metric` readout. This avoids GPS-position-noise jitter in the needle vs.
+  deriving speed from consecutive lat/lon (`cspeed`) as gopro-overlay does by
+  default. `course_deg` stays unused — the `compass` widget reads `cog`, which
+  gopro-overlay computes itself from consecutive lat/lon (geodesic bearing), so
+  the compass needs zero data changes, same as the existing map tile.
 - **Progress (`Progress`, stdlib only):** the run is planned up front as a list of
   `Step(kind, label, work)` (`plan_steps`), `work` in footage-seconds. Fractions
   are never timer guesses — ffmpeg is run with `-progress pipe:1 -loglevel error`

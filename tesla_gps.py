@@ -519,7 +519,16 @@ def write_gpx(samples: list[dict], out_path: str,
             lines.append(f"      <time>{_iso_time(s['time'], tz)}</time>")
         ext = []
         if s.get("speed_mps") is not None:
-            ext.append(f"<tesla:speed_mps>{s['speed_mps']:.3f}</tesla:speed_mps>")
+            # Plain "speed" (no namespace prefix): gopro-overlay's GPX parser
+            # (gopro_overlay/gpx.py's fudge()) only recognizes extension tags
+            # whose LOCAL name is exactly "speed" (among a fixed small set) --
+            # a "tesla:speed_mps" tag is silently ignored. It expects the value
+            # in m/s (gopro_overlay/gpx.py: units.Quantity(gpx.speed, units.mps)),
+            # which is exactly what Tesla's own speed_mps already is, so no
+            # conversion is needed. Feeding this (rather than leaving gopro-overlay
+            # to derive speed from consecutive lat/lon/time) avoids GPS-position
+            # noise in a --gauge speedometer needle.
+            ext.append(f"<speed>{s['speed_mps']:.3f}</speed>")
         if s.get("heading") is not None:
             ext.append(f"<tesla:course_deg>{s['heading']:.2f}</tesla:course_deg>")
         if s.get("frame_seq") is not None:
