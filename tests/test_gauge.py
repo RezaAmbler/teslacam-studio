@@ -231,6 +231,7 @@ def _tools_args(**kw):
     a.gauge_units = "mph"
     a.fsd_scoreboard = False
     a.fsd_friction_circle = False
+    a.fsd_note_highway = False
     a.feature = "front"
     a.__dict__.update(kw)
     return a

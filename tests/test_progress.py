@@ -374,6 +374,7 @@ class Args:
         self.gauge = False
         self.fsd_scoreboard = False
         self.fsd_friction_circle = False
+        self.fsd_note_highway = False
         self.speed = 1.0
         self.__dict__.update(kw)
 

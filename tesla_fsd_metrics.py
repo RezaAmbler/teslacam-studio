@@ -266,6 +266,42 @@ def g_to_offset(lateral_g: float, longitudinal_g: float, max_g: float) -> tuple:
     return dx, dy
 
 
+def ribbon_window(values: list, index: int, past_n: int, future_n: int) -> list:
+    """Slice a `past_n + 1 + future_n`-length window out of `values`, centered
+    on `index` -- the pure math behind the note-highway ribbon
+    (--fsd-note-highway): a horizontal scrolling strip of cornering severity
+    where "now" sits fixed at the center, what's LEFT of center is what the
+    car already did, and what's RIGHT of center is what the road is about to
+    demand -- the one FSD showcase visual that needs the whole drive's
+    timeline, not just the current sample (or a short trailing window, like
+    the friction circle's trail).
+
+    Continues the g_to_offset precedent: this is plain list slicing with zero
+    gopro_overlay dependency, so it belongs in this dependency-free module,
+    not in the venv-only tesla_fsd_overlay.py driver where tests/ (system
+    Python, no gopro-overlay installed) couldn't reach it.
+
+    Positions before the start or past the end of `values` are None-padded,
+    NOT wrapped, clamped to the nearest real index, or fabricated -- the same
+    "a gap must show as a gap" principle GTrailBuffer/decode_fsd_fields/
+    TakeoverCounter all already follow for a real telemetry gap. Here the gap
+    is structural (the start or end of the drive itself) rather than a
+    missing sample mid-drive, but the right on-screen answer is identical: a
+    visible gap, not a flat line pretending the road was straight before the
+    drive began or after it ended.
+
+    A `None` already present inside `values` (a genuine mid-drive telemetry
+    gap) passes through completely untouched -- this function only ever adds
+    padding at the two ends, never interpolates or drops an existing value.
+
+    The returned list is always exactly `past_n + 1 + future_n` items long,
+    regardless of how much of it ended up padded -- callers (the widget) can
+    rely on that fixed length unconditionally.
+    """
+    return [values[i] if 0 <= i < len(values) else None
+            for i in range(index - past_n, index + future_n + 1)]
+
+
 class TakeoverCounter:
     """Counts autopilot disengagements: a CONFIRMED engaged -> CONFIRMED
     not-engaged falling edge, once per edge.

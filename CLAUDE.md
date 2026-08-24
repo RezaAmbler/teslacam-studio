@@ -118,11 +118,12 @@ scoreboard overlay.
 - **FSD showcase overlays (`tesla_fsd_overlay.py` / `tesla_fsd_metrics.py`):**
   groundwork for four planned visual ideas (a hands-free/corner-count streak
   scoreboard, a friction-circle G-force meter, a scrolling "note highway"
-  anticipation ribbon, rally pace-notes). The first two of the four — the
-  streak scoreboard and the friction circle — are now real and wired into
-  `tesla_combine.py`'s CLI as `--fsd-scoreboard` (`fsd-streak-scoreboard`
-  branch, off the merged `fsd-overlay-foundation`) and `--fsd-friction-circle`
-  (`fsd-friction-circle` branch); the other two remain each their own
+  anticipation ribbon, rally pace-notes). The first three of the four — the
+  streak scoreboard, the friction circle, and the note highway — are now real
+  and wired into `tesla_combine.py`'s CLI as `--fsd-scoreboard`
+  (`fsd-streak-scoreboard` branch, off the merged `fsd-overlay-foundation`),
+  `--fsd-friction-circle` (`fsd-friction-circle` branch), and
+  `--fsd-note-highway` (`fsd-note-highway` branch); pace-notes remains its own
   follow-up branch's job. `StreakScoreboard` (`tesla_fsd_overlay.py`) replaces
   the branch's original `FsdDiagnosticText` throwaway plain-text overlay as
   the default draw target (`--widget scoreboard`, vs. `--widget diagnostic`
@@ -258,23 +259,120 @@ scoreboard overlay.
       a corner "Right 3" vs "Left 3"), so re-deriving it independently
       inside either one risks a silent contradiction with the friction
       circle. Worth hoisting into a tested, shared function before either
-      of those branches starts.
+      of those branches starts. (This did in fact get hoisted into
+      `tesla_fsd_metrics.g_to_offset` before the note-highway branch
+      started — see "Sign math moved to a tested, shared function" under
+      Verification status. The note-highway ribbon below only plots
+      *lateral* severity, a single axis, so it reuses `g_to_offset`'s
+      lateral sign convention directly rather than calling the function
+      itself, which combines both axes into a 2D offset the ribbon doesn't
+      need.)
+  - **The note highway** (`NoteHighway`, `--widget note-highway`,
+    `--fsd-note-highway`): a horizontal scrolling ribbon of signed
+    cornering severity, "now" fixed at horizontal-center — left of center is
+    what FSD already did, right of center is what the road is about to
+    demand, flowing toward "now" like a rhythm-game note chart, the car's
+    own trace merging into the ribbon exactly on arrival. This is the
+    architecturally novel one of the four ideas: every other FSD widget only
+    ever reads the *current* `entry()` (plus, for the friction circle, a
+    self-accumulated trailing buffer) — this one needs the drive's *whole*
+    timeline up front, including samples that haven't "happened" yet
+    relative to the frame being drawn, because compositing happens after
+    the fact and can show the road *before* the car reaches it, something a
+    live dashboard could never do.
+    - **Metric: reused `lateral_g`, not a new curvature/yaw-rate signal.**
+      The original brainstorm suggested steering angle, or road curvature
+      derived from `heading_deg` rate. `lateral_g` was used instead: it's
+      already derived, already sign-confirmed against real telemetry (see
+      `g_to_offset` above), and is a physically direct proxy for cornering
+      severity (centripetal accel = f(curvature, speed²)) without
+      introducing a fourth derived signal — a yaw-rate signal would need its
+      own new `gopro-overlay` plumbing (`cog` isn't automatically available;
+      it needs an explicit `process_deltas` call nothing currently makes,
+      confirmed during the foundation branch).
+    - **Full-timeline lookahead**: `FrameMeta` (`gopro_overlay/framemeta.py`)
+      already supports this directly — `frame_meta.framelist`/`.frames` are
+      plain attributes and `frame_meta[i]` is valid (`__getitem__` returns
+      `self.frames[self.framelist[i]]`) — so `main()` builds
+      `lateral_g_timeline = [frame_meta[i].lateral_g for i in
+      range(len(frame_meta))]` **once**, after both `frame_meta.process(...)`
+      calls have populated `.lateral_g` on every entry and before
+      `Overlay(...)` is constructed, and passes it to `NoteHighway` (via
+      `create_widgets_for`'s new optional `lateral_g_timeline` parameter,
+      only required for `--widget note-highway`). The widget then just needs
+      "where am I" in that array on each `draw()` call — reused the exact
+      `self._index`-incremented-once-per-`draw()` pattern
+      `FrictionCircle`/`GTrailBuffer` already established (rather than a
+      timestamp lookup), which works because `timelapse_correction` is
+      hardcoded to `1.0` and `timeseries_to_framemeta` builds entries at the
+      same `RENDER_STEP_SECONDS` cadence the render loop steps at — draw-call
+      N and array-index N stay in lockstep by construction, the same fact
+      the friction circle's trail buffer already relies on. **Verified
+      empirically, not just by reading the two source files**: a synthetic
+      `FrameMeta` pushed through the real `timeseries_to_framemeta` →
+      `stepper()` → `frame_meta.get(pts)`-per-step code path (the same
+      lookup `Overlay.draw()` performs) confirmed draw-call index N's
+      `entry.lateral_g` equals `lateral_g_timeline[N]` for every N across a
+      whole synthetic drive, zero mismatches — including with an original
+      sample cadence (0.2s) different from the render step (0.1s), so the
+      lockstep genuinely comes from `timeseries_to_framemeta`'s own
+      resampling, not a coincidence of matching input cadence.
+    - **`ribbon_window(values, index, past_n, future_n)`** (`tesla_fsd_
+      metrics.py`): the pure windowing math, continuing the `g_to_offset`
+      precedent — plain list slicing with zero `gopro_overlay` dependency,
+      so it lives in the dependency-free module `tests/` (system Python) can
+      reach, not the venv-only driver. Returns a `past_n + 1 + future_n`-
+      length slice centered on `index`, `None`-padded at either end where
+      the array doesn't reach (start/end of the drive) — never wrapped,
+      clamped, or fabricated, the same "a gap must show as a gap" principle
+      `GTrailBuffer`/`decode_fsd_fields`/`TakeoverCounter` already follow. A
+      `None` already inside `values` (a genuine mid-drive telemetry gap)
+      passes through completely untouched — only the two ends get padded.
+    - **Placement: full-width, below both top-anchored elements.** All four
+      hero-tile corners are now used (TL hero label, TR `StreakScoreboard`,
+      BL `--gauge`, BR `FrictionCircle`), but every FSD overlay is its own
+      independent compositing pass (chained through `angle_paths`, blind to
+      what any other pass drew), so placement has to come from fixed,
+      hand-designed regions, not measured live against whatever else happens
+      to be present in a given run. The gap between the gauge and
+      friction-circle panels varies with tile aspect ratio (fragile to
+      depend on); the vertical space *below* both top-anchored elements
+      doesn't — it's derived purely from their own known, fixed heights
+      (`NOTE_HIGHWAY_HERO_LABEL_CLEARANCE_PX=110`, a fixed pixel value
+      matching `HERO_FONT_SIZE`'s own fixed-pixel nature, vs.
+      `SCOREBOARD_MARGIN + img_h * SCOREBOARD_PANEL_H_FRAC`, computed live
+      from `StreakScoreboard`'s own constants at draw time), so it stays
+      clear of TL/TR regardless of tile shape, and sits well above BL/BR
+      since it's near the top. `NOTE_HIGHWAY_WIDTH_FRAC=0.92`/
+      `_HEIGHT_FRAC=0.11` and the `NOTE_HIGHWAY_PAST_SECONDS`/
+      `_FUTURE_SECONDS=4.0` window are the same starting-guess-then-verify
+      status every other panel constant in this codebase has had.
+    - Renders a centered zero-g baseline, a signed line/filled area
+      (positive `lateral_g` = right turn drawn *above* the baseline,
+      negative = left drawn *below* — signed, matching `g_to_offset`'s own
+      lateral convention directly, not just magnitude, since showing *which
+      way* the upcoming corner goes is the whole point), and a fixed
+      vertical "now" playhead at horizontal-center. `None`-padded slots
+      (start/end of drive, or a genuine mid-drive gap) break the line/fill
+      into separate contiguous runs rather than drawing a fabricated flat
+      line through them.
   - **`build_fsd_overlay` consolidation**: the original `--fsd-scoreboard`-
     only `build_fsd_scoreboard_overlay` (`tesla_combine.py`) was generalized
     into `build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widget,
     ffmpeg, venv_py, out_path, tmpdir, dry_run, progress)`, taking an
-    explicit `widget` ("scoreboard" or "friction-circle") passed straight
-    through to the subprocess as `tesla_fsd_overlay.py --widget <widget>` --
-    a second near-identical function would just have been copy-paste with
-    one word changed, and a third/fourth showcase idea is already known to
-    be coming. `FSD_OVERLAY_META` holds the small per-widget bits that
+    explicit `widget` ("scoreboard", "friction-circle", or now
+    "note-highway") passed straight through to the subprocess as
+    `tesla_fsd_overlay.py --widget <widget>` -- a second (or third)
+    near-identical function would just have been copy-paste with one word
+    changed. `FSD_OVERLAY_META` holds the small per-widget bits that
     actually differ (the CLI flag name for log lines, the `Step`/`Progress`
-    kind, etc). The one existing `--fsd-scoreboard` call site in `build_grid`
-    now passes `widget="scoreboard"` explicitly (previously implicit via the
-    driver's own `--widget` default) — confirmed, by rerunning every existing
-    `--fsd-scoreboard` test immediately after this refactor and before adding
-    anything friction-circle-specific, that the consolidation alone changes
-    nothing about `--fsd-scoreboard`'s behavior.
+    kind, etc) — the note-highway branch just added a third entry, no new
+    `build_*` function needed. The one existing `--fsd-scoreboard` call site
+    in `build_grid` now passes `widget="scoreboard"` explicitly (previously
+    implicit via the driver's own `--widget` default) — confirmed, by
+    rerunning every existing `--fsd-scoreboard` test immediately after this
+    refactor and before adding anything friction-circle-specific, that the
+    consolidation alone changes nothing about `--fsd-scoreboard`'s behavior.
 
   Two findings drove the original foundation's design:
   - **IMU axis mapping resolved with real data**, since Tesla documents none
@@ -433,16 +531,134 @@ scoreboard overlay.
     widget: **the two still-deferred ideas (note-highway ribbon, pace-notes)
     need this exact same convention** (e.g. pace-notes calling a corner
     "Right 3" vs "Left 3"), so they should call `g_to_offset` too, not
-    re-derive the sign independently.
-  - **Design note for the next two branches**: `--gauge` →
-    `--fsd-scoreboard` → `--fsd-friction-circle` already chains as three
-    sequential subprocess renders of the hero tile (each a full decode +
-    draw + re-encode generation). The note-highway ribbon and pace-notes
-    landing the same way would make five generations. `create_widgets_for`
+    re-derive the sign independently. (The note-highway ribbon has since
+    landed and does follow this convention for its one axis — see "The note
+    highway" bullet above for why it doesn't literally call `g_to_offset`
+    itself, which is a two-axis function this single-axis ribbon doesn't
+    need.)
+  - **Design note, now revisited**: at the time this was originally written,
+    `--gauge` → `--fsd-scoreboard` → `--fsd-friction-circle` already chained
+    as three sequential subprocess renders of the hero tile (each a full
+    decode + draw + re-encode generation), and landing the note-highway
+    ribbon and pace-notes the same way was flagged as something that would
+    make five generations — worth combining `create_widgets_for`'s multiple
+    FSD widgets into one compositing pass before a third FSD widget landed,
+    not after. Note-highway has now landed the same sequential-subprocess
+    way anyway (a fourth `build_fsd_overlay` call chained through
+    `angle_paths[hero_angle]`, not a combined pass), so
+    `--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`
+    together now really does mean four sequential hero-tile re-encode
+    generations. This is worth revisiting for real now that all four
+    showcase visuals exist (only pace-notes remains) — `create_widgets_for`
     already returns a widget *list*, so one `tesla_fsd_overlay.py`
     invocation could draw multiple FSD widgets (not `--gauge`, a different
-    tool) in a single pass if `--widget` took multiple values — worth doing
-    before a third FSD widget lands, not after.
+    tool, which is its own subprocess and layout system entirely) in a
+    single pass if `--widget` took multiple values, cutting four re-encodes
+    to one regardless of how many of the four flags are combined.
+- `--fsd-note-highway`/`NoteHighway`: the central architectural claim — that
+  draw-call index N and `lateral_g_timeline[N]` stay in lockstep — was
+  checked empirically, not just by reading `framemeta.py`/`framemeta_gpx.py`:
+  a synthetic `Timeseries` (irregular 0.2s sample spacing, deliberately
+  different from the 0.1s render step) was pushed through the real
+  `timeseries_to_framemeta` → `frame_meta.process(...)` → `frame_meta.
+  stepper(...)` → `frame_meta.get(pts)`-per-step path, and every one of the
+  99 draw-equivalent steps matched `lateral_g_timeline[index]` exactly, zero
+  mismatches. A second smoke test drove the real `NoteHighway.draw()` across
+  a 200-sample synthetic timeline containing both a start/end (edge-padded)
+  boundary and a genuine mid-drive `None` gap, confirming no exception at
+  any point (including one deliberate past-the-end draw call, defensively
+  handled by `ribbon_window`'s own bounds check) and that `self._index`
+  advances exactly once per `draw()` call as designed.
+
+  **Placement/rendering since confirmed against real footage, not just
+  synthetic data** — and by more than a single eyeballed frame, after a
+  first spot-check frame looked too flat to trust on sight alone: the
+  ground-truth GPX the real render actually used was regenerated
+  independently (same trim window, same `build_route_gpx` call), the
+  panel's pixel geometry was hand-recomputed from the `NOTE_HIGHWAY_*`
+  constants, and the "now" dot's pixel position was measured in extracted
+  frames at 10 timestamps spanning a real left-turn → right-turn sign
+  change. It matched ground-truth `lateral_g` to within ~0.01–0.02g at
+  every point, and the playhead's x-position matched the hand-computed
+  value to within 1px. (The methodology also caught a real, unrelated
+  discovery in the process — see the `FILENAME_RE` gotcha below.)
+  `NOTE_HIGHWAY_WIDTH_FRAC`/`_HEIGHT_FRAC`/`_PAST_SECONDS`/`_FUTURE_SECONDS`
+  are accordingly now tuned, same confirmed-against-a-real-frame status
+  `SCOREBOARD_PANEL_W_FRAC`/`FRICTION_CIRCLE_SIZE_FRAC` reached.
+
+  **Legend added after real-footage review** (a user watching a rendered
+  frame had no way to tell what the ribbon plotted, which axis was which,
+  or what the scale was — none of the other three overlays have this gap,
+  since the gauge has MPH/compass letters and the friction circle has
+  LEFT/RIGHT/ACCEL/BRAKE ticks + a numeric readout). All label text lives
+  in the panel's own PAD strip (the gap between the rounded-rect edge and
+  the plot area) on all four sides — the plotted line's y-range is exactly
+  `y1+pad..y2-pad` and x-range exactly `plot_x1..plot_x2`, so the pad strip
+  is geometrically guaranteed clear of the line/fill at any g value, at any
+  point in the window, not just "usually clear in practice." Top strip:
+  `"PAST {N}s"` / `"AHEAD {N}s"` at the two horizontal extremes (reads the
+  actual `NOTE_HIGHWAY_PAST_SECONDS`/`_FUTURE_SECONDS` constants, not a
+  hardcoded guess at the window width) and `"NOW"` centered on the
+  playhead. Bottom strip: `"CORNERING SEVERITY"` (what's plotted) and
+  `"±{MAX_G}g"` (the scale). Left strip: `"R"`/`"L"` tick labels at the
+  upper/lower quarter, spelling out the sign convention (+g/above baseline
+  = right turn, matching `g_to_offset`) the same way `FrictionCircle`'s own
+  ticks do, without needing a full axis label. Verified against a real
+  rendered frame (not just code-read): legible at both the cropped-panel
+  and full-tile scale, no overlap with the plotted data or with the hero
+  label/scoreboard above it.
+
+  **Independent Fable review found one real, medium-severity issue** (the
+  first FSD-branch review that found nothing wrong in the branch's own new
+  code) — not in `NoteHighway`/`ribbon_window` themselves, but in the
+  shared `retime_samples` (`tesla_combine.py`) they depend on: only the
+  *edge* head/tail pads nulled the FSD fields (`linear_acceleration_mps2_x/
+  y`, `autopilot_state`) across a gap; a genuine **mid-drive** SEI dropout
+  (e.g. one clip in a multi-clip event has no SEI while its neighbors do)
+  left real samples bracketing the gap, and gopro-overlay's own
+  `Timeseries.get()` linearly interpolates `lateral_g`/`autopilot_engaged`
+  straight across it — fabricating a smooth cornering/engagement ramp
+  through a stretch with zero real telemetry, which the note-highway ribbon
+  would then show as *upcoming road* before the car got there, the worst
+  possible place for this to surface. This contradicted the "a gap must
+  show as a gap" principle every FSD field/widget here otherwise claims to
+  follow (and had quietly applied to `FrictionCircle`'s trail,
+  `CornerCounter`, and interpolated `autopilot_engaged`/`TakeoverCounter`
+  since the foundation branch — this branch's docs were just the first to
+  assert the principle held generally, which is what made the gap visible).
+  **Fixed**: `retime_samples` now also breaks the FSD fields — not
+  position, which is left to interpolate/hold exactly as before, matching
+  the map tile's existing "squeezed gap" behavior — across any *mid-drive*
+  gap between two consecutive real samples wider than
+  `GAP_BREAK_SECONDS = 1.0` (comfortably above normal SEI sample spacing,
+  comfortably below a real dropout), by inserting two synthetic
+  `NO_FSD_DATA` points a few ms inside each side of the gap. Covered by new
+  tests: a mid-drive-gap case confirming the bridge points land and null
+  the right fields while leaving position alone, and a normal-spacing case
+  confirming no bridge is spuriously inserted at ordinary sample cadence.
+  The review also reconfirmed (by tracing gopro-overlay's own
+  `SingleBuffer`/`Scene`/`Overlay.draw()` and `Timeseries.Stepper` source,
+  not just re-reading this repo's comments) that the draw-call/array-index
+  lockstep is exact — `Stepper` increments by an exact `timedelta(seconds=
+  0.1)`, so there's no float-drift risk — and that `--speed` is safe to
+  combine with this widget (the ribbon composites onto the pre-speed hero
+  concat, so the grid's later `setpts` scales the baked-in ribbon and video
+  together; the ±4s window is footage time, so at `--speed 2` a viewer
+  sees ±2s of lookahead, worth knowing when retuning the window constants).
+
+  **Separately discovered (not a note-highway bug, found via the same
+  verification methodology): `FILENAME_RE` silently drops `-START`-suffixed
+  clips.** `FILENAME_RE` (`tesla_combine.py`) requires an angle to be
+  immediately followed by `.mp4`, so a real clip named e.g.
+  `..._front-START.mp4` (present in two of this user's actual event
+  folders, apparently from an earlier folder-reorganization pass) fails to
+  match and `discover_clips()` drops it with **no warning**. In the
+  render used for the verification above, this made `--trim-start
+  17:22:00` actually start at 17:22:05 — a silent 5-second truncation, no
+  error printed, output just quietly 55s instead of the requested 60s.
+  Confirmed, but out of scope for this branch and not yet fixed — flagged
+  for a follow-up (either widen the regex to tolerate a suffix, or at
+  minimum warn on any `.mp4` in the folder that `FILENAME_RE` didn't match).
 
 ## Gotchas
 - Never commit footage or rendered outputs.

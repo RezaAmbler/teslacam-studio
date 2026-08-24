@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """tesla_fsd_overlay.py — driver for FSD showcase overlays.
 
-Wired into tesla_combine.py's CLI as `--fsd-scoreboard` and
-`--fsd-friction-circle` (first two of the four FSD-showcase visuals to
-actually ship): proves, end to end, that Tesla's per-frame G-force/autopilot
-telemetry (SEI -> tesla_gps.write_gpx()'s repurposed GPX tags -> gopro-overlay's
+Wired into tesla_combine.py's CLI as `--fsd-scoreboard`, `--fsd-friction-circle`
+and `--fsd-note-highway` (three of the four FSD-showcase visuals to actually
+ship): proves, end to end, that Tesla's per-frame G-force/autopilot telemetry
+(SEI -> tesla_gps.write_gpx()'s repurposed GPX tags -> gopro-overlay's
 GPX-based pipeline -> tesla_fsd_metrics' pure decode/derivation -> a widget)
-can drive a real composited video, and draws either the "streak scoreboard"
-visual (StreakScoreboard, --widget scoreboard, the default) -- an accumulating
-hands-free/corner/peak-G/takeover stat line -- or the "friction circle" G-G
+can drive a real composited video, and draws the "streak scoreboard" visual
+(StreakScoreboard, --widget scoreboard, the default) -- an accumulating
+hands-free/corner/peak-G/takeover stat line -- the "friction circle" G-G
 diagram visual (FrictionCircle, --widget friction-circle) -- lateral G vs.
-longitudinal G on a ringed target with a fading trail. The two still-deferred
-showcase ideas (note-highway ribbon, pace-notes) are each their own follow-up
-branch's job; FsdDiagnosticText (--widget diagnostic) is kept around, not
-deleted, for debugging those. See CLAUDE.md for the full design rationale
-(axis mapping, GPX tag repurposing, why gopro-dashboard.py's CLI can't carry
-any of this on its own).
+longitudinal G on a ringed target with a fading trail -- or the "note
+highway" cornering ribbon (NoteHighway, --widget note-highway) -- a
+horizontal scrolling strip of signed lateral-G severity with "now" fixed at
+center, showing the road BEFORE the car reaches it. The one still-deferred
+showcase idea (pace-notes) is its own follow-up branch's job;
+FsdDiagnosticText (--widget diagnostic) is kept around, not deleted, for
+debugging it. See CLAUDE.md for the full design rationale (axis mapping, GPX
+tag repurposing, why gopro-dashboard.py's CLI can't carry any of this on its
+own).
 
 Must run under ./.venv (gopro-overlay installed there, not under the system
 Python tesla_combine.py itself uses) -- same venv-boundary reason `--map`/
@@ -500,6 +503,265 @@ class FrictionCircle(Widget):
         draw.text((text_x, text_y), text, font=text_font, fill=FRICTION_CIRCLE_TEXT_RGB)
 
 
+# --- note-highway ribbon (--fsd-note-highway) --------------------------------
+# A horizontal scrolling ribbon of cornering severity, "now" pinned at
+# horizontal-center: LEFT of center is what FSD just did, RIGHT of center is
+# what the road is about to demand -- flowing toward "now" like a rhythm-game
+# note chart, the car's own trace merging into it exactly on arrival. This is
+# the one FSD showcase visual that genuinely needs the WHOLE drive's timeline
+# up front (frame_meta[i] for every i, not just the current entry() or a
+# short trailing buffer like the friction circle's GTrailBuffer) -- because
+# compositing happens after the fact, the ribbon can show the road BEFORE the
+# car reaches it, something a live dashboard could never do.
+#
+# Placement: full-width, positioned BELOW both top-anchored elements (the
+# hero label tesla_combine.py's grid filter graph draws at x=20:y=20,
+# HERO_FONT_SIZE=64, AFTER this compositing pass runs -- see
+# StreakScoreboard's own placement comment above -- and StreakScoreboard's
+# own top-right panel, SCOREBOARD_MARGIN/SCOREBOARD_PANEL_H_FRAC above).
+# Chosen over squeezing into the gap between --gauge's bottom-left panel and
+# the friction circle's bottom-right panel because that gap's WIDTH varies
+# with tile aspect ratio (fragile to depend on); the vertical space below
+# both top-anchored elements doesn't -- it's derived purely from their own
+# known, fixed heights (computed in draw(), from the SAME module-level
+# constants StreakScoreboard already uses), so it stays clear of TL/TR
+# regardless of tile shape, and sits well above BL/BR since it's near the
+# top. A full-width horizontal ribbon (with side margins) is the natural
+# shape for what's inherently a wide, short visual, and it can never collide
+# with any of the other three FSD overlays' fixed corners.
+#
+# Every fraction/margin below started as a synthetic-render estimate, same
+# guess-then-verify status every other panel constant in this file has had.
+NOTE_HIGHWAY_WIDTH_FRAC = 0.92     # panel width, as a fraction of the tile width --
+                                    # near-full-width with small side margins, matching
+                                    # this being deliberately a wide, short ribbon.
+NOTE_HIGHWAY_HEIGHT_FRAC = 0.11    # panel height, as a fraction of the tile height --
+                                    # short, since it's one plotted line/area, not a
+                                    # multi-section dashboard like --gauge's panel.
+NOTE_HIGHWAY_HERO_LABEL_CLEARANCE_PX = 110  # fixed-px clearance for the hero label
+                                    # tesla_combine.py draws at x=20:y=20 (HERO_FONT_SIZE=64)
+                                    # AFTER this compositing pass -- a fixed pixel value,
+                                    # not a tile-height fraction, because HERO_FONT_SIZE
+                                    # itself is a fixed pixel size regardless of tile size.
+NOTE_HIGHWAY_GAP_PX = 16           # gap between whichever top element (hero label or
+                                    # StreakScoreboard's panel) sits lowest, and this
+                                    # ribbon's own top edge.
+NOTE_HIGHWAY_PAD_FRAC = 0.12       # inner panel padding, as a fraction of panel height --
+                                    # keeps the plotted line's peaks off the panel's own
+                                    # rounded-corner edge.
+
+NOTE_HIGHWAY_PAST_SECONDS = 4.0    # how far LEFT of "now" (what FSD already did) the
+                                    # ribbon shows -- a symmetric few-seconds-each-side
+                                    # starting guess, same starting-guess-then-verify
+                                    # status every panel constant in this file has had.
+NOTE_HIGHWAY_FUTURE_SECONDS = 4.0  # how far RIGHT of "now" (what the road is about to
+                                    # demand) the ribbon shows.
+# Derived from RENDER_STEP_SECONDS (module-level, above) rather than restating
+# "40 samples" independently -- one widget draw() call, and one array index,
+# per render step, same reasoning FRICTION_CIRCLE_TRAIL_LEN already documents:
+# change one without the other and the "4-second" window silently becomes a
+# different duration, with nothing to catch the drift.
+NOTE_HIGHWAY_PAST_N = round(NOTE_HIGHWAY_PAST_SECONDS / RENDER_STEP_SECONDS)      # 40
+NOTE_HIGHWAY_FUTURE_N = round(NOTE_HIGHWAY_FUTURE_SECONDS / RENDER_STEP_SECONDS)  # 40
+
+NOTE_HIGHWAY_MAX_G = 0.6           # g value at the ribbon's own top/bottom edge (the
+                                    # full-scale amplitude a sample is plotted against) --
+                                    # same value and same rationale as FRICTION_CIRCLE_MAX_G
+                                    # (comfortable FSD cornering measured so far tops out
+                                    # well under this).
+
+NOTE_HIGHWAY_BG = (0, 0, 0, 160)                  # translucent dark panel, matching FRICTION_CIRCLE_BG
+NOTE_HIGHWAY_BASELINE_RGB = (255, 255, 255, 70)   # faint zero-g baseline
+NOTE_HIGHWAY_PLAYHEAD_RGB = (255, 255, 255, 200)  # "now" vertical marker
+NOTE_HIGHWAY_LINE_RGB = (90, 200, 255, 255)       # plotted severity line
+NOTE_HIGHWAY_FILL_RGB = (90, 200, 255, 70)        # translucent fill under the line
+NOTE_HIGHWAY_NOW_DOT_RGB = (255, 255, 255, 255)   # current-sample dot, at the playhead
+NOTE_HIGHWAY_LABEL_RGB = (255, 255, 255, 150)     # legend text: title/scale/PAST/AHEAD/R/L
+NOTE_HIGHWAY_NOW_LABEL_RGB = (255, 255, 255, 230)  # "NOW" label -- brighter, matches the playhead
+
+
+class NoteHighway(Widget):
+    """The note-highway ribbon showcase visual (--widget note-highway,
+    --fsd-note-highway): a horizontal scrolling strip of signed lateral_g
+    severity, "now" fixed at horizontal-center. See the module-level
+    NOTE_HIGHWAY_* constants above for the full placement/sizing rationale.
+
+    Unlike every other widget in this file, this one is handed the FULL
+    lateral_g timeline up front (`lateral_g_timeline`, built once in main()
+    via a single list comprehension over frame_meta AFTER both process()
+    passes have populated .lateral_g on every entry -- see main()'s own
+    comment) rather than only ever reading entry()'s current sample. That's
+    the genuinely new piece this widget needs: showing the road BEFORE the
+    car reaches it requires knowing what's coming, not just what "now" is.
+
+    self._index tracks "where is 'now' in that array", incremented once per
+    draw() call -- the exact same pattern FrictionCircle/GTrailBuffer already
+    established (append-once-per-draw), which real-footage verification
+    already proved reliable. This works because timelapse_correction is
+    hardcoded to 1.0 (main()) and timeseries_to_framemeta builds entries at
+    the same RENDER_STEP_SECONDS cadence the render loop steps at -- draw-call
+    N and array-index N stay in lockstep by construction. Confirmed
+    empirically (not just by reading the two source files) against a
+    synthetic FrameMeta pushed through the real timeseries_to_framemeta ->
+    stepper() -> Overlay.draw() code path: draw-call index N's
+    entry().lateral_g equaled lateral_g_timeline[N] for every N across the
+    whole synthetic drive, with zero mismatches.
+
+    ribbon_window (tesla_fsd_metrics) does the actual windowing math --
+    None-padded at either end where the window runs off the start/end of the
+    drive, which this widget renders as a visible break in the line/fill,
+    never a fabricated flat line (the same "a gap must show as a gap"
+    principle every other FSD field/widget in this branch follows).
+    """
+
+    def __init__(self, entry, font, lateral_g_timeline):
+        self.entry = entry
+        self.font = font
+        self.lateral_g_timeline = lateral_g_timeline
+        self._index = 0
+
+    @staticmethod
+    def _draw_run(draw, points, y_mid):
+        """Draw one contiguous (no-gap) run of plotted (x, y) points: a
+        translucent filled area down to the zero-g baseline, then the line
+        on top -- matching FrictionCircle's own painter's-algorithm ordering
+        (fill first, then line, so the line reads crisply over the fill). A
+        single-point run still draws (a small dot -- there's a real sample
+        here, even with no neighbor to connect it to); an empty run draws
+        nothing."""
+        if not points:
+            return
+        if len(points) == 1:
+            x, y = points[0]
+            r = 2
+            draw.ellipse([x - r, y - r, x + r, y + r], fill=NOTE_HIGHWAY_LINE_RGB)
+            return
+        polygon = [(points[0][0], y_mid)] + points + [(points[-1][0], y_mid)]
+        draw.polygon(polygon, fill=NOTE_HIGHWAY_FILL_RGB)
+        draw.line(points, fill=NOTE_HIGHWAY_LINE_RGB, width=2)
+
+    def draw(self, image, draw):
+        window = fsd_metrics.ribbon_window(
+            self.lateral_g_timeline, self._index,
+            NOTE_HIGHWAY_PAST_N, NOTE_HIGHWAY_FUTURE_N)
+        # Advance for the NEXT draw() call -- see the class docstring on why
+        # a plain per-call increment (not a timestamp lookup) is the correct,
+        # proven-reliable way to track "now"'s position in the full array.
+        self._index += 1
+
+        img_w, img_h = image.size
+
+        panel_w = max(2, round(img_w * NOTE_HIGHWAY_WIDTH_FRAC))
+        x1 = round((img_w - panel_w) / 2)
+        x2 = x1 + panel_w
+
+        # Clears BOTH top-anchored elements (see the module comment above):
+        # the hero label tesla_combine.py draws later at a fixed pixel
+        # position, and StreakScoreboard's own panel, whose bottom edge
+        # scales with tile height -- so this ribbon's top edge sits below
+        # whichever of the two is lower, plus a gap.
+        scoreboard_bottom = SCOREBOARD_MARGIN + round(img_h * SCOREBOARD_PANEL_H_FRAC)
+        y1 = max(NOTE_HIGHWAY_HERO_LABEL_CLEARANCE_PX, scoreboard_bottom) + NOTE_HIGHWAY_GAP_PX
+        panel_h = max(2, round(img_h * NOTE_HIGHWAY_HEIGHT_FRAC))
+        y2 = y1 + panel_h
+
+        radius = max(2, round(panel_h * 0.15))
+        draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=NOTE_HIGHWAY_BG)
+
+        pad = max(2, round(panel_h * NOTE_HIGHWAY_PAD_FRAC))
+        plot_x1, plot_x2 = x1 + pad, x2 - pad
+        y_mid = (y1 + y2) / 2
+        half_h = (panel_h - 2 * pad) / 2
+
+        # Faint zero-g baseline across the full plotted width.
+        draw.line([(plot_x1, y_mid), (plot_x2, y_mid)], fill=NOTE_HIGHWAY_BASELINE_RGB)
+
+        n = len(window)  # == NOTE_HIGHWAY_PAST_N + 1 + NOTE_HIGHWAY_FUTURE_N, always
+        step_x = (plot_x2 - plot_x1) / (n - 1) if n > 1 else 0.0
+
+        def to_xy(i, g):
+            x = plot_x1 + i * step_x
+            # +g (right) drawn ABOVE the baseline (smaller y -- screen y
+            # increases downward), -g (left) drawn below -- signed, matching
+            # g_to_offset's own lateral convention directly (not just
+            # magnitude): the whole point is showing WHICH WAY the upcoming
+            # corner goes.
+            clamped = max(-1.0, min(1.0, g / NOTE_HIGHWAY_MAX_G))
+            y = y_mid - clamped * half_h
+            return x, y
+
+        # Plot in contiguous non-None runs only -- a None slot (start/end of
+        # the drive, or a genuine mid-drive telemetry gap) breaks the
+        # line/fill rather than being drawn as 0.0, which would misrepresent
+        # a gap as "the road was straight here".
+        run = []
+        for i, g in enumerate(window):
+            if g is None:
+                self._draw_run(draw, run, y_mid)
+                run = []
+            else:
+                run.append(to_xy(i, g))
+        self._draw_run(draw, run, y_mid)
+
+        # "Now" playhead: a fixed vertical marker at the window's center
+        # index (NOTE_HIGHWAY_PAST_N), where the current sample sits and the
+        # car's own trace "arrives" as the ribbon scrolls past it.
+        now_x, _ = to_xy(NOTE_HIGHWAY_PAST_N, 0.0)
+        draw.line([(now_x, y1), (now_x, y2)], fill=NOTE_HIGHWAY_PLAYHEAD_RGB)
+        now_g = window[NOTE_HIGHWAY_PAST_N]
+        if now_g is not None:
+            _, now_y = to_xy(NOTE_HIGHWAY_PAST_N, now_g)
+            r = max(2, round(panel_h * 0.05))
+            draw.ellipse([now_x - r, now_y - r, now_x + r, now_y + r],
+                        fill=NOTE_HIGHWAY_NOW_DOT_RGB)
+
+        # Legend -- added after real-footage review found the panel had NO
+        # indication of what was plotted, which axis was which, or what the
+        # scale was. Placed entirely in the PAD strip (the gap between the
+        # panel's rounded edge and the plot area on every side): the plotted
+        # line's own y-range is exactly y1+pad..y2-pad and its x-range is
+        # exactly plot_x1..plot_x2, so the pad strip is guaranteed clear of
+        # the line/fill on all four sides -- labels here can never be
+        # occluded by data, at any g value.
+        label_font = self.font.font_variant(size=max(8, round(panel_h * 0.10)))
+
+        def _label(text, x, y, align, font=label_font, fill=NOTE_HIGHWAY_LABEL_RGB):
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if align == "left":
+                ox = x
+            elif align == "right":
+                ox = x - tw
+            else:
+                ox = x - tw / 2
+            draw.text((ox, y - bbox[1]), text, font=font, fill=fill)
+
+        top_mid = y1 + pad / 2
+        bottom_mid = y2 - pad / 2
+
+        # Top strip: what the ribbon's timeline axis means -- "PAST"/"AHEAD"
+        # at the two horizontal extremes (matching NOTE_HIGHWAY_PAST_SECONDS/
+        # _FUTURE_SECONDS, not a hardcoded guess at how wide the window is),
+        # "NOW" centered on the playhead itself.
+        _label(f"PAST {NOTE_HIGHWAY_PAST_SECONDS:.0f}s", plot_x1, top_mid, "left")
+        _label(f"AHEAD {NOTE_HIGHWAY_FUTURE_SECONDS:.0f}s", plot_x2, top_mid, "right")
+        _label("NOW", now_x, top_mid, "center", fill=NOTE_HIGHWAY_NOW_LABEL_RGB)
+
+        # Bottom strip: what's plotted, and the vertical scale.
+        _label("CORNERING SEVERITY", plot_x1, bottom_mid, "left")
+        _label(f"±{NOTE_HIGHWAY_MAX_G:.1f}g", plot_x2, bottom_mid, "right")
+
+        # Left strip (the horizontal pad band between the panel's own edge
+        # and plot_x1 -- clear of the line for the same reason as above):
+        # R/L tick labels at the upper/lower quarter, spelling out the sign
+        # convention (+g/above baseline = right turn, -g/below = left --
+        # matching g_to_offset's convention, same as FrictionCircle's own
+        # LEFT/RIGHT ticks) without needing a full axis label.
+        left_mid = x1 + pad / 2
+        _label("R", left_mid, y_mid - half_h / 2, "center")
+        _label("L", left_mid, y_mid + half_h / 2, "center")
+
+
 class FsdDiagnosticText(Widget):
     """Throwaway diagnostic overlay: plain text proving lateral_g/
     longitudinal_g/hands_free_seconds/corner_count all reach a widget with
@@ -547,7 +809,7 @@ class FsdDiagnosticText(Widget):
             )
 
 
-def create_widgets_for(font, widget="scoreboard"):
+def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None):
     """Returns a `create_widgets(entry)` callable of the shape Overlay()
     (gopro_overlay/layout.py) expects -- proven directly usable outside the
     XML layout system by the library's own non-XML speed_awareness_layout
@@ -558,10 +820,30 @@ def create_widgets_for(font, widget="scoreboard"):
 
     `widget`: "scoreboard" (default, --widget) builds the real StreakScoreboard
     showcase visual; "friction-circle" builds the FrictionCircle G-meter
+    showcase visual; "note-highway" builds the NoteHighway cornering-ribbon
     showcase visual; "diagnostic" keeps FsdDiagnosticText available (not
-    deleted) for future debugging of the two still-deferred FSD-overlay
-    ideas, which will want the same kind of raw-value proof-of-plumbing check
-    this branch's own verification relied on.
+    deleted) for future debugging of the one still-deferred FSD-overlay idea
+    (pace-notes), which will want the same kind of raw-value
+    proof-of-plumbing check this branch's own verification relied on.
+
+    `lateral_g_timeline`: the full-drive lateral_g array NoteHighway needs
+    (see its own class docstring for why) -- unlike every other widget here,
+    which only ever reads entry()'s current sample, this one needs the whole
+    timeline up front, so it can't get by on `entry`/`font` alone. Only
+    required (non-None) when `widget == "note-highway"`; every other widget
+    ignores this parameter entirely.
+
+    NOTE: a design note worth revisiting now that all four FSD showcase
+    visuals exist (scoreboard, friction-circle, note-highway, and the
+    still-deferred pace-notes) -- `--gauge --fsd-scoreboard
+    --fsd-friction-circle --fsd-note-highway` together now means FOUR
+    sequential hero-tile re-encode generations (build_fsd_overlay/
+    build_gauge_overlay each subprocess out their own full video re-encode).
+    Flagged during the friction-circle review and deferred until a second
+    widget existed to make it concrete; worth reconsidering now: combining
+    multiple FSD widgets into ONE compositing pass (one Overlay with several
+    widgets in its list, same as this function already returns a list) would
+    cut that to one re-encode regardless of how many flags are combined.
     """
     text_font = font.font_variant(size=22)
 
@@ -570,6 +852,8 @@ def create_widgets_for(font, widget="scoreboard"):
             return [FsdDiagnosticText(Coordinate(24, 24), entry, text_font)]
         if widget == "friction-circle":
             return [FrictionCircle(entry, font)]
+        if widget == "note-highway":
+            return [NoteHighway(entry, font, lateral_g_timeline)]
         return [StreakScoreboard(entry, font)]
 
     return create
@@ -657,10 +941,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Driver for FSD showcase overlays: decodes the GPX "
                     "repurposed-tag -> lateral_g/longitudinal_g/"
                     "autopilot_engaged -> derived-metric pipeline and "
-                    "composites the real streak-scoreboard visual (or, with "
-                    "--widget diagnostic, the original throwaway raw-value "
-                    "text overlay). Invoked by tesla_combine.py's "
-                    "--fsd-scoreboard flag -- see CLAUDE.md.")
+                    "composites the streak-scoreboard, friction-circle, or "
+                    "note-highway showcase visual (or, with --widget "
+                    "diagnostic, the original throwaway raw-value text "
+                    "overlay). Invoked by tesla_combine.py's "
+                    "--fsd-scoreboard/--fsd-friction-circle/"
+                    "--fsd-note-highway flags -- see CLAUDE.md.")
     ap.add_argument("input", type=Path, help="hero camera video (e.g. the "
                     "*-front-combined.mp4 tesla_combine.py already produces)")
     ap.add_argument("output", type=Path, help="output video path")
@@ -673,10 +959,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="directory containing the ffmpeg/ffprobe binaries "
                         "to use (default: PATH)")
     ap.add_argument("--widget", default="scoreboard",
-                    choices=["scoreboard", "diagnostic", "friction-circle"],
+                    choices=["scoreboard", "diagnostic", "friction-circle", "note-highway"],
                     help="which overlay to draw (default: scoreboard). scoreboard: the real "
                         "streak-scoreboard showcase visual. friction-circle: the G-G diagram "
-                        "showcase visual. diagnostic: the original "
+                        "showcase visual. note-highway: the cornering-severity ribbon showcase "
+                        "visual. diagnostic: the original "
                         "throwaway raw-value text overlay, kept for debugging.")
     return ap
 
@@ -726,6 +1013,23 @@ def main(argv=None) -> int:
     frame_meta.process(make_axis_decode_processor())
     frame_meta.process(make_stateful_processor())
 
+    # NoteHighway (--widget note-highway) needs the WHOLE drive's lateral_g
+    # timeline up front, not just the current entry() -- see its own class
+    # docstring. Built here, exactly once, as a single list comprehension:
+    # AFTER both process() passes above (so every entry's .lateral_g is
+    # already populated) and BEFORE Overlay() is constructed below (so the
+    # widget has it at draw time, not just at some later point). frame_meta[i]
+    # (FrameMeta.__getitem__, gopro_overlay/framemeta.py) returns entries in
+    # framelist order -- the same order/cadence the render loop's own
+    # stepper below walks in lockstep with (confirmed empirically -- see
+    # NoteHighway's own class docstring) -- so index i here is exactly the
+    # array position NoteHighway's self._index will reach on draw-call i.
+    # Only built when actually needed: for every other widget this would be
+    # a wasted O(len(frame_meta)) allocation.
+    lateral_g_timeline = None
+    if args.widget == "note-highway":
+        lateral_g_timeline = [frame_meta[i].lateral_g for i in range(len(frame_meta))]
+
     output: Path = args.output
     output.unlink(missing_ok=True)
     execution = InProcessExecution()
@@ -769,7 +1073,8 @@ def main(argv=None) -> int:
     stepper = frame_meta.stepper(timeunits(seconds=RENDER_STEP_SECONDS * timelapse_correction))
     progress = ProgressBarProgress("Render")
 
-    overlay = Overlay(framemeta=frame_meta, create_widgets=create_widgets_for(font, args.widget))
+    overlay = Overlay(framemeta=frame_meta,
+                      create_widgets=create_widgets_for(font, args.widget, lateral_g_timeline))
 
     progress.start(len(stepper))
     with ffmpeg.generate() as writer:

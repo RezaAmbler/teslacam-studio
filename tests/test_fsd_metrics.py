@@ -357,6 +357,79 @@ def test_g_to_offset_diagonal_clamp_preserves_ratio_between_axes():
     assert dx > 0 and dy > 0
 
 
+# --- ribbon_window (--fsd-note-highway) ---------------------------------------
+# The pure windowing math behind the note-highway ribbon: a fixed-length
+# slice of `values` centered on `index`, None-padded (never wrapped, clamped,
+# or fabricated) wherever the window runs off either end of the array.
+
+def test_ribbon_window_mid_array_returns_the_expected_slice():
+    values = list(range(20))
+    window = m.ribbon_window(values, index=10, past_n=3, future_n=2)
+    assert window == [7, 8, 9, 10, 11, 12]
+
+
+def test_ribbon_window_length_is_always_past_plus_one_plus_future():
+    values = list(range(20))
+    for index in (0, 1, 5, 10, 19, 25, -5):
+        window = m.ribbon_window(values, index=index, past_n=4, future_n=6)
+        assert len(window) == 4 + 1 + 6
+
+
+def test_ribbon_window_start_of_array_left_pads_with_none():
+    values = list(range(10))
+    window = m.ribbon_window(values, index=1, past_n=3, future_n=2)
+    # index=1: positions -2, -1 are before the array start -> None; 0..3 real.
+    assert window == [None, None, 0, 1, 2, 3]
+
+
+def test_ribbon_window_end_of_array_right_pads_with_none():
+    values = list(range(10))
+    window = m.ribbon_window(values, index=8, past_n=2, future_n=3)
+    # index=8: positions 6,7,8,9 real; 10,11 past the end -> None.
+    assert window == [6, 7, 8, 9, None, None]
+
+
+def test_ribbon_window_entirely_before_the_array_is_all_none():
+    values = list(range(5))
+    window = m.ribbon_window(values, index=-10, past_n=1, future_n=1)
+    assert window == [None, None, None]
+
+
+def test_ribbon_window_entirely_after_the_array_is_all_none():
+    values = list(range(5))
+    window = m.ribbon_window(values, index=100, past_n=1, future_n=1)
+    assert window == [None, None, None]
+
+
+def test_ribbon_window_zero_past_and_future_is_a_single_point_window():
+    values = list(range(20))
+    window = m.ribbon_window(values, index=10, past_n=0, future_n=0)
+    assert window == [10]
+
+
+def test_ribbon_window_zero_past_and_future_out_of_range_is_none():
+    values = list(range(5))
+    window = m.ribbon_window(values, index=99, past_n=0, future_n=0)
+    assert window == [None]
+
+
+def test_ribbon_window_existing_none_values_pass_through_untouched():
+    # A genuine mid-drive telemetry gap already in `values` must survive
+    # untouched -- ribbon_window only ever ADDS padding at the two ends, it
+    # never interpolates or drops a real (even if None) entry.
+    values = [0.1, 0.2, None, 0.4, 0.5]
+    window = m.ribbon_window(values, index=2, past_n=2, future_n=2)
+    assert window == [0.1, 0.2, None, 0.4, 0.5]
+
+
+def test_ribbon_window_none_value_combined_with_edge_padding():
+    values = [None, 0.2, 0.3]
+    window = m.ribbon_window(values, index=0, past_n=2, future_n=1)
+    # positions -2, -1 are before the array start -> None (padding);
+    # position 0 is a REAL None (a genuine gap); 1 is real data.
+    assert window == [None, None, None, 0.2]
+
+
 # --- TakeoverCounter ----------------------------------------------------------
 
 def test_takeover_counter_starts_at_zero():

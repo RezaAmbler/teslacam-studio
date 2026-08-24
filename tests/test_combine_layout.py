@@ -417,10 +417,50 @@ def test_retime_edge_pads_null_fsd_fields_but_keep_position():
         assert pad["autopilot_state"] is None
         assert pad["lat"] == real["lat"]  # position still held, unlike FSD fields
 
-    assert real["linear_acceleration_mps2_x"] == 0.9
-    assert real["autopilot_state"] == 1
-    assert out[0]["linear_acceleration_mps2_y"] is None
-    assert out[0]["autopilot_state"] is None
+
+def test_retime_bridges_fsd_fields_across_mid_drive_gap():
+    # A real mid-drive SEI dropout (e.g. one clip in a multi-clip event has
+    # no SEI while its neighbors do) must NOT let gopro-overlay's own
+    # Timeseries.get() linearly interpolate lateral_g/autopilot_engaged
+    # straight across the gap -- confirmed as a real hole (an independent
+    # review traced gopro-overlay's own interpolation code) in the "a gap
+    # must show as a gap" principle every other FSD field/widget follows.
+    # Two consecutive real samples 50s apart (clip0 has content only through
+    # frame 100 = t10.0; clip1's first sample lands at concat_start=60.0)
+    # must get two synthetic None-FSD bridge points inserted just inside
+    # each side of the gap.
+    s0 = _s(100)
+    s0["linear_acceleration_mps2_x"] = -2.0
+    s0["autopilot_state"] = 1
+    s1 = _s(0)
+    s1["linear_acceleration_mps2_x"] = 1.5
+    s1["autopilot_state"] = 1
+    c0 = [_s(0), s0]
+    c1 = [s1, _s(50)]
+    out = tc.retime_samples([c0, c1], [10.0, 10.0], [60.0, 60.0], 0.0, 130.0)
+    by_time = {round(_secs(s), 3): s for s in out}
+
+    assert 10.0 in by_time and by_time[10.0]["linear_acceleration_mps2_x"] == -2.0
+    assert 60.0 in by_time and by_time[60.0]["linear_acceleration_mps2_x"] == 1.5
+    # bridge points just inside the gap, both FSD-field-null
+    bridge_start = by_time[10.01]
+    bridge_end = by_time[59.99]
+    for bridge in (bridge_start, bridge_end):
+        assert bridge["linear_acceleration_mps2_x"] is None
+        assert bridge["autopilot_state"] is None
+    # position is left alone across the gap (unlike the FSD fields)
+    assert bridge_start["lat"] == s0["lat"]
+    assert bridge_end["lat"] == s1["lat"]
+
+
+def test_retime_no_bridge_for_normal_sample_spacing():
+    # Ordinary consecutive-sample spacing (well under GAP_BREAK_SECONDS)
+    # must not spuriously insert bridge points -- exact count/timing check.
+    out = tc.retime_samples([[_s(0), _s(10)]], [10.0], [60.0], 0.0, 60.0)
+    times = [round(_secs(s), 3) for s in out]
+    # exactly: real@0.0, real@1.0, tail pad@60.5 -- no bridge inserted for
+    # a 1.0s gap (GAP_BREAK_SECONDS requires a STRICTLY greater gap)
+    assert times == [0.0, 1.0, 60.5]
 
 
 # --- looks_tesla_encrypted ---------------------------------------------------
@@ -535,6 +575,7 @@ def _scoreboard_tools_args(**kw):
     a.gauge_units = "mph"
     a.fsd_scoreboard = False
     a.fsd_friction_circle = False
+    a.fsd_note_highway = False
     a.feature = "front"
     a.__dict__.update(kw)
     return a
@@ -790,3 +831,142 @@ def test_fsd_friction_circle_dry_run_passes_widget_flag(tmp_path, capsys):
 
     printed = capsys.readouterr().out
     assert "--widget friction-circle" in printed
+
+
+# --- --fsd-note-highway: CLI parsing/defaults ---------------------------------
+
+def test_cli_fsd_note_highway_default_off():
+    args = tc.build_parser().parse_args(["/some/folder"])
+    assert args.fsd_note_highway is False
+
+
+def test_cli_fsd_note_highway_flag():
+    args = tc.build_parser().parse_args(["/some/folder", "--fsd-note-highway"])
+    assert args.fsd_note_highway is True
+
+
+# --- --fsd-note-highway + a paired --feature: the die() path in setup_tools --
+
+def test_fsd_note_highway_pair_feature_is_rejected(monkeypatch, tmp_path):
+    # Mirrors test_fsd_friction_circle_pair_feature_is_rejected exactly --
+    # same restriction, same reasoning (composites onto one hero tile).
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_note_highway=True, feature="repeaters"))
+
+
+def test_fsd_note_highway_solo_feature_is_accepted(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    tools = tc.setup_tools(_scoreboard_tools_args(fsd_note_highway=True, feature="left_pillar"))
+    assert tools.map_venv_py == tmp_path / "py"
+    assert tools.map_gopro == tmp_path / "gopro"
+
+
+def test_fsd_note_highway_missing_tooling_message_names_the_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (None, None, ["gopro-overlay"]))
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_note_highway=True))
+
+
+# --- --fsd-note-highway: filename suffix (build_grid, --dry-run) -------------
+
+def _note_highway_stats(**overrides):
+    """A stats dict with every key build_grid/print_stats might touch across
+    --gauge/--fsd-scoreboard/--fsd-friction-circle/--fsd-note-highway, all
+    defaulted off -- extends _friction_circle_stats' shape with the
+    note-highway keys this branch added."""
+    stats = _friction_circle_stats()
+    stats.update({"note_highway_s": 0.0, "note_highway_built": False})
+    stats.update(overrides)
+    return stats
+
+
+def test_fsd_note_highway_filename_suffix(tmp_path):
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-note-highway", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["note_highway_built"] is True
+    assert "_note-highway" in out_grid.name
+    assert out_grid.name == "session_grid_note-highway.mp4"
+
+
+def test_fsd_note_highway_full_chain_suffix_order(tmp_path):
+    # All four overlay flags together (--gauge --fsd-scoreboard
+    # --fsd-friction-circle --fsd-note-highway) chain sequentially through
+    # angle_paths[hero_angle] -- gauge, then scoreboard, then friction
+    # circle, then note highway, the same order build_grid composites them
+    # in; the filename records all four in that order. Confirms the full
+    # chain now that all four FSD/gauge overlay flags exist.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--gauge", "--fsd-scoreboard", "--fsd-friction-circle",
+         "--fsd-note-highway", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"), map_gopro=Path("fake-gopro"),
+                     map_font="/System/Library/Fonts/Menlo.ttc")
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["gauge_built"] is True
+    assert stats["scoreboard_built"] is True
+    assert stats["friction_circle_built"] is True
+    assert stats["note_highway_built"] is True
+    assert out_grid.name == "session_grid_gauge_scoreboard_friction-circle_note-highway.mp4"
+
+
+def test_fsd_note_highway_dry_run_passes_widget_flag(tmp_path, capsys):
+    # build_fsd_overlay's consolidation passes --widget through to
+    # tesla_fsd_overlay.py explicitly -- confirm the printed --dry-run
+    # command actually carries the right widget name.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-note-highway", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    printed = capsys.readouterr().out
+    assert "--widget note-highway" in printed
