@@ -373,6 +373,7 @@ class Args:
         self.map_mag = 2.0
         self.gauge = False
         self.fsd_scoreboard = False
+        self.fsd_friction_circle = False
         self.speed = 1.0
         self.__dict__.update(kw)
 

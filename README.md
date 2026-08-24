@@ -35,6 +35,14 @@ traces where you drove.
   together only extracts GPS once). Takeover counting hasn't been exercised
   against a real disengagement yet — every drive tested so far stayed engaged
   throughout.
+- **FSD friction circle** (`--fsd-friction-circle`) — the classic motorsport
+  G-G diagram, composited bottom-right on the hero camera tile: lateral G vs.
+  longitudinal G plotted on a ringed target (rings at 0.2g/0.4g), with a
+  fading 3-second trail and a "peak this corner" readout. Smooth FSD driving
+  traces clean arcs; jerky driving scatters. Same GPS telemetry as `--map`/
+  `--gauge`/`--fsd-scoreboard` (shared). Can be combined with `--gauge`/
+  `--fsd-scoreboard` — the three overlays occupy different corners of the
+  hero tile.
 - **Landscape layout** (`--landscape`) — the featured camera at full native
   resolution on the left, every other camera (and the map, if any) in a thin
   sidebar column on the right, sized to match. Produces a real landscape
@@ -111,7 +119,7 @@ predicted from that measurement).
   ```
   The script auto-detects `ffmpeg-full` and falls back gracefully.
 - **Python 3.9+** for the core tool (standard library only).
-- For `--map` / `--gauge` / `--fsd-scoreboard`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
+- For `--map` / `--gauge` / `--fsd-scoreboard` / `--fsd-friction-circle`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
 - For `--blur-faces`: `pip install deface` (optional).
 
 ## Setup
@@ -121,16 +129,17 @@ git clone https://github.com/RezaAmbler/teslacam-studio.git
 cd teslacam-studio
 
 # Optional — only needed for the --map route overlay / --gauge dashboard overlay /
-# --fsd-scoreboard streak scoreboard:
+# --fsd-scoreboard streak scoreboard / --fsd-friction-circle G-meter:
 python3.12 -m venv .venv
 ./.venv/bin/python -m pip install gopro-overlay
 ```
 
 The `--map`/`--gauge` features look for `gopro-dashboard.py` inside `./.venv`;
-`--fsd-scoreboard` looks for its own driver script (`tesla_fsd_overlay.py`) and
-the `gopro-overlay` library installed there. `--map` downloads OpenStreetMap
-tiles on first use (so it needs network access); `--gauge`/`--fsd-scoreboard`
-composite onto your own footage and need no network access.
+`--fsd-scoreboard`/`--fsd-friction-circle` look for their own driver script
+(`tesla_fsd_overlay.py`) and the `gopro-overlay` library installed there.
+`--map` downloads OpenStreetMap tiles on first use (so it needs network
+access); `--gauge`/`--fsd-scoreboard`/`--fsd-friction-circle` composite onto
+your own footage and need no network access.
 
 ### Running the tests
 
@@ -174,6 +183,12 @@ python3 tesla_combine.py /path/to/event/folder --gauge --gauge-units kph
 # Composite an FSD streak scoreboard onto the hero tile (needs gopro-overlay in ./.venv)
 python3 tesla_combine.py /path/to/event/folder --fsd-scoreboard
 
+# Composite an FSD friction-circle G-meter onto the hero tile (needs gopro-overlay in ./.venv)
+python3 tesla_combine.py /path/to/event/folder --fsd-friction-circle
+
+# All three hero-tile overlays together (each takes a different corner)
+python3 tesla_combine.py /path/to/event/folder --gauge --fsd-scoreboard --fsd-friction-circle
+
 # Landscape layout (real 16:9-ish aspect ratio) instead of the tall grid
 python3 tesla_combine.py /path/to/event/folder --landscape --map
 
@@ -200,6 +215,7 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--gauge` | Composite a speed/compass dashboard panel onto the hero tile (solo `--feature` only) |
 | `--gauge-units` | `mph` (default) or `kph` |
 | `--fsd-scoreboard` | Composite an FSD streak scoreboard (hands-free time, corner count, peak G, takeovers) onto the hero tile (solo `--feature` only) |
+| `--fsd-friction-circle` | Composite an FSD friction-circle G-meter (lateral vs. longitudinal G, fading trail, peak-this-corner) onto the hero tile (solo `--feature` only) |
 | `--landscape` | Hero camera at native res + thin sidebar column, instead of the tall grid |
 | `--native` | True native resolution (skips the hardware-fit scale-down) |
 | `--quality` | `fast` (default, hardware) or `high` (software libx264, CRF 18) |
@@ -230,7 +246,8 @@ Written next to the input folder unless `--output-dir` is given:
 | `<session>_maptile.mp4` | (with `--map`) the standalone live route-map tile |
 | `<session>_<hero-angle>_gauge.mp4` | (with `--gauge`) that hero tile, dashboard overlay composited on |
 | `<session>_<hero-angle>_scoreboard.mp4` | (with `--fsd-scoreboard`) that hero tile, streak scoreboard composited on |
-| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_map].mp4` | the labeled multi-camera composite |
+| `<session>_<hero-angle>_friction-circle.mp4` | (with `--fsd-friction-circle`) that hero tile, friction-circle G-meter composited on |
+| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_map].mp4` | the labeled multi-camera composite |
 
 `playcheck.sh <file.mp4>` runs headless playback sanity checks (decode integrity,
 faststart index, hardware-decodable dimensions, constant frame rate).

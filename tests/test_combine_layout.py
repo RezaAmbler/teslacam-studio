@@ -534,6 +534,7 @@ def _scoreboard_tools_args(**kw):
     a.gauge = False
     a.gauge_units = "mph"
     a.fsd_scoreboard = False
+    a.fsd_friction_circle = False
     a.feature = "front"
     a.__dict__.update(kw)
     return a
@@ -651,3 +652,141 @@ def test_fsd_scoreboard_and_gauge_suffix_order(tmp_path):
     assert stats["gauge_built"] is True
     assert stats["scoreboard_built"] is True
     assert out_grid.name == "session_grid_gauge_scoreboard.mp4"
+
+
+# --- --fsd-friction-circle: CLI parsing/defaults ------------------------------
+
+def test_cli_fsd_friction_circle_default_off():
+    args = tc.build_parser().parse_args(["/some/folder"])
+    assert args.fsd_friction_circle is False
+
+
+def test_cli_fsd_friction_circle_flag():
+    args = tc.build_parser().parse_args(["/some/folder", "--fsd-friction-circle"])
+    assert args.fsd_friction_circle is True
+
+
+# --- --fsd-friction-circle + a paired --feature: the die() path in setup_tools
+
+def test_fsd_friction_circle_pair_feature_is_rejected(monkeypatch, tmp_path):
+    # Mirrors test_fsd_scoreboard_pair_feature_is_rejected exactly -- same
+    # restriction, same reasoning (composites onto one hero tile).
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_friction_circle=True, feature="repeaters"))
+
+
+def test_fsd_friction_circle_solo_feature_is_accepted(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    tools = tc.setup_tools(_scoreboard_tools_args(fsd_friction_circle=True, feature="left_pillar"))
+    assert tools.map_venv_py == tmp_path / "py"
+    assert tools.map_gopro == tmp_path / "gopro"
+
+
+def test_fsd_friction_circle_missing_tooling_message_names_the_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (None, None, ["gopro-overlay"]))
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_friction_circle=True))
+
+
+# --- --fsd-friction-circle: filename suffix (build_grid, --dry-run) ----------
+
+def _friction_circle_stats(**overrides):
+    """A stats dict with every key build_grid/print_stats might touch across
+    --gauge/--fsd-scoreboard/--fsd-friction-circle, all defaulted off -- the
+    same shape _scoreboard_grid_plan's callers already build by hand, just
+    extended with the friction-circle keys the refactor added."""
+    stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
+             "scoreboard_s": 0.0, "scoreboard_built": False,
+             "friction_circle_s": 0.0, "friction_circle_built": False, "grid_s": 0.0}
+    stats.update(overrides)
+    return stats
+
+
+def test_fsd_friction_circle_filename_suffix(tmp_path):
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-friction-circle", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _friction_circle_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["friction_circle_built"] is True
+    assert "_friction-circle" in out_grid.name
+    assert out_grid.name == "session_grid_friction-circle.mp4"
+
+
+def test_fsd_friction_circle_gauge_scoreboard_suffix_order(tmp_path):
+    # All three overlay flags together chain sequentially through
+    # angle_paths[hero_angle] (gauge, then scoreboard, then friction circle
+    # -- the same order build_grid composites them in); the filename records
+    # all three in that order.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--gauge", "--fsd-scoreboard", "--fsd-friction-circle", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"), map_gopro=Path("fake-gopro"),
+                     map_font="/System/Library/Fonts/Menlo.ttc")
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _friction_circle_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["gauge_built"] is True
+    assert stats["scoreboard_built"] is True
+    assert stats["friction_circle_built"] is True
+    assert out_grid.name == "session_grid_gauge_scoreboard_friction-circle.mp4"
+
+
+def test_fsd_friction_circle_dry_run_passes_widget_flag(tmp_path, capsys):
+    # build_fsd_overlay's consolidation passes --widget through to
+    # tesla_fsd_overlay.py explicitly -- confirm the printed --dry-run
+    # command actually carries the right widget name. log() prints straight
+    # to stdout (see tesla_combine.py's log()), not through Progress's own
+    # `stream`, so capsys -- not the Progress stream -- is what catches it.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-friction-circle", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _friction_circle_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    printed = capsys.readouterr().out
+    assert "--widget friction-circle" in printed

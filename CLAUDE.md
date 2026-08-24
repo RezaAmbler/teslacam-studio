@@ -118,14 +118,15 @@ scoreboard overlay.
 - **FSD showcase overlays (`tesla_fsd_overlay.py` / `tesla_fsd_metrics.py`):**
   groundwork for four planned visual ideas (a hands-free/corner-count streak
   scoreboard, a friction-circle G-force meter, a scrolling "note highway"
-  anticipation ribbon, rally pace-notes). The first of the four — the streak
-  scoreboard — is now real and wired into `tesla_combine.py`'s CLI as
-  `--fsd-scoreboard` (`fsd-streak-scoreboard` branch, off the merged
-  `fsd-overlay-foundation`); the other three remain each their own follow-up
-  branch's job. `StreakScoreboard` (`tesla_fsd_overlay.py`) replaces the
-  branch's original `FsdDiagnosticText` throwaway plain-text overlay as the
-  default draw target (`--widget scoreboard`, vs. `--widget diagnostic` --
-  the old diagnostic is kept, not deleted, for debugging the next three
+  anticipation ribbon, rally pace-notes). The first two of the four — the
+  streak scoreboard and the friction circle — are now real and wired into
+  `tesla_combine.py`'s CLI as `--fsd-scoreboard` (`fsd-streak-scoreboard`
+  branch, off the merged `fsd-overlay-foundation`) and `--fsd-friction-circle`
+  (`fsd-friction-circle` branch); the other two remain each their own
+  follow-up branch's job. `StreakScoreboard` (`tesla_fsd_overlay.py`) replaces
+  the branch's original `FsdDiagnosticText` throwaway plain-text overlay as
+  the default draw target (`--widget scoreboard`, vs. `--widget diagnostic`
+  -- the old diagnostic is kept, not deleted, for debugging the remaining
   ideas the same way it helped prove this one's plumbing). It draws a single
   dark translucent panel, **top-right** of the hero tile: a color-coded "FSD
   ENGAGED"/"FSD OFF" badge (green while engaged, gray/red while not) followed
@@ -147,7 +148,135 @@ scoreboard overlay.
   observed — so `TakeoverCounter` is implemented and unit-tested against
   synthetic data only, and has NOT been verified against a real disengagement
   event. Don't mistake "looks right in a synthetic test" for "confirmed
-  against reality" here. Two findings drove the original foundation's design:
+  against reality" here.
+  - **The friction circle** (`FrictionCircle`, `--widget friction-circle`,
+    `--fsd-friction-circle`): the classic motorsport G-G diagram — lateral G
+    vs. longitudinal G plotted as a dot on a ringed target (concentric rings
+    at 0.2g/0.4g, `FRICTION_CIRCLE_RING_STEP`, full-scale rim at
+    `FRICTION_CIRCLE_MAX_G=0.6`), with a fading 3-second trail behind it and
+    a "peak this corner: X.XXg" readout. Smooth FSD driving (brake → turn-in
+    → apex → throttle blending into one continuous curve) traces clean arcs;
+    jerky driving scatters. **Bottom-right** of the hero tile — the one
+    corner the other two overlays leave free: the grid's own hero label is
+    top-left (drawn later by `tesla_combine.py`'s filter graph, same reason
+    `StreakScoreboard` avoids it), `StreakScoreboard` itself is top-right,
+    `--gauge`'s dashboard panel is bottom-left. So all three overlay flags
+    together (`--gauge --fsd-scoreboard --fsd-friction-circle`) now use all
+    four corners with no collisions, by construction. `FRICTION_CIRCLE_
+    SIZE_FRAC`/`_MARGIN` are the same starting-guess-then-verify status every
+    panel constant in this codebase has had.
+    - `CornerCounter` (`tesla_fsd_metrics.py`) was extended, not duplicated,
+      with `last_corner_peak_g` (latches to the just-completed corner's peak
+      `|lateral_g|` the instant a corner *exits* — the same
+      `magnitude < exit_g` transition that already flips `_in_corner` False)
+      and an internal `_current_corner_peak` (the in-progress corner's
+      running peak, reset to the entry magnitude when a corner *starts*).
+      Kept in `CornerCounter` rather than a second class so there's exactly
+      one place the "am I in a corner right now" hysteresis lives — two
+      independent trackers could disagree. The extension is backward
+      compatible: `corner_count`/`peak_lateral_g` and `update()`'s
+      return-value contract are unchanged, confirmed by rerunning the
+      pre-existing `CornerCounter` tests unmodified after the extension.
+    - `GTrailBuffer` (`tesla_fsd_metrics.py`) is a thin
+      `collections.deque(maxlen=N)` of `(lateral_g, longitudinal_g)` pairs.
+      `.append` is a no-op when either axis is `None` — mirrors the
+      takeover-counter lesson: a real telemetry gap must leave a visible
+      *pause* in the trail (the deque just stops growing until data
+      resumes), never fabricate a point at the origin or silently carry a
+      stale value forward. `N` (Fable's "3-second" trail) is the *widget's*
+      decision, not this class's — `tesla_fsd_overlay.py`'s render loop
+      steps at ~0.1s, so `FrictionCircle` picks `N=30`; `GTrailBuffer` itself
+      just takes whatever `maxlen` it's given. `FrictionCircle` owns one
+      `GTrailBuffer` instance as `__init__` state and appends to it once per
+      `draw()` call — safe because `Overlay.__init__` (`gopro_overlay/
+      layout.py`) calls `create_widgets(entry)` exactly once and reuses the
+      same widget instances for every subsequent `draw()` across the whole
+      render, confirmed by reading that file this session.
+    - **Alpha-fade technique that actually worked, and why**: direct
+      per-shape RGBA fill on the shared overlay canvas (the same technique
+      `StreakScoreboard`'s translucent panel/badge already uses), NOT
+      gopro-overlay's own `Frame` widget technique (`gopro_overlay/widgets/
+      widgets.py`) of drawing children onto a separate opaque layer, applying
+      an alpha mask via `putalpha`, then `image.alpha_composite`-ing that
+      layer onto the canvas. The direct approach works here because
+      `tesla_fsd_overlay.py`'s `SingleBuffer` starts each frame from a
+      **fully transparent** `(0,0,0,0)` canvas (see its own `main()`) — so a
+      direct fill's alpha is written to the frame as-is, and ffmpeg's own
+      `overlay` filter alpha-blends the *finished* frame onto the video
+      correctly. The trail is drawn **oldest point first**, so where two
+      points overlap, painter's-algorithm order means the newer (more
+      opaque) one naturally overwrites the older (fainter) one — the correct
+      order for a fade, and why the simpler direct-alpha approach was
+      sufficient without a flat-opacity artifact. **This was verified by
+      rendering a real synthetic frame and reading back actual pixel alpha
+      values** (not just a code-read): a 40-sample synthetic corner produced
+      a trail whose per-pixel alpha rose monotonically from 35 (oldest) to
+      200 (newest), with the current-sample dot overwriting as solid
+      `(255,255,255,255)` on top — confirming the fade is real, not flat.
+      That same real-frame check also caught a real layout bug: the
+      "RIGHT"/"LEFT" axis tick labels, drawn with OUTWARD text alignment
+      (extending away from center, toward the panel's own rim), overflowed
+      past the panel's edge and came uncomfortably close to the tile's own
+      right edge (bottom-right placement means that edge is close by
+      construction). Fixed by aligning those two labels INWARD instead
+      (toward the spacious center of the circle) — always fits regardless of
+      font/label width, since the whole circle's interior is available to
+      grow into.
+    - **Axis sign convention — confirmed against real telemetry, not
+      eyeballed**: the IMU axis MAPPING (`linear_acceleration_mps2_x/y` →
+      lateral/longitudinal) was already confirmed against real data (see
+      below); which physical direction each channel's *positive* sign
+      corresponds to needed a *second*, separate check. A single eyeballed
+      video frame turned out to be an unreliable way to check it — this is a
+      continuously winding mountain road, so "which way does the FRONT
+      camera curve right now" is phase-lagged against "what is the car's
+      lateral accel at this exact instant" (two different real timestamps
+      gave contradictory answers by eye). Settled with statistics instead,
+      over the same 28,000-point real drive used for the axis mapping:
+      `corr(d(heading_deg)/dt [+ = turning right], lateral_g) = +0.68` —
+      turning right already gives positive `lateral_g`, so the `x = cx +
+      (...)` mapping needed no change. `corr(d(speed)/dt [+ = accelerating],
+      raw linear_acceleration_mps2_y) = -0.36` — accelerating gives
+      **negative** `longitudinal_g`, which the original `y = cy - (...)`
+      put toward the `BRAKE` label (backwards); fixed to `y = cy + (...)`.
+      Re-verified after the fix, again against real telemetry rather than a
+      guess: found the exact real timestamps of strongest acceleration and
+      strongest braking within a test window from the actual per-frame CSV,
+      rendered both, and measured the dot's pixel position programmatically
+      — the acceleration-moment dot sits measurably higher (closer to
+      `ACCEL`) than the braking-moment dot, confirming the fix in the
+      correct direction. A full-frame render during real braking-into-a-
+      right-turn shows the dot in the bottom-right quadrant with a trail
+      curving in from upper-left — physically coherent with trail-braking
+      into a right-hander, matching real motorsport G-G diagrams. This sign
+      logic (`FrictionCircle._g_to_px`, `tesla_fsd_overlay.py`) is currently
+      the only place it's expressed, and it's pure math with no
+      `gopro_overlay` dependency but still lives in the venv-only driver
+      script rather than `tesla_fsd_metrics.py` — **the two still-deferred
+      ideas (note-highway ribbon, pace-notes) will need this exact same
+      "positive lateral = right turn" convention** (e.g. pace-notes calling
+      a corner "Right 3" vs "Left 3"), so re-deriving it independently
+      inside either one risks a silent contradiction with the friction
+      circle. Worth hoisting into a tested, shared function before either
+      of those branches starts.
+  - **`build_fsd_overlay` consolidation**: the original `--fsd-scoreboard`-
+    only `build_fsd_scoreboard_overlay` (`tesla_combine.py`) was generalized
+    into `build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widget,
+    ffmpeg, venv_py, out_path, tmpdir, dry_run, progress)`, taking an
+    explicit `widget` ("scoreboard" or "friction-circle") passed straight
+    through to the subprocess as `tesla_fsd_overlay.py --widget <widget>` --
+    a second near-identical function would just have been copy-paste with
+    one word changed, and a third/fourth showcase idea is already known to
+    be coming. `FSD_OVERLAY_META` holds the small per-widget bits that
+    actually differ (the CLI flag name for log lines, the `Step`/`Progress`
+    kind, etc). The one existing `--fsd-scoreboard` call site in `build_grid`
+    now passes `widget="scoreboard"` explicitly (previously implicit via the
+    driver's own `--widget` default) — confirmed, by rerunning every existing
+    `--fsd-scoreboard` test immediately after this refactor and before adding
+    anything friction-circle-specific, that the consolidation alone changes
+    nothing about `--fsd-scoreboard`'s behavior.
+
+  Two findings drove the original foundation's design:
   - **IMU axis mapping resolved with real data**, since Tesla documents none
     of this: correlated 28,000 telemetry points (17.5km of real mountain
     driving) against two independent signals — `linear_acceleration_mps2_x`
@@ -264,6 +393,56 @@ scoreboard overlay.
   until the next one; the bug just fixed was about *missing data* being
   misread as a disengagement, a different and now-closed hole from "we've
   never seen a real one to check against."
+- `--fsd-friction-circle`/`FrictionCircle`: the direct-alpha trail-fade
+  technique and the panel's overall layout (rings, ticks, current dot, peak-G
+  readout) were first verified by rendering real synthetic frames through the
+  actual widget code under `./.venv` and reading back real pixel alpha
+  values — this caught and fixed a real tick-label overflow bug. It has
+  since also gone through a full integrated `tesla_combine.py` render
+  against real Tesla footage, the same way `--fsd-scoreboard` was: alone,
+  combined with `--gauge --fsd-scoreboard --fsd-friction-circle` (all four
+  hero-tile corners populated at once, no collisions), and under
+  `--landscape --map`. `FRICTION_CIRCLE_SIZE_FRAC`/`_MARGIN`/`_MAX_G` are
+  accordingly tuned, not a starting guess. The axis sign convention is
+  confirmed against real telemetry (see the design-notes bullet above for
+  the full method) — not an open item.
+  - **Fixed (flagged by an independent review, same day)**: the "peak this
+    corner" readout used to read `last_corner_peak_g` directly, which only
+    latches on corner *exit* — so while a corner was actually in progress
+    (the moment a viewer is most likely to be looking at a G-meter), it
+    showed the *previous* corner's peak, not the live one. `CornerCounter.
+    display_peak_g` now feeds the widget instead: the live, still-growing
+    `_current_corner_peak` while `_in_corner` is true, falling back to
+    `last_corner_peak_g` (now correctly read as "the last *completed*
+    corner's peak") between corners. `last_corner_peak_g` itself is
+    unchanged and still exists for any caller that specifically wants that
+    narrower meaning.
+  - **Sign math moved to a tested, shared function (flagged by the same
+    review)**: `FrictionCircle._g_to_px`'s sign/clamp logic (confirmed
+    against real telemetry, see above) used to live inline in the widget --
+    pure math with zero `gopro_overlay` dependency, but stuck in the
+    venv-only driver script where `tests/` (system Python) couldn't reach
+    it. Moved to `tesla_fsd_metrics.g_to_offset(lateral_g, longitudinal_g,
+    max_g) -> (dx, dy)`, returning a normalized, UI-framework-agnostic
+    offset (+dx = right, +dy = accelerating) that `_g_to_px` now just scales
+    by `radius_px` and flips into screen space (+y is DOWN on screen, the
+    opposite of `g_to_offset`'s "+dy = accelerating = up" convention -- that
+    flip is the one piece that legitimately belongs in the widget, not the
+    dependency-free module). Now covered by direct tests pinning both axes'
+    signs and the clamp-to-rim behavior — this matters beyond just this
+    widget: **the two still-deferred ideas (note-highway ribbon, pace-notes)
+    need this exact same convention** (e.g. pace-notes calling a corner
+    "Right 3" vs "Left 3"), so they should call `g_to_offset` too, not
+    re-derive the sign independently.
+  - **Design note for the next two branches**: `--gauge` →
+    `--fsd-scoreboard` → `--fsd-friction-circle` already chains as three
+    sequential subprocess renders of the hero tile (each a full decode +
+    draw + re-encode generation). The note-highway ribbon and pace-notes
+    landing the same way would make five generations. `create_widgets_for`
+    already returns a widget *list*, so one `tesla_fsd_overlay.py`
+    invocation could draw multiple FSD widgets (not `--gauge`, a different
+    tool) in a single pass if `--widget` took multiple values — worth doing
+    before a third FSD widget lands, not after.
 
 ## Gotchas
 - Never commit footage or rendered outputs.

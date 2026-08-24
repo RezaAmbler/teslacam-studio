@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """tesla_fsd_overlay.py — driver for FSD showcase overlays.
 
-Wired into tesla_combine.py's CLI as `--fsd-scoreboard` (first of the four
-FSD-showcase visuals to actually ship): proves, end to end, that Tesla's
-per-frame G-force/autopilot telemetry (SEI -> tesla_gps.write_gpx()'s
-repurposed GPX tags -> gopro-overlay's GPX-based pipeline -> tesla_fsd_metrics'
-pure decode/derivation -> a widget) can drive a real composited video, and
-draws the real "streak scoreboard" visual (StreakScoreboard, --widget
-scoreboard, the default) -- an accumulating hands-free/corner/peak-G/takeover
-stat line. The three still-deferred showcase ideas (friction circle,
-note-highway ribbon, pace-notes) are each their own follow-up branch's job;
-FsdDiagnosticText (--widget diagnostic) is kept around, not deleted, for
-debugging those. See CLAUDE.md for the full design rationale (axis mapping,
-GPX tag repurposing, why gopro-dashboard.py's CLI can't carry any of this on
-its own).
+Wired into tesla_combine.py's CLI as `--fsd-scoreboard` and
+`--fsd-friction-circle` (first two of the four FSD-showcase visuals to
+actually ship): proves, end to end, that Tesla's per-frame G-force/autopilot
+telemetry (SEI -> tesla_gps.write_gpx()'s repurposed GPX tags -> gopro-overlay's
+GPX-based pipeline -> tesla_fsd_metrics' pure decode/derivation -> a widget)
+can drive a real composited video, and draws either the "streak scoreboard"
+visual (StreakScoreboard, --widget scoreboard, the default) -- an accumulating
+hands-free/corner/peak-G/takeover stat line -- or the "friction circle" G-G
+diagram visual (FrictionCircle, --widget friction-circle) -- lateral G vs.
+longitudinal G on a ringed target with a fading trail. The two still-deferred
+showcase ideas (note-highway ribbon, pace-notes) are each their own follow-up
+branch's job; FsdDiagnosticText (--widget diagnostic) is kept around, not
+deleted, for debugging those. See CLAUDE.md for the full design rationale
+(axis mapping, GPX tag repurposing, why gopro-dashboard.py's CLI can't carry
+any of this on its own).
 
 Must run under ./.venv (gopro-overlay installed there, not under the system
 Python tesla_combine.py itself uses) -- same venv-boundary reason `--map`/
@@ -67,6 +69,15 @@ from gopro_overlay.progresstrack import ProgressBarProgress
 from gopro_overlay.timeunits import timeunits
 from gopro_overlay.units import units
 from gopro_overlay.widgets.widgets import Widget
+
+# The render loop's own step cadence -- main() passes this to frame_meta.
+# stepper(), which is what "one widget draw() call" actually means in wall-
+# clock terms. FRICTION_CIRCLE_TRAIL_HZ/_LEN below derive from this SAME
+# constant rather than re-stating "0.1" independently -- an earlier version
+# had that duplication (a real finding from an independent review: change
+# one without the other and the "3-second" trail silently becomes a
+# different duration, with nothing to catch the drift).
+RENDER_STEP_SECONDS = 0.1
 
 # A loadable TTF is required at startup even for this plain-text diagnostic
 # widget. Mirrors tesla_combine.py's own FONT_CANDIDATES/find_font() fallback
@@ -225,6 +236,270 @@ class StreakScoreboard(Widget):
         draw.text((stats_x, stats_text_y), stats_text, font=font, fill=(255, 255, 255, 255))
 
 
+# --- friction circle G-meter (--fsd-friction-circle) -------------------------
+# The classic motorsport G-G diagram: lateral G vs. longitudinal G plotted as a
+# dot on a ringed target, with a fading trail behind it. Smooth FSD driving
+# (brake -> turn-in -> apex -> throttle blending into one continuous curve)
+# traces clean arcs; jerky driving scatters.
+#
+# Position: BOTTOM-RIGHT -- the one corner the hero tile's other overlays
+# leave free. tesla_combine.py's grid filter graph draws the hero label
+# top-left (see StreakScoreboard's own comment above); StreakScoreboard itself
+# takes top-right; --gauge's dashboard panel takes bottom-left (GAUGE_MARGIN,
+# tesla_combine.py). Bottom-right is also naturally suited to a roughly-
+# square ringed target, unlike the scoreboard's wide single-line panel. This
+# means all three overlay flags together (--gauge --fsd-scoreboard
+# --fsd-friction-circle) now use all four corners with no collisions by
+# construction, not by luck.
+#
+# Every fraction below started as a synthetic-render estimate, same status
+# every other panel constant in this codebase has had (SCOREBOARD_*, GAUGE_*)
+# -- a starting point that must be checked against a real rendered frame.
+FRICTION_CIRCLE_SIZE_FRAC = 0.30  # ringed-target circle's diameter, as a
+                                  # fraction of the tile's SHORTER dimension
+                                  # (not width/height separately, since the
+                                  # target itself is round) -- a starting
+                                  # guess-then-verify constant like every
+                                  # other panel size in this codebase.
+FRICTION_CIRCLE_MARGIN = 24      # px from the tile's bottom-right corner
+                                  # (matches GAUGE_MARGIN/SCOREBOARD_MARGIN)
+FRICTION_CIRCLE_PAD_FRAC = 0.16  # inner margin between the circle's outer
+                                  # edge and the drawn rings, as a fraction of
+                                  # the circle's diameter -- reserves room for
+                                  # the axis tick labels without them
+                                  # overhanging the panel's edge.
+FRICTION_CIRCLE_TEXT_H_FRAC = 0.16  # height of the "peak this corner" text
+                                  # strip below the circle, as a fraction of
+                                  # the circle's diameter.
+FRICTION_CIRCLE_GAP_FRAC = 0.04  # gap between the circle and the text strip
+                                  # below it, as a fraction of the circle's
+                                  # diameter.
+
+FRICTION_CIRCLE_MAX_G = 0.6      # g value at the RING AREA's outer edge (the
+                                  # full-scale radius a sample is plotted
+                                  # against) -- comfortable FSD lateral
+                                  # cornering measured so far tops out well
+                                  # under this (CornerCounter.ENTER_G=0.15,
+                                  # real drives peaking ~0.3-0.5g per
+                                  # CLAUDE.md), so 0.6g gives headroom above
+                                  # the 0.4g outer ring without a realistic
+                                  # peak pinning to the rim.
+FRICTION_CIRCLE_RING_STEP = 0.2  # ring interval in g -- rings drawn at 0.2g
+                                  # and 0.4g, per Fable's brainstorm.
+
+FRICTION_CIRCLE_TRAIL_SECONDS = 3.0  # Fable's "3-second" trail
+# Derived from RENDER_STEP_SECONDS (module-level, above) rather than
+# restating "10Hz"/"0.1s" independently -- one widget draw() call per render
+# step, and FrictionCircle appends to its trail once per draw() call, so
+# RENDER_STEP_SECONDS is what "3 seconds" actually means in buffer length.
+FRICTION_CIRCLE_TRAIL_LEN = round(FRICTION_CIRCLE_TRAIL_SECONDS / RENDER_STEP_SECONDS)  # 30
+
+FRICTION_CIRCLE_BG = (0, 0, 0, 160)           # translucent dark disc, matching
+                                              # SCOREBOARD_PANEL_BG/--gauge's style
+FRICTION_CIRCLE_RING_RGB = (255, 255, 255, 90)   # faint ring outlines
+FRICTION_CIRCLE_AXIS_RGB = (255, 255, 255, 55)   # faint crosshair axes
+FRICTION_CIRCLE_TICK_RGB = (220, 220, 220, 200)  # axis tick label text
+FRICTION_CIRCLE_TRAIL_RGB = (90, 200, 255)       # trail dot base color (alpha
+                                                  # varies per point by age --
+                                                  # see draw())
+FRICTION_CIRCLE_TRAIL_MIN_ALPHA = 35   # oldest trail point
+FRICTION_CIRCLE_TRAIL_MAX_ALPHA = 200  # newest trail point (still a step
+                                        # below the current dot's own alpha,
+                                        # so the current sample reads as the
+                                        # brightest thing on the panel)
+FRICTION_CIRCLE_DOT_RGB = (255, 255, 255, 255)   # current sample: solid bright dot
+FRICTION_CIRCLE_TEXT_RGB = (255, 255, 255, 255)
+
+
+class FrictionCircle(Widget):
+    """The friction-circle G-meter showcase visual (--widget friction-circle):
+    a ringed target (concentric circles at 0.2g/0.4g) with the current
+    (lateral_g, longitudinal_g) sample as a bright dot, a fading 3-second
+    trail behind it (GTrailBuffer), and a small "peak this corner: X.XXg"
+    readout fed by CornerCounter.display_peak_g (grows live while a corner
+    is in progress, holds the finished corner's peak between corners --
+    NOT last_corner_peak_g directly, which would show the PREVIOUS corner's
+    value for the whole duration of the current one).
+
+    Owns a GTrailBuffer instance as __init__ state -- safe because
+    Overlay.__init__ (gopro_overlay/layout.py) calls create_widgets(entry)
+    exactly ONCE and reuses the same widget instances for every subsequent
+    draw() call across the whole render, so instance-level accumulation
+    (append-once-per-frame, in draw() below) is the correct, simplest way to
+    hold a trail -- no need to thread it through FrameMeta.process() the way
+    the *shared* derived fields (lateral_g, last_corner_peak_g, etc) are.
+
+    Axis convention (lateral_g -> x, longitudinal_g -> y) mirrors
+    tesla_fsd_metrics' documented mapping. WHICH SIGN reads as left/right
+    and accel/brake was initially a best-guess, then checked against real
+    telemetry (not eyeballed off single video frames -- see _g_to_px's own
+    comment for why that method gave contradictory answers on a winding
+    road): lateral needed no change (turning right already gave positive
+    lateral_g), longitudinal was backwards (accelerating gave negative
+    longitudinal_g, which the original `cy - (...)` put toward BRAKE) and
+    has been fixed to `cy + (...)`.
+
+    RENDERING TECHNIQUE: draws every shape directly onto the shared overlay
+    canvas via self.font/draw with per-shape RGBA fill (no separate
+    Frame-style alpha-mask layer -- see gopro_overlay/widgets/widgets.py's
+    Frame class for that alternate technique). This mirrors StreakScoreboard,
+    whose translucent panel/badge fills are drawn the same direct way and
+    were confirmed, against real rendered footage, to composite correctly:
+    the render loop's SingleBuffer starts each frame from a FULLY
+    TRANSPARENT (0,0,0,0) canvas (see tesla_fsd_overlay.py's main()), so a
+    direct fill's alpha value is written as-is and ffmpeg's own overlay
+    filter alpha-blends the finished frame onto the video correctly. The
+    trail is drawn OLDEST POINT FIRST specifically so that where two points
+    happen to overlap, the newer (more opaque) one paints over the older
+    (fainter) one -- the correct painter's-algorithm order for a fade, and
+    why direct-alpha (rather than Frame's separate-layer-then-composite
+    technique) is sufficient here without a flat-opacity artifact.
+    """
+
+    def __init__(self, entry, font):
+        self.entry = entry
+        self.font = font
+        self.trail = fsd_metrics.GTrailBuffer(maxlen=FRICTION_CIRCLE_TRAIL_LEN)
+
+    @staticmethod
+    def _g_to_px(lateral_g, longitudinal_g, cx, cy, radius_px, max_g):
+        """Map a (lateral_g, longitudinal_g) sample to panel pixel
+        coordinates. The sign/clamp math itself (which axis means which
+        physical direction, confirmed against real telemetry -- not
+        eyeballed off a single video frame, which turned out to be an
+        unreliable check on a continuously winding road) lives in
+        tesla_fsd_metrics.g_to_offset, not here -- moved there after an
+        independent review flagged that this pure math, with zero
+        gopro_overlay dependency, was stuck in a venv-only script tests/
+        can't reach, and that the two still-deferred FSD-overlay ideas will
+        need this exact same convention. See that function's own docstring
+        for the confirmed correlation values.
+
+        This method only does the SCREEN-SPACE part: g_to_offset returns
+        dy where +dy = accelerating = "up" in the intuitive/physical sense,
+        but screen pixel y increases DOWNWARD, so it's negated here -- a
+        UI-framework detail that deliberately does NOT belong in the
+        dependency-free metrics module.
+        """
+        dx, dy = fsd_metrics.g_to_offset(lateral_g, longitudinal_g, max_g)
+        x = cx + dx * radius_px
+        y = cy - dy * radius_px
+        return x, y
+
+    def draw(self, image, draw):
+        e = self.entry()
+        lateral_g = e.lateral_g
+        longitudinal_g = e.longitudinal_g
+        # display_peak_g, not last_corner_peak_g: the latter only latches on
+        # corner EXIT, so reading it directly would show the PREVIOUS
+        # corner's peak for the whole duration of the current one -- exactly
+        # when a viewer is most likely to be looking at a G-meter. See
+        # CornerCounter.display_peak_g's docstring.
+        peak = e.display_peak_g or 0.0
+
+        # Append-once-per-frame: a None sample (data gap) is a no-op inside
+        # GTrailBuffer.append itself, so the trail simply pauses (holds its
+        # existing points) rather than fabricating a point at the origin.
+        self.trail.append(lateral_g, longitudinal_g)
+
+        img_w, img_h = image.size
+        size = max(2, round(min(img_w, img_h) * FRICTION_CIRCLE_SIZE_FRAC))
+        text_h = max(1, round(size * FRICTION_CIRCLE_TEXT_H_FRAC))
+        gap = max(1, round(size * FRICTION_CIRCLE_GAP_FRAC))
+
+        x2 = img_w - FRICTION_CIRCLE_MARGIN
+        x1 = x2 - size
+        panel_y2 = img_h - FRICTION_CIRCLE_MARGIN
+        circle_y2 = panel_y2 - text_h - gap
+        circle_y1 = circle_y2 - size
+        cx, cy = (x1 + x2) / 2, (circle_y1 + circle_y2) / 2
+
+        pad = max(2, round(size * FRICTION_CIRCLE_PAD_FRAC))
+        radius_px = size / 2 - pad
+
+        # Ringed target background: a filled dark disc, then concentric ring
+        # outlines at each FRICTION_CIRCLE_RING_STEP up to FRICTION_CIRCLE_MAX_G.
+        draw.ellipse([x1, circle_y1, x2, circle_y2], fill=FRICTION_CIRCLE_BG)
+        ring_g = FRICTION_CIRCLE_RING_STEP
+        while ring_g < FRICTION_CIRCLE_MAX_G - 1e-9:
+            r = radius_px * (ring_g / FRICTION_CIRCLE_MAX_G)
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=FRICTION_CIRCLE_RING_RGB)
+            ring_g += FRICTION_CIRCLE_RING_STEP
+        draw.ellipse([cx - radius_px, cy - radius_px, cx + radius_px, cy + radius_px],
+                     outline=FRICTION_CIRCLE_RING_RGB)
+
+        # Faint crosshair axes.
+        draw.line([(cx - radius_px, cy), (cx + radius_px, cy)], fill=FRICTION_CIRCLE_AXIS_RGB)
+        draw.line([(cx, cy - radius_px), (cx, cy + radius_px)], fill=FRICTION_CIRCLE_AXIS_RGB)
+
+        # Axis tick labels, in the pad ring between the rings and the panel's
+        # outer edge -- see the class docstring for the left/right and
+        # accel/brake sign caveat. LEFT/RIGHT are aligned INWARD (toward
+        # center, not outward toward the panel's own rim) deliberately --
+        # verified against a real rendered frame that outward alignment lets
+        # a wide label like "RIGHT" overflow past the panel's own edge (and,
+        # since this widget sits in the tile's bottom-right corner, come
+        # uncomfortably close to the tile's real edge too). Aligning inward
+        # instead always has the whole spacious center of the circle to grow
+        # into, so it can never overflow the panel regardless of font/label
+        # width.
+        tick_font = self.font.font_variant(size=max(8, round(size * 0.045)))
+        tick_r = size / 2 - pad / 2
+        for text, tx, ty, align in (
+            ("LEFT", cx - tick_r, cy, "left"),
+            ("RIGHT", cx + tick_r, cy, "right"),
+            ("ACCEL", cx, cy - tick_r, "center"),
+            ("BRAKE", cx, cy + tick_r, "center"),
+        ):
+            bbox = draw.textbbox((0, 0), text, font=tick_font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if align == "right":
+                ox, oy = tx - tw, ty - th / 2
+            elif align == "left":
+                ox, oy = tx, ty - th / 2
+            else:
+                ox, oy = tx - tw / 2, ty - th / 2
+            draw.text((ox, oy - bbox[1]), text, font=tick_font, fill=FRICTION_CIRCLE_TICK_RGB)
+
+        # Fading trail, oldest first (see the class docstring on draw order).
+        points = self.trail.points
+        trail_r = max(1, round(radius_px * 0.02))
+        n = len(points)
+        for i, (lg, tg) in enumerate(points):
+            alpha = (FRICTION_CIRCLE_TRAIL_MAX_ALPHA if n == 1 else round(
+                FRICTION_CIRCLE_TRAIL_MIN_ALPHA + (FRICTION_CIRCLE_TRAIL_MAX_ALPHA -
+                FRICTION_CIRCLE_TRAIL_MIN_ALPHA) * i / (n - 1)))
+            px, py = self._g_to_px(lg, tg, cx, cy, radius_px, FRICTION_CIRCLE_MAX_G)
+            draw.ellipse([px - trail_r, py - trail_r, px + trail_r, py + trail_r],
+                        fill=(*FRICTION_CIRCLE_TRAIL_RGB, alpha))
+
+        # Current sample: a solid bright dot on top of the trail. Skipped
+        # (not faked at the origin) when this frame has no reading.
+        if lateral_g is not None and longitudinal_g is not None:
+            dot_r = max(2, round(radius_px * 0.04))
+            px, py = self._g_to_px(lateral_g, longitudinal_g, cx, cy, radius_px,
+                                   FRICTION_CIRCLE_MAX_G)
+            draw.ellipse([px - dot_r, py - dot_r, px + dot_r, py + dot_r],
+                        fill=FRICTION_CIRCLE_DOT_RGB)
+
+        # "peak this corner" readout, in the text strip below the circle.
+        text = f"peak this corner: {peak:.2f}g"
+        text_font_size = max(8, round(text_h * 0.7))
+        text_font = self.font.font_variant(size=text_font_size)
+        available_w = size
+        while text_font_size > 8:
+            bbox = draw.textbbox((0, 0), text, font=text_font)
+            if (bbox[2] - bbox[0]) <= available_w:
+                break
+            text_font_size -= 1
+            text_font = self.font.font_variant(size=text_font_size)
+        bbox = draw.textbbox((0, 0), text, font=text_font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        text_x = cx - tw / 2
+        text_y = circle_y2 + gap + (text_h - th) / 2 - bbox[1]
+        draw.text((text_x, text_y), text, font=text_font, fill=FRICTION_CIRCLE_TEXT_RGB)
+
+
 class FsdDiagnosticText(Widget):
     """Throwaway diagnostic overlay: plain text proving lateral_g/
     longitudinal_g/hands_free_seconds/corner_count all reach a widget with
@@ -282,8 +557,9 @@ def create_widgets_for(font, widget="scoreboard"):
     Entry.__getattr__ in gopro_overlay/entry.py -- no fixed schema at all).
 
     `widget`: "scoreboard" (default, --widget) builds the real StreakScoreboard
+    showcase visual; "friction-circle" builds the FrictionCircle G-meter
     showcase visual; "diagnostic" keeps FsdDiagnosticText available (not
-    deleted) for future debugging of the three still-deferred FSD-overlay
+    deleted) for future debugging of the two still-deferred FSD-overlay
     ideas, which will want the same kind of raw-value proof-of-plumbing check
     this branch's own verification relied on.
     """
@@ -292,6 +568,8 @@ def create_widgets_for(font, widget="scoreboard"):
     def create(entry):
         if widget == "diagnostic":
             return [FsdDiagnosticText(Coordinate(24, 24), entry, text_font)]
+        if widget == "friction-circle":
+            return [FrictionCircle(entry, font)]
         return [StreakScoreboard(entry, font)]
 
     return create
@@ -360,6 +638,13 @@ def make_stateful_processor():
         return {
             "corner_count": counter.corner_count,
             "peak_lateral_g": counter.peak_lateral_g,
+            "last_corner_peak_g": counter.last_corner_peak_g,
+            # display_peak_g (not last_corner_peak_g) is what the friction
+            # circle's "peak this corner" readout actually shows -- see
+            # CornerCounter.display_peak_g's docstring for why the raw
+            # last_corner_peak_g field reads as the PREVIOUS corner's value
+            # for the whole duration of the current one.
+            "display_peak_g": counter.display_peak_g,
             "hands_free_seconds": hands_free.hands_free_seconds,
             "takeover_count": takeovers.takeover_count,
         }
@@ -387,9 +672,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ffmpeg-dir", type=Path, default=None,
                     help="directory containing the ffmpeg/ffprobe binaries "
                         "to use (default: PATH)")
-    ap.add_argument("--widget", default="scoreboard", choices=["scoreboard", "diagnostic"],
+    ap.add_argument("--widget", default="scoreboard",
+                    choices=["scoreboard", "diagnostic", "friction-circle"],
                     help="which overlay to draw (default: scoreboard). scoreboard: the real "
-                        "streak-scoreboard showcase visual. diagnostic: the original "
+                        "streak-scoreboard showcase visual. friction-circle: the G-G diagram "
+                        "showcase visual. diagnostic: the original "
                         "throwaway raw-value text overlay, kept for debugging.")
     return ap
 
@@ -479,7 +766,7 @@ def main(argv=None) -> int:
             f"silently drifting out of sync with it.")
     timelapse_correction = 1.0
     log(f"Timelapse Factor = {timelapse_correction:.3f}")
-    stepper = frame_meta.stepper(timeunits(seconds=0.1 * timelapse_correction))
+    stepper = frame_meta.stepper(timeunits(seconds=RENDER_STEP_SECONDS * timelapse_correction))
     progress = ProgressBarProgress("Render")
 
     overlay = Overlay(framemeta=frame_meta, create_widgets=create_widgets_for(font, args.widget))

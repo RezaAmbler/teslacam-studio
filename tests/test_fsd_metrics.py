@@ -3,6 +3,8 @@ corner-count hysteresis detector, and hands-free-seconds accumulator behind
 the FSD-overlay foundation branch (tesla_fsd_overlay.py). Synthetic data
 only, no gopro_overlay import -- this module is deliberately importable and
 testable under the system Python (see its own docstring)."""
+import math
+
 import pytest
 
 import tesla_fsd_metrics as m
@@ -110,6 +112,149 @@ def test_corner_counter_rejects_invalid_threshold_ordering():
         m.CornerCounter(enter_g=0.1, exit_g=0.2)
 
 
+# --- CornerCounter.last_corner_peak_g (--fsd-friction-circle) -----------------
+
+def test_corner_counter_last_corner_peak_g_starts_at_zero():
+    counter = m.CornerCounter()
+    assert counter.last_corner_peak_g == 0.0
+
+
+def test_corner_counter_last_corner_peak_g_stays_zero_mid_corner():
+    counter = m.CornerCounter()
+    # Still IN the corner (never dropped below exit_g) -- nothing has
+    # "completed" yet, so last_corner_peak_g must not move.
+    for v in [0.0, 0.16, 0.30, 0.20]:
+        counter.update(v)
+    assert counter.last_corner_peak_g == 0.0
+
+
+def test_corner_counter_last_corner_peak_g_latches_on_exit():
+    counter = m.CornerCounter()
+    # Peaks at 0.30 mid-corner, then exits -- last_corner_peak_g should latch
+    # to 0.30 (the corner's own peak), NOT the overall peak_lateral_g and NOT
+    # the exit sample's own (much smaller) magnitude.
+    sequence = [0.0, 0.16, 0.30, 0.20, 0.05]  # last value drops below EXIT_G
+    for v in sequence:
+        counter.update(v)
+    assert counter.last_corner_peak_g == pytest.approx(0.30)
+    assert counter.peak_lateral_g == pytest.approx(0.30)
+
+
+def test_corner_counter_last_corner_peak_g_resets_for_next_corner():
+    counter = m.CornerCounter()
+    # First corner peaks at 0.20 and exits.
+    for v in [0.0, 0.16, 0.20, 0.05]:
+        counter.update(v)
+    assert counter.last_corner_peak_g == pytest.approx(0.20)
+    # Second corner, weaker (peaks at 0.18) -- must overwrite, not keep the
+    # first corner's higher peak, and must not move until IT exits either.
+    for v in [0.16, 0.18]:
+        counter.update(v)
+    assert counter.last_corner_peak_g == pytest.approx(0.20)  # unchanged mid-corner
+    counter.update(0.05)  # now it exits
+    assert counter.last_corner_peak_g == pytest.approx(0.18)
+
+
+def test_corner_counter_last_corner_peak_g_uses_magnitude():
+    counter = m.CornerCounter()
+    for v in [0.0, -0.16, -0.30, -0.20, -0.05]:
+        counter.update(v)
+    assert counter.last_corner_peak_g == pytest.approx(0.30)
+
+
+def test_corner_counter_display_peak_g_starts_at_zero():
+    counter = m.CornerCounter()
+    assert counter.display_peak_g == 0.0
+
+
+def test_corner_counter_display_peak_g_grows_live_mid_corner():
+    # Unlike last_corner_peak_g (which stays 0.0 mid-corner -- see the test
+    # above), display_peak_g is what a "peak this corner" readout should
+    # actually show: the live, still-growing peak of the IN-PROGRESS corner.
+    counter = m.CornerCounter()
+    counter.update(0.16)  # corner starts
+    assert counter.display_peak_g == pytest.approx(0.16)
+    counter.update(0.25)  # grows
+    assert counter.display_peak_g == pytest.approx(0.25)
+    counter.update(0.20)  # a dip that's still above exit_g -- must NOT shrink
+    assert counter.display_peak_g == pytest.approx(0.25)
+
+
+def test_corner_counter_display_peak_g_holds_after_exit_until_next_corner():
+    counter = m.CornerCounter()
+    for v in [0.16, 0.30, 0.05]:  # a corner that peaks at 0.30, then exits
+        counter.update(v)
+    assert counter.display_peak_g == pytest.approx(0.30)
+    counter.update(0.05)  # still between corners -- holds the finished peak
+    assert counter.display_peak_g == pytest.approx(0.30)
+    counter.update(0.16)  # next corner starts, live tracking resumes
+    assert counter.display_peak_g == pytest.approx(0.16)
+    counter.update(0.10)  # a dip mid-corner that's still above exit_g
+    assert counter.display_peak_g == pytest.approx(0.16)  # not shrunk
+
+
+def test_corner_counter_existing_behavior_unaffected_by_extension():
+    # A rerun of the pre-existing corner_count/peak_lateral_g/edge-return
+    # contract, to confirm the last_corner_peak_g extension didn't disturb it.
+    counter = m.CornerCounter()
+    sequence = [0.0, 0.05, 0.10, 0.16, 0.20, 0.16, 0.10, 0.05, 0.0]
+    edges = [counter.update(v) for v in sequence]
+    assert counter.corner_count == 1
+    assert sum(edges) == 1
+    assert edges.index(True) == sequence.index(0.16)
+    assert counter.peak_lateral_g == pytest.approx(0.20)
+
+
+# --- GTrailBuffer (--fsd-friction-circle) --------------------------------------
+
+def test_gtrail_buffer_starts_empty():
+    trail = m.GTrailBuffer(maxlen=3)
+    assert trail.points == []
+
+
+def test_gtrail_buffer_appends_in_order_oldest_to_newest():
+    trail = m.GTrailBuffer(maxlen=5)
+    trail.append(0.1, 0.2)
+    trail.append(0.3, -0.1)
+    assert trail.points == [(0.1, 0.2), (0.3, -0.1)]
+
+
+def test_gtrail_buffer_evicts_oldest_first_at_maxlen():
+    trail = m.GTrailBuffer(maxlen=3)
+    for i in range(5):
+        trail.append(float(i), 0.0)
+    # Only the last 3 appended survive, oldest-to-newest.
+    assert trail.points == [(2.0, 0.0), (3.0, 0.0), (4.0, 0.0)]
+
+
+def test_gtrail_buffer_none_lateral_is_a_noop():
+    trail = m.GTrailBuffer(maxlen=3)
+    trail.append(0.1, 0.2)
+    trail.append(None, 0.5)  # missing lateral -- must not grow or corrupt
+    assert trail.points == [(0.1, 0.2)]
+
+
+def test_gtrail_buffer_none_longitudinal_is_a_noop():
+    trail = m.GTrailBuffer(maxlen=3)
+    trail.append(0.1, 0.2)
+    trail.append(0.4, None)  # missing longitudinal -- must not grow or corrupt
+    assert trail.points == [(0.1, 0.2)]
+
+
+def test_gtrail_buffer_both_none_is_a_noop():
+    trail = m.GTrailBuffer(maxlen=3)
+    trail.append(None, None)
+    assert trail.points == []
+
+
+def test_gtrail_buffer_points_is_a_snapshot_not_the_live_buffer():
+    trail = m.GTrailBuffer(maxlen=3)
+    trail.append(0.1, 0.2)
+    snapshot = trail.points
+    trail.append(0.3, 0.4)
+    assert snapshot == [(0.1, 0.2)]  # unaffected by the later append
+
+
 # --- HandsFreeAccumulator -----------------------------------------------------
 
 def test_hands_free_accumulator_sums_only_engaged_intervals():
@@ -144,6 +289,72 @@ def test_hands_free_accumulator_ignores_nonpositive_dt():
     acc.update(True, 0.0)
     acc.update(True, -1.0)
     assert acc.hands_free_seconds == 0.0
+
+
+# --- g_to_offset (--fsd-friction-circle) ---------------------------------------
+# The friction circle's sign convention, confirmed against real telemetry (see
+# g_to_offset's own docstring and CLAUDE.md's "Axis sign convention" design
+# note for the correlation values) -- pinned here so a regression on either
+# axis is caught, and so the two still-deferred FSD-overlay ideas that will
+# need this SAME convention have one tested function to call rather than
+# re-deriving it (an independent review flagged this exact risk).
+
+def test_g_to_offset_positive_lateral_g_is_positive_dx():
+    # Turning right correlates with positive lateral_g (r=+0.68 vs real
+    # heading-rate data) -- dx is lateral_g directly, no sign flip.
+    dx, dy = m.g_to_offset(lateral_g=0.3, longitudinal_g=0.0, max_g=0.6)
+    assert dx == pytest.approx(0.5)
+    assert dy == pytest.approx(0.0)
+
+
+def test_g_to_offset_negative_lateral_g_is_negative_dx():
+    dx, dy = m.g_to_offset(lateral_g=-0.3, longitudinal_g=0.0, max_g=0.6)
+    assert dx == pytest.approx(-0.5)
+
+
+def test_g_to_offset_accelerating_is_positive_dy():
+    # Accelerating correlates with NEGATIVE raw longitudinal_g (r=-0.36 vs
+    # real speed-derivative data) -- dy is defined as "+dy = accelerating",
+    # so this is a genuine sign FLIP relative to lateral, not a passthrough.
+    dx, dy = m.g_to_offset(lateral_g=0.0, longitudinal_g=-0.3, max_g=0.6)
+    assert dy == pytest.approx(0.5)
+
+
+def test_g_to_offset_braking_is_negative_dy():
+    dx, dy = m.g_to_offset(lateral_g=0.0, longitudinal_g=0.3, max_g=0.6)
+    assert dy == pytest.approx(-0.5)
+
+
+def test_g_to_offset_zero_input_is_origin():
+    dx, dy = m.g_to_offset(lateral_g=0.0, longitudinal_g=0.0, max_g=0.6)
+    assert dx == pytest.approx(0.0)
+    assert dy == pytest.approx(0.0)
+
+
+def test_g_to_offset_within_max_g_is_unclamped():
+    dx, dy = m.g_to_offset(lateral_g=0.3, longitudinal_g=-0.3, max_g=0.6)
+    assert dx == pytest.approx(0.5)
+    assert dy == pytest.approx(0.5)
+
+
+def test_g_to_offset_exceeding_max_g_clamps_to_the_rim_preserving_direction():
+    # A spike well past max_g must land AT magnitude 1.0 (the rim), scaled
+    # down along the same direction -- not cropped to some arbitrary point.
+    dx, dy = m.g_to_offset(lateral_g=1.2, longitudinal_g=0.0, max_g=0.6)
+    assert dx == pytest.approx(1.0)
+    assert dy == pytest.approx(0.0)
+    assert math.hypot(dx, dy) == pytest.approx(1.0)
+
+
+def test_g_to_offset_diagonal_clamp_preserves_ratio_between_axes():
+    # lateral_g=0.6 (right) and longitudinal_g=-0.6 (accelerating) are equal
+    # magnitude, and dy is accelerating's NEGATION -- so both dx and dy come
+    # out equal (not opposite): right-and-accelerating clamps to the
+    # upper-right of the rim, not a mixed sign.
+    dx, dy = m.g_to_offset(lateral_g=0.6, longitudinal_g=-0.6, max_g=0.3)
+    assert math.hypot(dx, dy) == pytest.approx(1.0)
+    assert dx == pytest.approx(dy)
+    assert dx > 0 and dy > 0
 
 
 # --- TakeoverCounter ----------------------------------------------------------

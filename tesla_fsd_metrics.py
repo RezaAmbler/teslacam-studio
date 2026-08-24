@@ -29,6 +29,8 @@ own field names cad/power/hr.
 
 from __future__ import annotations
 
+import collections
+import math
 from typing import NamedTuple, Optional
 
 # Standard gravity, m/s^2 -- the conversion factor from Tesla's raw
@@ -117,7 +119,19 @@ class CornerCounter:
         self.exit_g = exit_g
         self.corner_count = 0
         self.peak_lateral_g = 0.0
+        # The just-completed corner's peak |lateral_g|, latched the instant a
+        # corner exits (see update()) -- feeds the friction-circle widget's
+        # "peak this corner" readout (--fsd-friction-circle). Stays 0.0 until
+        # the first corner actually completes (a corner still in progress
+        # hasn't "completed" yet, so it doesn't move this).
+        self.last_corner_peak_g = 0.0
         self._in_corner = False
+        # The IN-PROGRESS corner's running peak -- reset to the entry
+        # magnitude when a corner starts, updated while _in_corner stays
+        # True, and copied into last_corner_peak_g the instant it exits.
+        # Kept here (not a second class) so there's exactly one place the
+        # "am I in a corner right now" hysteresis lives.
+        self._current_corner_peak = 0.0
 
     def update(self, lateral_g: Optional[float]) -> bool:
         """Feed one lateral_g sample (None-safe -- a missing sample neither
@@ -136,11 +150,120 @@ class CornerCounter:
 
         if not self._in_corner and magnitude >= self.enter_g:
             self._in_corner = True
+            self._current_corner_peak = magnitude
             self.corner_count += 1
             return True
-        if self._in_corner and magnitude < self.exit_g:
-            self._in_corner = False
+        if self._in_corner:
+            if magnitude > self._current_corner_peak:
+                self._current_corner_peak = magnitude
+            if magnitude < self.exit_g:
+                self._in_corner = False
+                self.last_corner_peak_g = self._current_corner_peak
         return False
+
+    @property
+    def display_peak_g(self) -> float:
+        """What a "peak this corner" readout should actually show right now
+        -- NOT the same as last_corner_peak_g alone. That field only latches
+        on corner EXIT, so a widget reading it directly shows the PREVIOUS
+        corner's peak for the entire duration of the current one -- exactly
+        the moment a viewer is most likely to be looking at a G-meter.
+        Flagged by an independent review as a real, if minor, correctness
+        gap (the label says "this corner", the data said "the last one").
+
+        While a corner is in progress, this returns the live, still-growing
+        _current_corner_peak; once it exits, last_corner_peak_g (now frozen
+        at that corner's final peak) takes over until the next corner starts
+        raising _current_corner_peak again. Continuous and always describes
+        "the most relevant corner peak right now" -- growing during a
+        corner, holding steady between corners."""
+        return self._current_corner_peak if self._in_corner else self.last_corner_peak_g
+
+
+class GTrailBuffer:
+    """Fixed-length trail of recent (lateral_g, longitudinal_g) samples, for
+    the friction-circle G-meter (--fsd-friction-circle) to render as a fading
+    polyline/dot-chain. A plain `collections.deque(maxlen=N)` under the hood
+    -- oldest points fall off the end automatically as new ones are appended,
+    no manual eviction needed.
+
+    `N` (the "3-second" trail Fable's brainstorm asked for) is a decision for
+    the WIDGET to make, not this class -- it depends on the render loop's
+    sample cadence (tesla_fsd_overlay.py steps at ~0.1s, so N=30 there), so
+    this class just takes whatever `maxlen` its caller hands it.
+
+    `.append` is a no-op when either axis is None -- mirrors the takeover-
+    counter lesson (see TakeoverCounter's docstring): a real telemetry gap
+    must leave a visible pause/break in the trail, never fabricate a point at
+    the origin (which would read as "the car was at rest, dead center") or
+    silently carry a stale value forward (which would read as "the car held
+    that exact G" through a gap it didn't actually measure).
+    """
+
+    def __init__(self, maxlen: int):
+        self._points = collections.deque(maxlen=maxlen)
+
+    def append(self, lateral_g: Optional[float], longitudinal_g: Optional[float]) -> None:
+        if lateral_g is None or longitudinal_g is None:
+            return
+        self._points.append((lateral_g, longitudinal_g))
+
+    @property
+    def points(self):
+        """Oldest-to-newest list of (lateral_g, longitudinal_g) pairs -- a
+        plain list snapshot (not the live deque) so a caller can't mutate
+        this buffer's internal state through it."""
+        return list(self._points)
+
+
+def g_to_offset(lateral_g: float, longitudinal_g: float, max_g: float) -> tuple:
+    """Map a (lateral_g, longitudinal_g) sample to a normalized (dx, dy)
+    offset for the friction-circle G-meter (--fsd-friction-circle), where
+    +dx = right and +dy = accelerating (forward). Both are clamped to
+    magnitude 1.0 -- scaled down together along the same direction, not
+    just cropped -- when the input magnitude exceeds max_g, so an unusually
+    large G spike still lands ON the rim rather than outside it entirely.
+
+    Moved here (not left inline in tesla_fsd_overlay.py's widget code) after
+    an independent review flagged it: this is pure math with zero
+    gopro_overlay dependency, but it had been living in the venv-only driver
+    script anyway, where tests/ (system Python, no gopro-overlay installed)
+    can't reach it to guard against a regression. That matters beyond just
+    this widget -- the two still-deferred FSD-overlay ideas (a note-highway
+    ribbon, rally pace-notes) will need this EXACT SAME sign convention
+    (e.g. pace-notes calling a corner "Right 3" vs "Left 3"), so if either
+    one re-derives the sign independently instead of calling this function,
+    a silent contradiction between the two overlays is exactly the bug class
+    this project has now hit more than once. One tested function, not two
+    (or three, or four) independently-guessed ones.
+
+    BOTH signs are confirmed against real telemetry, not eyeballed off a
+    video frame (a single frame turned out to be an unreliable check on a
+    continuously winding road -- see CLAUDE.md's "Axis sign convention"
+    design note for the full method and the numbers):
+      - lateral: corr(d(heading_deg)/dt [+ = turning right], lateral_g)
+        = +0.68 over 28,000 real points -- turning right already gives
+        positive lateral_g, so dx is lateral_g directly, no sign flip.
+      - longitudinal: corr(d(speed)/dt [+ = accelerating], raw
+        linear_acceleration_mps2_y) = -0.36 over the same data --
+        accelerating gives NEGATIVE longitudinal_g. Since +dy is defined
+        here as "accelerating", dy is the NEGATION of longitudinal_g (a
+        real, confirmed sign flip -- this is not the same relationship as
+        the lateral axis, and must not be "simplified" to match it).
+
+    Returns a normalized offset, not pixel coordinates -- screen-space
+    conventions (e.g. that +y is DOWN on screen, the opposite of this
+    function's +dy = accelerating = "up" in the physical/intuitive sense)
+    are a UI-framework detail that belongs in the widget, not here.
+    """
+    magnitude = math.hypot(lateral_g, longitudinal_g)
+    if magnitude > max_g and magnitude > 0:
+        scale = max_g / magnitude
+        lateral_g *= scale
+        longitudinal_g *= scale
+    dx = lateral_g / max_g
+    dy = -longitudinal_g / max_g
+    return dx, dy
 
 
 class TakeoverCounter:
