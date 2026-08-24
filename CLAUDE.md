@@ -115,6 +115,92 @@ scoreboard overlay.
   default. `course_deg` stays unused — the `compass` widget reads `cog`, which
   gopro-overlay computes itself from consecutive lat/lon (geodesic bearing), so
   the compass needs zero data changes, same as the existing map tile.
+- **HUD-style translucent map inset (`--map-overlay`):** a small, semi-
+  transparent `moving_journey_map` (the SAME widget the sidebar `--map` tile
+  uses) composited directly onto a corner of the hero camera tile — additive
+  alongside `--map`, not a replacement for it: both a sidebar tile AND a HUD
+  inset is a valid, if unusual, combination (verified together, see
+  Verification status). Scoped first as a research spike
+  (`docs/translucent-map-overlay-findings.md`, `backlog-additions` branch);
+  implemented by mirroring `write_gauge_layout`/`build_gauge_overlay`'s
+  established pattern almost exactly (`write_map_overlay_layout`/
+  `build_map_overlay`) — a `<frame bg=... opacity=...>` around a square
+  `moving_journey_map`, composited via the same `gopro-dashboard.py
+  --use-gpx-only <hero-video>` positional-input compositing mode `--gauge`
+  uses. `build_gopro_layout_overlay` is the shared tail both `build_gauge_
+  overlay` and `build_map_overlay` now delegate to (extracted during this
+  branch) — the gopro-dashboard.py invocation, `--dry-run` printing, and
+  progress bookkeeping were byte-for-byte identical between the two, only
+  the layout-XML-writing and file-naming differed, so a second near-
+  identical function would've been the same copy-paste `build_fsd_overlay`'s
+  own consolidation (`FSD_OVERLAY_META`) already avoided for the FSD
+  showcase overlays. GPS extraction (`build_route_gpx`) is shared with
+  `--map`/`--gauge`/the FSD showcase flags the same way — one extraction
+  regardless of how many are requested together. Reuses `--map-zoom` (no
+  separate `--map-overlay-zoom` flag); does NOT support `--map-mag` --
+  unlike `build_map_tile`, `build_map_overlay`'s compositing path has no
+  synthetic-size-render-then-upscale pass to hang a magnification step off
+  of (it composites straight onto the real hero video, like `--gauge`).
+  Deliberately **square** (`MAP_OVERLAY_SIZE_FRAC` of the hero tile's
+  *shorter* side): `moving_journey_map` is inherently square, and a square
+  panel sidesteps `write_map_layout`'s crop/centre-offset trick entirely
+  (that trick exists only because the sidebar tile itself isn't square).
+  v1 requires a **solo hero** (same restriction as `--gauge`/every FSD
+  showcase flag) — validated in `setup_tools`.
+  - **Corner/collision design (the real open question a research spike this
+    thin leaves unanswered):** `--gauge` owns bottom-left, `StreakScoreboard`
+    owns top-right, `FrictionCircle` owns bottom-right, the note-highway
+    ribbon owns a full-width band near the top — `--map-overlay` prefers
+    **bottom-right** (the spike's own recommendation: avoids `--gauge` by
+    construction, mirroring how `--map`'s sidebar tile and `--gauge` already
+    coexist today), but that's the SAME corner `--fsd-friction-circle`
+    already claims — the one real collision risk, not a hypothetical one.
+    `pick_map_overlay_corner(gauge, scoreboard, friction_circle,
+    note_highway)` (pure, tested) resolves it with a fixed preference order
+    computed fresh in `build_grid` from that run's own flags: bottom-right →
+    bottom-left (if friction-circle took bottom-right) → top-right (if
+    gauge ALSO took bottom-left; treated as claimed by EITHER scoreboard OR
+    the note-highway ribbon, since the ribbon's own near-top band would
+    collide with a top-right panel too even though it isn't corner-anchored
+    itself) → if even that's claimed, settle back on bottom-right and accept
+    sharing it with the friction circle, a documented degenerate case
+    (`--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway
+    --map-overlay` all at once) rather than an invented fifth position.
+    Verified against real combined renders, not just the isolated pure
+    function: `--map-overlay --fsd-friction-circle` (no collision — HUD
+    inset lands bottom-left instead), `--gauge --map-overlay` (both
+    corners as expected, no fallback needed), and the fullest combination
+    (all five hero-tile overlays) — which DOES show the documented overlap
+    in the rendered frame, confirming the fallback chain reaches its
+    documented last resort for real, not just in the pure-function tests.
+  - **The translucency mechanism itself was NOT actually proven going in,
+    despite the research spike's own claim** ("`--gauge`'s own panel
+    `bg="0,0,0,180"` already renders correctly through this exact
+    pipeline" — asserted from "a few minutes' scoping, not a measured
+    spike", the spike's own disclaimer). Verifying `--map-overlay` against
+    a REAL rendered frame (not just re-reading that claim) found it false
+    as stated: gopro-overlay's `Frame` widget (`gopro_overlay/widgets/
+    widgets.py`) builds its alpha mask from a SEPARATE `opacity` XML
+    attribute (0.0–1.0, default 1.0), and `Frame.draw()` calls
+    `rect.putalpha(self.mask)` — which OVERWRITES the entire panel's alpha
+    with that mask, regardless of whatever alpha `bg=`'s own RGBA string
+    embedded. Without `opacity=` also set, `bg="0,0,0,180"` renders fully
+    **opaque**, not translucent — confirmed by sampling real output pixels
+    (a "translucent" panel read back as pure `(0,0,0)`, not a blend with
+    the video underneath) and cross-checked against gopro-overlay's own
+    bundled example layouts (e.g. `layouts/default-1920x1080.xml`'s
+    "gps-lock" frame), which always pair `bg=` with a separate `opacity=`,
+    never rely on `bg=`'s alpha alone. Fixed in BOTH `write_map_overlay_
+    layout` (this branch) and `write_gauge_layout` (`GAUGE_BG_ALPHA`, same
+    root cause — `--gauge`'s panel had been silently rendering fully
+    opaque since it was added, contradicting its own "semi-transparent"
+    design description) by adding the matching `opacity=` attribute derived
+    from the same alpha constant. One side effect worth knowing: `opacity=`
+    makes the whole `<frame>` translucent, background AND children alike
+    (not just a translucent box behind opaque content) — confirmed this is
+    the intended look for a HUD-style overlay (some of the live video now
+    genuinely shows through the map/dial/text, not just the panel's own
+    padding) by looking at the real fixed render, not assumed.
 - **FSD showcase overlays (`tesla_fsd_overlay.py` / `tesla_fsd_metrics.py`):**
   groundwork for four planned visual ideas (a hands-free/corner-count streak
   scoreboard, a friction-circle G-force meter, a scrolling "note highway"
@@ -663,6 +749,127 @@ scoreboard overlay.
   against the real affected folder that the `-START` clip is now discovered
   and correctly selected/offset for a trim window starting inside it. See
   the Gotchas section below for the `-START` convention itself.
+- `--map-overlay`/`pick_map_overlay_corner`/`write_map_overlay_layout`: went
+  through the same real-render verification loop as every prior overlay,
+  and it changed the design mid-branch rather than confirming a guess.
+  - **The translucency mechanism the research spike claimed was "already
+    proven" turned out NOT to work as claimed, caught by looking at real
+    output pixels, not by re-reading the spike's own assertion.** A first
+    real render's HUD panel read back as solid opaque black at the pixel
+    level, not the intended ~70% translucent blend with the video
+    underneath — traced to a real bug in how `bg="R,G,B,A"` interacts with
+    gopro-overlay's `Frame` widget (see the design-notes bullet above for
+    the mechanism). Fixed in both `write_map_overlay_layout` (this branch)
+    and, since it's the exact same root cause, `write_gauge_layout`
+    (`--gauge` had been silently rendering its "semi-transparent" panel
+    fully opaque since it was added). Re-verified after the fix by sampling
+    real pixels again: the panel border now blends with the video
+    background as expected (measured values matched the predicted
+    alpha-180-over-background blend to within rounding), and the map
+    content itself is now also genuinely translucent (video visibly shows
+    through), which — after looking at the actual result, not just fixing
+    the number — is the correct look for a "HUD-style" map, not an
+    unwanted side effect of the fix.
+  - **Placement/sizing** (`MAP_OVERLAY_SIZE_FRAC=0.32`, `_MARGIN=24`,
+    `_PAD_FRAC=0.05`, `_BG_ALPHA=180`, `_LINE_WIDTH=4`) reached the
+    confirmed-against-a-real-frame stage on the first pass (after the
+    alpha fix above) — no further iteration needed. Verified against real
+    Tesla footage (a real mountain drive, `--landscape --quality high`,
+    the same footage/window every other overlay in this file was verified
+    against): route line, position dot, and street/river labels are all
+    legible at this size/opacity over live moving video, including where
+    the road surface shows through the translucent border — the exact
+    thing the research spike flagged as genuinely unproven (a sidebar tile
+    sits on a plain background; this competes with live video). No
+    collision with the hero label (top-left) or the sidebar column in any
+    layout tested.
+  - **Corner/collision design verified against real combined renders**, not
+    just `pick_map_overlay_corner`'s own unit tests: `--map-overlay`
+    `--fsd-friction-circle` together (the one real collision risk) shows
+    the HUD inset falling back to bottom-left with no overlap; `--gauge
+    --map-overlay` shows both in their preferred corners; `--map
+    --map-overlay` together (sidebar tile AND HUD inset at once) shows
+    both legibly, confirming that additive combination is genuinely usable
+    and not just technically non-crashing; and the fullest combination
+    (`--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway
+    --map-overlay`) shows the documented last-resort overlap (HUD inset
+    sharing bottom-right with the friction circle) actually happening in a
+    real rendered frame, not just asserted in the docstring/tests -- a
+    known, accepted limitation of that specific five-overlay combination,
+    not a silent bug.
+  - `playcheck.sh` clean (decode integrity, faststart, hw-decodable dims,
+    CFR) on every one of the real renders above.
+  - **Independent Fable review found one real, high-value bug beyond the
+    alpha fix above, plus two documentation-accuracy issues** (the review
+    independently re-derived the `bg=`/`opacity=` mechanism from
+    gopro-overlay's own source before trusting this file's account of it,
+    and separately enumerated all 16 `pick_map_overlay_corner` input
+    combinations against its docstring). All three fixed and re-verified:
+    - **Real bug: the burned-in clock collides with the bottom-left
+      fallback under `--landscape`.** `pick_map_overlay_corner` modeled
+      `--gauge`/`--fsd-scoreboard`/`--fsd-friction-circle`/
+      `--fsd-note-highway` as the only things that can occupy a corner --
+      it never accounted for `_apply_tail`'s own burned-in clock
+      (`x=20:y=h-th-20` on the FINAL CANVAS, whenever labels are on). Under
+      `--landscape` the hero tile spans the full canvas height at the left
+      edge, so canvas bottom-left IS hero-tile bottom-left, unconditionally
+      -- meaning `--landscape --fsd-friction-circle --map-overlay` (no
+      `--gauge` needed) fell back to bottom-left as designed, straight into
+      the clock's own territory. Confirmed with a real render *before* the
+      fix: the clock's text box was drawn directly over the map inset's
+      bottom edge. Fixed: `pick_map_overlay_corner` gained a
+      `clock_bottom_left` parameter (treats bottom-left as claimed when
+      set, same as `gauge`), and `build_grid` passes
+      `args.landscape and tools.has_text` -- exactly the condition under
+      which the clock actually lands there. Re-verified against the same
+      real render: the panel now falls all the way to top-right, clear of
+      the clock, the friction circle, AND the hero label. The equivalent
+      risk in the DEFAULT (non-landscape) grid -- the hero row can also end
+      up as the canvas's bottom row on a low-camera-count session (e.g.
+      only front+back present, since `build_rows` puts the hero row last
+      when there's just one other row group) -- is deliberately NOT modeled:
+      it depends on which OTHER camera angles are present, not just which
+      overlay flags are active, doesn't fit this function's pure
+      flags-in-corner-out signature, and is a PRE-EXISTING exposure
+      `--gauge`'s own bottom-left panel has always had, not something this
+      branch creates or worsens -- confirmed for the `--landscape` case
+      specifically (a real `--gauge --landscape` render shows the exact
+      same clock-over-panel overlap this branch's fix addresses for
+      `--map-overlay`), though the tall-grid low-camera-count variant of
+      the same underlying exposure was reasoned about from `build_rows`'s
+      own row-ordering logic, not separately rendered. Left as a known,
+      documented, deferred gap either way.
+    - **Doc fix: `MAP_OVERLAY_PAD_FRAC`'s comment (and `write_map_overlay_
+      layout`'s docstring) had described the pad as separating a
+      translucent border from a "fully opaque map raster" -- wrong, given
+      the alpha-mechanism fix above: `Frame`'s `opacity=` mask applies to
+      the WHOLE rect uniformly, map raster included (`Frame`'s own
+      docstring: "makes a child controllably transparent"), which this
+      file's own Verification-status entry above already established for
+      real ("the map content itself is now also genuinely translucent").
+      The pad comment just hadn't been updated to match. Fixed to describe
+      the pad as a border-width control only, not a translucency boundary.
+    - **Doc fix: `pick_map_overlay_corner`'s docstring point 4 mis-stated
+      its own trigger condition** ("--gauge, --fsd-scoreboard (or
+      --fsd-friction-circle... but see below)" -- friction-circle is
+      actually a REQUIRED conjunct to reach point 4 at all, not an
+      alternative to scoreboard, and "but see below" dangled with nothing
+      following it). The code itself was already correct for all 16 input
+      combinations (confirmed by the reviewer enumerating them); only the
+      prose was garbled. Fixed to state the real condition plainly:
+      `friction_circle AND (gauge OR clock_bottom_left) AND (scoreboard OR
+      note_highway)`.
+    - Two further review notes were investigated and are recorded above
+      rather than requiring a code change: whether `--gauge`'s own dial/
+      compass/text stayed legible now that the opacity fix also makes
+      those children translucent (re-rendered `--gauge` alone after the
+      fix and visually confirmed: dial, needle, compass letters, big speed
+      readout, and sparkline chart are all clearly legible at ~70% alpha
+      over live video -- the translucency reads as intentional HUD styling,
+      not a regression); and a couple of minor test-coverage gaps (an
+      untested corner combination, the no-GPS degradation path) below the
+      "real bug" bar this project's reviews use to gate a fix, some of
+      which were still added anyway since they were cheap.
 
 ## Gotchas
 - Never commit footage or rendered outputs.

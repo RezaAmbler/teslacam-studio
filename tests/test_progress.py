@@ -372,6 +372,7 @@ class Args:
         self.map = False
         self.map_mag = 2.0
         self.gauge = False
+        self.map_overlay = False
         self.fsd_scoreboard = False
         self.fsd_friction_circle = False
         self.fsd_note_highway = False
