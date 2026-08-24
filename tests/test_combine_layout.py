@@ -970,3 +970,41 @@ def test_fsd_note_highway_dry_run_passes_widget_flag(tmp_path, capsys):
 
     printed = capsys.readouterr().out
     assert "--widget note-highway" in printed
+
+
+# --- FILENAME_RE / discover_clips -------------------------------------------
+
+def test_filename_re_matches_plain_clip():
+    m = tc.FILENAME_RE.match("2026-08-22_17-21-05-front.mp4")
+    assert m is not None
+    assert m.group(1) == "2026-08-22_17-21-05"
+    assert m.group(2) == "front"
+
+
+def test_filename_re_matches_user_start_suffix():
+    # A user-added "-START" marker (not a Tesla naming convention) on the
+    # first clip of a session they've trimmed down to what they want in a
+    # final video -- must still match and group like any other clip of that
+    # angle, or discover_clips() silently drops it. Confirmed real bug: this
+    # caused --trim-start to silently start several seconds late with no
+    # warning when the dropped clip was the first one overlapping the window.
+    m = tc.FILENAME_RE.match("2026-08-22_17-21-05-front-START.mp4")
+    assert m is not None
+    assert m.group(1) == "2026-08-22_17-21-05"
+    assert m.group(2) == "front"  # not "front-START" -- angle group unaffected
+
+
+def test_filename_re_rejects_unrelated_suffix():
+    # Not a blanket "any suffix is fine" -- only the specific -START marker.
+    assert tc.FILENAME_RE.match("2026-08-22_17-21-05-front-copy.mp4") is None
+
+
+def test_discover_clips_includes_start_suffixed_clip(tmp_path):
+    (tmp_path / "2026-08-22_17-21-05-front-START.mp4").touch()
+    (tmp_path / "2026-08-22_17-22-05-front.mp4").touch()
+    (tmp_path / "2026-08-22_17-21-05-back.mp4").touch()
+    by_angle, session_start = tc.discover_clips(tmp_path)
+    front_names = [p.name for _, p in by_angle["front"]]
+    assert "2026-08-22_17-21-05-front-START.mp4" in front_names
+    # session_start reflects the -START clip's real (earlier) timestamp
+    assert session_start == datetime(2026, 8, 22, 17, 21, 5)

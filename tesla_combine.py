@@ -65,8 +65,15 @@ SCRIPT_VERSION = "2.7"
 CONCAT_CACHE_VERSION = "2.0"
 
 CAMERA_ANGLES = ["front", "back", "left_repeater", "right_repeater", "left_pillar", "right_pillar"]
+# The optional "-START" suffix is a user-added marker (not a Tesla naming
+# convention) on the first clip of a session they've trimmed down to the
+# footage they actually want in a final video -- it must still match and
+# group like any other clip of that angle, or discover_clips() silently
+# drops it (confirmed: this caused a --trim-start to silently start several
+# seconds late with no warning). The angle capture group (group 2) is
+# unaffected -- "front-START.mp4" still yields "front", not "front-START".
 FILENAME_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})-(front|back|left_repeater|right_repeater|left_pillar|right_pillar)\.mp4$"
+    r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})-(front|back|left_repeater|right_repeater|left_pillar|right_pillar)(?:-START)?\.mp4$"
 )
 LABEL_TEXT = {
     "front": "FRONT", "back": "BACK",
