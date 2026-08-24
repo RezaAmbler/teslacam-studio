@@ -576,6 +576,7 @@ def _scoreboard_tools_args(**kw):
     a.fsd_scoreboard = False
     a.fsd_friction_circle = False
     a.fsd_note_highway = False
+    a.fsd_pace_notes = False
     a.feature = "front"
     a.__dict__.update(kw)
     return a
@@ -970,6 +971,159 @@ def test_fsd_note_highway_dry_run_passes_widget_flag(tmp_path, capsys):
 
     printed = capsys.readouterr().out
     assert "--widget note-highway" in printed
+
+
+# --- --fsd-pace-notes: CLI parsing/defaults -----------------------------------
+
+def test_cli_fsd_pace_notes_default_off():
+    args = tc.build_parser().parse_args(["/some/folder"])
+    assert args.fsd_pace_notes is False
+
+
+def test_cli_fsd_pace_notes_flag():
+    args = tc.build_parser().parse_args(["/some/folder", "--fsd-pace-notes"])
+    assert args.fsd_pace_notes is True
+
+
+# --- --fsd-pace-notes + a paired --feature: the die() path in setup_tools ----
+
+def test_fsd_pace_notes_pair_feature_is_rejected(monkeypatch, tmp_path):
+    # Mirrors test_fsd_note_highway_pair_feature_is_rejected exactly -- same
+    # restriction, same reasoning (composites onto one hero tile).
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_pace_notes=True, feature="repeaters"))
+
+
+def test_fsd_pace_notes_solo_feature_is_accepted(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    tools = tc.setup_tools(_scoreboard_tools_args(fsd_pace_notes=True, feature="left_pillar"))
+    assert tools.map_venv_py == tmp_path / "py"
+    assert tools.map_gopro == tmp_path / "gopro"
+
+
+def test_fsd_pace_notes_missing_tooling_message_names_the_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (None, None, ["gopro-overlay"]))
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_pace_notes=True))
+
+
+# --- --fsd-pace-notes: filename suffix (build_grid, --dry-run) ---------------
+
+def _pace_notes_stats(**overrides):
+    """A stats dict with every key build_grid/print_stats might touch across
+    --gauge/--fsd-scoreboard/--fsd-friction-circle/--fsd-note-highway/
+    --fsd-pace-notes, all defaulted off -- extends _note_highway_stats'
+    shape with the pace-notes keys this branch added."""
+    stats = _note_highway_stats()
+    stats.update({"pace_notes_s": 0.0, "pace_notes_built": False})
+    stats.update(overrides)
+    return stats
+
+
+def test_fsd_pace_notes_filename_suffix(tmp_path):
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-pace-notes", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _pace_notes_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["pace_notes_built"] is True
+    assert "_pace-notes" in out_grid.name
+    assert out_grid.name == "session_grid_pace-notes.mp4"
+
+
+def test_fsd_pace_notes_full_chain_suffix_order(tmp_path):
+    # All five overlay flags together (--gauge --fsd-scoreboard
+    # --fsd-friction-circle --fsd-note-highway --fsd-pace-notes) chain
+    # sequentially through angle_paths[hero_angle] -- gauge, then
+    # scoreboard, then friction circle, then note highway, then pace notes,
+    # the same order build_grid composites them in; the filename records
+    # all five in that order. Confirms the full chain now that all four FSD
+    # showcase visuals (plus --gauge) exist.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--gauge", "--fsd-scoreboard", "--fsd-friction-circle",
+         "--fsd-note-highway", "--fsd-pace-notes", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"), map_gopro=Path("fake-gopro"),
+                     map_font="/System/Library/Fonts/Menlo.ttc")
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _pace_notes_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["gauge_built"] is True
+    assert stats["scoreboard_built"] is True
+    assert stats["friction_circle_built"] is True
+    assert stats["note_highway_built"] is True
+    assert stats["pace_notes_built"] is True
+    assert out_grid.name == ("session_grid_gauge_scoreboard_friction-circle_"
+                             "note-highway_pace-notes.mp4")
+
+
+def test_fsd_pace_notes_dry_run_passes_widget_flag(tmp_path, capsys):
+    # build_fsd_overlay's consolidation passes --widget through to
+    # tesla_fsd_overlay.py explicitly -- confirm the printed --dry-run
+    # command actually carries the right widget name.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-pace-notes", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _pace_notes_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    printed = capsys.readouterr().out
+    assert "--widget pace-notes" in printed
+
+
+def test_fsd_pace_notes_plan_steps_adds_pace_notes_render():
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-pace-notes"])
+    selections = {"front": (["a.mp4"], 0.0, 60.0)}
+    footage = {"front": 60.0}
+    steps = tc.plan_steps(args, selections, footage)
+    kinds = [s.kind for s in steps]
+    assert "map_gps" in kinds
+    assert "pace_notes_render" in kinds
 
 
 # --- FILENAME_RE / discover_clips -------------------------------------------

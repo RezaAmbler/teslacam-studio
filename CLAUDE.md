@@ -118,17 +118,16 @@ scoreboard overlay.
 - **FSD showcase overlays (`tesla_fsd_overlay.py` / `tesla_fsd_metrics.py`):**
   groundwork for four planned visual ideas (a hands-free/corner-count streak
   scoreboard, a friction-circle G-force meter, a scrolling "note highway"
-  anticipation ribbon, rally pace-notes). The first three of the four — the
-  streak scoreboard, the friction circle, and the note highway — are now real
-  and wired into `tesla_combine.py`'s CLI as `--fsd-scoreboard`
-  (`fsd-streak-scoreboard` branch, off the merged `fsd-overlay-foundation`),
-  `--fsd-friction-circle` (`fsd-friction-circle` branch), and
-  `--fsd-note-highway` (`fsd-note-highway` branch); pace-notes remains its own
-  follow-up branch's job. `StreakScoreboard` (`tesla_fsd_overlay.py`) replaces
+  anticipation ribbon, rally pace-notes). All four now real and wired into
+  `tesla_combine.py`'s CLI as `--fsd-scoreboard` (`fsd-streak-scoreboard`
+  branch, off the merged `fsd-overlay-foundation`), `--fsd-friction-circle`
+  (`fsd-friction-circle` branch), `--fsd-note-highway` (`fsd-note-highway`
+  branch), and `--fsd-pace-notes` (`fsd-pace-notes` branch, the last of the
+  four). `StreakScoreboard` (`tesla_fsd_overlay.py`) replaces
   the branch's original `FsdDiagnosticText` throwaway plain-text overlay as
   the default draw target (`--widget scoreboard`, vs. `--widget diagnostic`
-  -- the old diagnostic is kept, not deleted, for debugging the remaining
-  ideas the same way it helped prove this one's plumbing). It draws a single
+  -- the old diagnostic is kept, not deleted, for debugging future work the
+  same way it helped prove this one's plumbing). It draws a single
   dark translucent panel, **top-right** of the hero tile: a color-coded "FSD
   ENGAGED"/"FSD OFF" badge (green while engaged, gray/red while not) followed
   by hands-free time, corner count, peak cornering G, and takeover count.
@@ -356,23 +355,180 @@ scoreboard overlay.
       (start/end of drive, or a genuine mid-drive gap) break the line/fill
       into separate contiguous runs rather than drawing a fabricated flat
       line through them.
+  - **The pace notes** (`PaceNotes`, `--widget pace-notes`,
+    `--fsd-pace-notes`, the fourth and last of the four planned ideas): a
+    momentary rally-style text callout — "RIGHT 3", with a direction chevron
+    and a color-coded severity digit — that appears a few seconds BEFORE a
+    corner and clears shortly after, the way a real rally co-driver reads a
+    pre-recorded note just ahead of the driver. Designed with a Fable-model
+    creative consult (same process the other three ideas' original
+    brainstorm and this branch's own placement/review went through) — its
+    recommendations (severity curve, callout wording, lead/hold timing,
+    alpha-only "animation", placement below the note-highway ribbon) were
+    followed close to verbatim; see the design rationale below for where the
+    implementation matched vs. adapted them.
+    - **Architecture: precompute, never grade live.** Unlike `CornerCounter`
+      (a streaming, one-sample-at-a-time detector feeding the scoreboard's
+      `corner_count` and the friction-circle's peak-G readout),
+      `segment_corners` (`tesla_fsd_metrics.py`) scans the WHOLE
+      `lateral_g_timeline` (the same full-drive array `NoteHighway` already
+      needs, built the same way in `main()` -- each widget is its own
+      subprocess/`--widget` invocation, so `--fsd-note-highway` and
+      `--fsd-pace-notes` never share one process to reuse the array
+      across, but the construction is identical) in a single pass and
+      returns every corner's `start_index`/`end_index`/`peak_g`/`direction`
+      up front. `build_pace_notes` then grades and chains them once, also up
+      front, into a `PaceNote` list. `draw()` only ever does a cheap lookup
+      (`active_pace_note`/`pace_note_alpha`) against the current frame index
+      — there is no per-frame grading, so there is no boundary-oscillation
+      flicker to debounce: a corner is graded exactly once, on its final,
+      fully-observed peak. This was the single design decision Fable's
+      brainstorm flagged as solving the "flicker trap" (a pace note's grade
+      changing mid-callout as `lateral_g` jitters near a threshold) *by
+      construction* rather than by tuning.
+    - **Severity grading** (`grade_corner`, `PACE_NOTE_GRADE_THRESHOLDS`,
+      `tesla_fsd_metrics.py`): peak `|lateral_g|` → a rally-style 1
+      (tightest/most dramatic) to 6 (loosest/barely worth a call), non-
+      linear like real rally severity numbers, but scaled to FSD's own real
+      cornering envelope (comfortable mountain-road FSD driving measured so
+      far tops out well under `FRICTION_CIRCLE_MAX_G=0.6`) rather than real
+      rally G-loads (1.5g+) — a literal port of real pace-note breakpoints
+      would put every FSD corner at "6" and never call anything else. The
+      floor (0.15) is deliberately `CornerCounter.ENTER_G` exactly: every
+      corner graded here is a corner `CornerCounter` would also count (same
+      0.15g floor) — a WEAKER guarantee than "the counts always match",
+      flagged as overstated by an independent review: they don't match in
+      general, since `build_pace_notes` drops sub-min-duration blips and
+      merges chained pairs into one callout, and `segment_corners` drops a
+      corner still open at the timeline's end, none of which
+      `CornerCounter` does. What's guaranteed is that every CALLOUT
+      corresponds to a counted corner, never the reverse claim.
+    - **Direction reuses `g_to_offset`, literally, not just its
+      convention.** `segment_corners` calls
+      `g_to_offset(peak_signed_lateral_g, 0.0, max_g=|peak_signed_lateral_g|)`
+      and reads the sign of the returned `dx` — not a re-derivation of
+      "positive lateral_g = right", the actual confirmed-against-real-
+      telemetry function every other FSD widget's direction already goes
+      through (see `g_to_offset`'s own docstring, which specifically warned
+      pace-notes would need this). `max_g` is set to the peak's own
+      magnitude so `g_to_offset`'s clamp-to-rim never engages — only `dx`'s
+      SIGN is used, its scaled magnitude is irrelevant here.
+    - **Callout text** (Fable's recommendation, adopted close to verbatim):
+      `"RIGHT 3"` / `"LEFT 4"` — direction word, then grade number, all
+      caps, the minimum that captures rally flavor. A corner lasting at
+      least `PACE_NOTES_LONG_SECONDS=4.0` gets a `" LONG"` suffix. Two
+      corners chain into one callout (`"RIGHT 3"` with a smaller `"into
+      LEFT 4"` line beneath) when the gap between them is at most
+      `PACE_NOTES_CHAIN_GAP_SECONDS=2.0` — `build_pace_notes` chains AT MOST
+      one link (never "into X into Y": a chained corner's own potential
+      chain into a third corner is not inherited), and the chained corner
+      does NOT also get its own standalone callout (re-announcing it a
+      second later would read as a stutter, not authenticity) — covered by
+      `test_build_pace_notes_chains_at_most_one_link`.
+    - **Timing** (Fable's recommendation): `PACE_NOTES_LEAD_SECONDS=2.5`
+      (callout appears this far before the corner's real start — inside the
+      note-highway ribbon's own 4.0s lookahead, so by the time the callout
+      pops, the corner's bump is already visible sliding toward the ribbon's
+      playhead — the callout literally names the shape the viewer can
+      already see coming), `PACE_NOTES_HOLD_SECONDS=1.0` (the callout's
+      OUTER window extends this far AFTER the corner's start — anchored to
+      the corner's START, not its end, matching a real co-driver: the call
+      is read on approach and the driver is already executing the corner by
+      the time it clears — NOT how long it stays at full opacity: the
+      `_FADE_OUT_SECONDS` ramp runs INSIDE this window's own last stretch,
+      so the callout is actually fully gone AT `HOLD_SECONDS`, not
+      `HOLD_SECONDS` after full opacity ends; an earlier version of this
+      doc and the code's own comments got this wrong, flagged by an
+      independent review — see Verification status),
+      `PACE_NOTES_FADE_IN_SECONDS=0.3`/`_FADE_OUT_SECONDS=0.6`.
+      Overlap rule: when two notes' windows overlap (a tight corner
+      sequence), the LATER-starting note wins — `active_pace_note` scans in
+      reverse, so a fresh call always preempts a lingering stale one; never
+      two panels at once, never a crossfade between them. The earlier
+      note's own window is also TRUNCATED (`tesla_fsd_metrics.
+      visible_window`) so it fades out smoothly and reaches zero before the
+      later note's window can open, rather than being cut off abruptly at
+      full opacity — a real bug an independent review found and fixed (see
+      Verification status for the full story).
+    - **"Animation" is alpha only** (Fable's recommendation, matching the
+      friction circle's own established rendering technique): no position
+      slide, no size change — `pace_note_alpha` returns a single 0.0-1.0
+      scalar per frame (linear ramp up over the fade-in, hold at 1.0, linear
+      ramp down over the fade-out) that `PaceNotes.draw()`'s `_fade()`
+      multiplies into every shape's own RGBA alpha channel before drawing —
+      the same direct-RGBA-on-transparent-canvas technique the friction
+      circle's fading trail already proved composites correctly (see that
+      section above). A slide would fight the note-highway ribbon's own
+      leftward flow this widget sits below; PIL font sizes step discretely
+      so a scale "animation" would judder rather than read as smooth.
+    - **Placement: full-width, centered, directly below the note-highway
+      ribbon's own band** — computed from the SAME `NOTE_HIGHWAY_*`
+      constants `NoteHighway`'s own `draw()` uses for its bottom edge,
+      whether or not `--fsd-note-highway` is actually enabled in a given
+      run (every FSD overlay pass is its own blind, independent compositing
+      step, so placement has to come from fixed, hand-designed regions —
+      same reasoning `NoteHighway`'s own placement already documents). This
+      clears every other overlay's fixed region by construction: TL hero
+      label, TR `StreakScoreboard`, BL `--gauge`, BR `FrictionCircle`, and
+      the `NoteHighway` ribbon strip itself. Fable's brainstorm floated
+      anchoring near the ribbon's own "now" playhead instead, but that risks
+      colliding with the plotted line/playhead/"NOW" label in an 11%-tile-
+      height strip — directly below it, still visually tied to the ribbon it
+      annotates, was the safer, still-thematic choice, and was the one
+      verified against a real combined render (see Verification status).
+    - **"A gap must show as a gap"**: `segment_corners` treats a `None`
+      sample (a telemetry gap) exactly like `CornerCounter.update`'s own
+      None-safety — it neither starts nor ends a corner, and doesn't move
+      the peak, so a gap mid-corner simply pauses it. A corner still open
+      when the timeline runs out (the drive ends mid-corner) is DROPPED,
+      not synthesized an end — never confirmed how it resolves, so it must
+      not be called out as a real, complete corner. Pace notes are also
+      deliberately NOT gated on `autopilot_engaged`: the note describes the
+      *road*, not FSD's state, and a takeover moment is exactly when a
+      viewer most wants to know what corner prompted it — a deliberate
+      decision, not an oversight, written down here so it isn't "fixed"
+      later.
+
+      This principle originally had a real gap of its own, found by an
+      independent review: pausing corner STATE across a gap (above) is not
+      the same as pausing corner DURATION, and the first version of this
+      code only did the former — `min_samples`/`LONG` were computed from
+      raw `end_index - start_index`, which keeps counting through an
+      unobserved gap exactly like through real data, so a single real
+      sample either side of a long blackout could be reported as one long,
+      confirmed corner. Fixed by adding `Corner.observed_samples` (a count
+      of only the REAL samples seen while the corner was open) for those
+      decisions to key off instead, and `Corner.gap_before` (whether the
+      approach to this corner was actually fully observed) so
+      `build_pace_notes` refuses to chain two corners across an unobserved
+      stretch. See Verification status for the full repro-and-fix story.
+    - `PACE_NOTES_MIN_CORNER_SECONDS=0.7` drops corner blips too short to
+      call out. `PACE_NOTES_GRADE_COLORS` reuses the scoreboard's
+      established red/amber/green severity language (only the grade
+      NUMBER is colored; the direction word and chevron stay white, so
+      color always answers "how sharp" and the chevron/word always answer
+      "which way"). Every `PACE_NOTES_*` fraction/margin is the same
+      starting-guess-then-verify status every other panel constant in this
+      codebase has had — see Verification status for what's since been
+      confirmed against real footage.
   - **`build_fsd_overlay` consolidation**: the original `--fsd-scoreboard`-
     only `build_fsd_scoreboard_overlay` (`tesla_combine.py`) was generalized
     into `build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widget,
     ffmpeg, venv_py, out_path, tmpdir, dry_run, progress)`, taking an
-    explicit `widget` ("scoreboard", "friction-circle", or now
-    "note-highway") passed straight through to the subprocess as
-    `tesla_fsd_overlay.py --widget <widget>` -- a second (or third)
-    near-identical function would just have been copy-paste with one word
-    changed. `FSD_OVERLAY_META` holds the small per-widget bits that
-    actually differ (the CLI flag name for log lines, the `Step`/`Progress`
-    kind, etc) — the note-highway branch just added a third entry, no new
-    `build_*` function needed. The one existing `--fsd-scoreboard` call site
-    in `build_grid` now passes `widget="scoreboard"` explicitly (previously
-    implicit via the driver's own `--widget` default) — confirmed, by
-    rerunning every existing `--fsd-scoreboard` test immediately after this
-    refactor and before adding anything friction-circle-specific, that the
-    consolidation alone changes nothing about `--fsd-scoreboard`'s behavior.
+    explicit `widget` ("scoreboard", "friction-circle", "note-highway", or
+    now "pace-notes") passed straight through to the subprocess as
+    `tesla_fsd_overlay.py --widget <widget>` -- a second (or third, or
+    fourth) near-identical function would just have been copy-paste with
+    one word changed. `FSD_OVERLAY_META` holds the small per-widget bits
+    that actually differ (the CLI flag name for log lines, the
+    `Step`/`Progress` kind, etc) — the pace-notes branch just added a
+    fourth entry, no new `build_*` function needed. The one existing
+    `--fsd-scoreboard` call site in `build_grid` now passes
+    `widget="scoreboard"` explicitly (previously implicit via the driver's
+    own `--widget` default) — confirmed, by rerunning every existing
+    `--fsd-scoreboard` test immediately after this refactor and before
+    adding anything friction-circle-specific, that the consolidation alone
+    changes nothing about `--fsd-scoreboard`'s behavior.
 
   Two findings drove the original foundation's design:
   - **IMU axis mapping resolved with real data**, since Tesla documents none
@@ -528,33 +684,40 @@ scoreboard overlay.
     flip is the one piece that legitimately belongs in the widget, not the
     dependency-free module). Now covered by direct tests pinning both axes'
     signs and the clamp-to-rim behavior — this matters beyond just this
-    widget: **the two still-deferred ideas (note-highway ribbon, pace-notes)
-    need this exact same convention** (e.g. pace-notes calling a corner
-    "Right 3" vs "Left 3"), so they should call `g_to_offset` too, not
-    re-derive the sign independently. (The note-highway ribbon has since
-    landed and does follow this convention for its one axis — see "The note
-    highway" bullet above for why it doesn't literally call `g_to_offset`
-    itself, which is a two-axis function this single-axis ribbon doesn't
-    need.)
-  - **Design note, now revisited**: at the time this was originally written,
+    widget: **the two ideas that were still deferred at the time (note-
+    highway ribbon, pace-notes) need this exact same convention** (e.g.
+    pace-notes calling a corner "Right 3" vs "Left 3"), so they should call
+    `g_to_offset` too, not re-derive the sign independently. (Both have
+    since landed — the note-highway ribbon follows this convention for its
+    one axis, see "The note highway" bullet above for why it doesn't
+    literally call `g_to_offset` itself, which is a two-axis function that
+    single-axis ribbon doesn't need; pace-notes' `segment_corners` DOES call
+    `g_to_offset` directly, see "The pace notes" bullet above.)
+  - **Design note, now resolved**: at the time this was originally written,
     `--gauge` → `--fsd-scoreboard` → `--fsd-friction-circle` already chained
     as three sequential subprocess renders of the hero tile (each a full
     decode + draw + re-encode generation), and landing the note-highway
     ribbon and pace-notes the same way was flagged as something that would
     make five generations — worth combining `create_widgets_for`'s multiple
     FSD widgets into one compositing pass before a third FSD widget landed,
-    not after. Note-highway has now landed the same sequential-subprocess
-    way anyway (a fourth `build_fsd_overlay` call chained through
-    `angle_paths[hero_angle]`, not a combined pass), so
-    `--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`
-    together now really does mean four sequential hero-tile re-encode
-    generations. This is worth revisiting for real now that all four
-    showcase visuals exist (only pace-notes remains) — `create_widgets_for`
-    already returns a widget *list*, so one `tesla_fsd_overlay.py`
-    invocation could draw multiple FSD widgets (not `--gauge`, a different
-    tool, which is its own subprocess and layout system entirely) in a
-    single pass if `--widget` took multiple values, cutting four re-encodes
-    to one regardless of how many of the four flags are combined.
+    not after. Both note-highway and pace-notes landed the same sequential-
+    subprocess way anyway (each its own `build_fsd_overlay` call chained
+    through `angle_paths[hero_angle]`, not a combined pass), so
+    `--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway
+    --fsd-pace-notes` together now means FIVE sequential hero-tile re-encode
+    generations. All four FSD showcase visuals now exist and none more are
+    planned, so this is no longer "worth revisiting later" — it's the
+    concrete, ready-to-do next efficiency win for anyone touching this area
+    next: `create_widgets_for` already returns a widget *list*, so one
+    `tesla_fsd_overlay.py` invocation could draw multiple FSD widgets (not
+    `--gauge`, a different tool, which is its own subprocess and layout
+    system entirely) in a single pass if `--widget` took multiple values,
+    cutting five re-encodes to one regardless of how many of the four flags
+    are combined. Deliberately NOT done as part of the pace-notes branch
+    itself — it's a cross-cutting refactor of every existing widget's own
+    call site, a bigger, riskier change than adding the fourth widget on
+    the established pattern, and this codebase's own precedent (every prior
+    FSD branch) is to land the new widget first, refactor separately.
 - `--fsd-note-highway`/`NoteHighway`: the central architectural claim — that
   draw-call index N and `lateral_g_timeline[N]` stay in lockstep — was
   checked empirically, not just by reading `framemeta.py`/`framemeta_gpx.py`:
@@ -663,6 +826,126 @@ scoreboard overlay.
   against the real affected folder that the `-START` clip is now discovered
   and correctly selected/offset for a trim window starting inside it. See
   the Gotchas section below for the `-START` convention itself.
+- `--fsd-pace-notes`/`PaceNotes`: verified `--dry-run --verbose` solo and
+  combined with every other `--fsd-*`/`--gauge` flag (confirms the chain
+  order in both the printed compositing steps and the resulting filename),
+  then a full integrated real-footage render through `tesla_combine.py`
+  itself — `--fsd-pace-notes` alone and again as part of the "everything"
+  combination (`--gauge --fsd-scoreboard --fsd-friction-circle
+  --fsd-note-highway --fsd-pace-notes --map`), both under `--landscape
+  --quality high --map --map-zoom 16` on the same real trimmed window this
+  project's other recent branches used. `playcheck.sh` clean on both
+  outputs. The combined render's extracted frame shows all five hero-tile
+  regions populated at once (TL hero label, TR `StreakScoreboard`, the
+  note-highway ribbon strip, `PaceNotes`' own callout centered directly
+  below it, BL `--gauge`, BR `FrictionCircle`) with no visual overlap
+  between any of them, confirming the placement claim holds in practice, not
+  just in the constants' arithmetic.
+
+  **Cross-checked against independently regenerated ground truth, not just
+  eyeballed** (the same methodology the note-highway branch's own
+  verification used, and the same "a single eyeballed frame is unreliable"
+  lesson the friction-circle sign-convention work learned first): the exact
+  GPX the solo render actually used was regenerated in a SEPARATE process
+  (a fresh `build_route_gpx` call, same trim window), then run through the
+  real `tesla_fsd_overlay.py` decode -> `segment_corners` ->
+  `build_pace_notes` pipeline to print ground-truth corner timestamps/
+  grades/directions/chain state. Real frames were then extracted from the
+  actual rendered grid video at three of those corners' computed
+  full-opacity timestamps (one plain "RIGHT 5", one plain "LEFT 5", and one
+  CHAINED "RIGHT 6" / "into RIGHT 6" pair) and confirmed to show exactly the
+  predicted text, direction chevron, and grade color in every case; a frame
+  extracted from a quiet mid-drive moment between two notes' windows
+  confirmed nothing is drawn there (the ephemeral/most-frames-draw-nothing
+  design claim). Direction itself is not a fresh finding here -- it inherits
+  `g_to_offset`'s already-confirmed-against-real-telemetry sign convention
+  (see "Sign math moved to a tested, shared function" above) rather than
+  re-deriving it, per this file's own repeated warning that pace-notes
+  specifically needed to reuse that convention, not re-derive it.
+
+  **Independent Fable review** (same process as every prior FSD branch, the
+  most thorough one yet -- it built and ran executable repros for every
+  suspicion rather than reasoning abstractly) found two real bugs, both
+  fixed before commit, plus two doc-accuracy issues:
+  - **A telemetry gap could fabricate corner DURATION**, not just corner
+    state. `segment_corners` already treated a `None` sample as a no-op for
+    hysteresis state (correct, mirrors `CornerCounter`), but every
+    duration-derived decision -- `min_samples` filtering and
+    `build_pace_notes`' `LONG` flag -- was computed from raw
+    `end_index - start_index`, which keeps ticking through an unobserved
+    gap the same as through real data. Confirmed with an executable repro:
+    one real 0.2g sample, a manufactured 10-second all-`None` blackout, one
+    real return-to-baseline sample -- reported as a single ten-second
+    corner ("RIGHT 5 LONG"), fabricated almost entirely from unobserved
+    time. A second repro showed the same gap defeating the "too short to
+    call" `min_samples` filter outright. **Fixed**: `Corner` gained
+    `observed_samples` (a count of only the REAL samples seen while the
+    corner was open) and `gap_before` (whether the stretch immediately
+    preceding this corner's start contained any missing sample);
+    `min_samples`/`LONG` now key off `observed_samples`, and
+    `build_pace_notes` refuses to chain two corners when `gap_before` is
+    True (a real gap in the "straight road between them" means the chain's
+    implicit "into" claim was never actually observed -- a third repro
+    showed two corners either side of a total blackout chaining into a
+    confident-looking, fabricated "into" callout before this fix). Covered
+    by new tests mirroring both repros plus the chain-suppression case.
+  - **A later note preempting an earlier one was an instant cut, not a
+    fade** -- contradicting this branch's own "pure alpha fade, never a
+    crossfade, never two panels at once" claim (the "never a crossfade"
+    half was true; "pure alpha fade" wasn't). With the shipped timing
+    constants, two corners spaced roughly 2-3 real seconds apart (closer
+    than `LEAD_SECONDS + HOLD_SECONDS`, but too far apart to chain) produce
+    overlapping windows; the old `active_pace_note` just picked the later
+    note once its window opened, so the earlier note held at alpha 1.0
+    until the exact frame the later note's own window began, then vanished
+    in one frame while the later note popped in already fading up from
+    zero. Confirmed with an executable repro before the fix. **Fixed**:
+    `visible_window(notes, i, lead_samples, hold_samples)` truncates a
+    note's natural window to end one sample before the FOLLOWING note's own
+    natural window opens (never extends, only shortens, clamped to at least
+    one sample); `active_pace_note`/`pace_note_alpha` now consult this
+    truncated window instead of each note's bare natural one --
+    `pace_note_alpha`'s signature changed from `(note, index, ...)` to
+    `(notes, i, index, ...)` specifically so it always agrees with
+    `active_pace_note` about which (possibly truncated) window is in play,
+    rather than each independently re-deriving it. Verified two ways: a
+    synthetic repro showing the earlier note's alpha now ramps smoothly to
+    0 by the truncation point instead of being cut off at full opacity, and
+    two extracted real synthetic-frame renders (one mid-fade-out on the
+    earlier note, one mid-fade-in on the later note) confirmed visually.
+  - **Doc drift, both fixed**: the `PACE_NOTE_GRADE_THRESHOLDS` comment (and
+    this file's own severity-grading bullet above) overstated the
+    corner_count/callout-count guarantee as "can never contradict each
+    other" -- false, since `build_pace_notes` drops short blips, merges
+    chained pairs, and `segment_corners` drops a corner still open at the
+    timeline's end, none of which `CornerCounter` does. Reworded to the
+    TRUE, weaker guarantee: every callout corresponds to a corner
+    `CornerCounter` also counts (shared 0.15g floor), not a 1:1 count
+    match. Separately, `PACE_NOTES_HOLD_SECONDS`'s comment and `PaceNotes`'
+    own class docstring claimed the callout "clears `HOLD_SECONDS +
+    FADE_OUT_SECONDS` after" the corner's start -- wrong: the fade-out ramp
+    runs INSIDE the `HOLD_SECONDS` window, not after it, so the callout is
+    actually fully gone AT `HOLD_SECONDS`, and full opacity itself ends at
+    `HOLD_SECONDS - FADE_OUT_SECONDS`. `pace_note_alpha`'s own docstring
+    was already the accurate description; the two other comments now match
+    it.
+  - **Confirmed clean** (checked against the code, not just the docs, with
+    executable repros where suspicious): `g_to_offset` reuse for direction
+    is literal, not re-derived; an open corner at the timeline's end is
+    dropped even in the adversarial case of a trailing gap sitting inside
+    it; the precompute-once architecture really does mean `draw()` never
+    re-grades a corner (no flicker path exists to find); chaining really is
+    at most one link with the chained corner correctly suppressed, verified
+    with a three-corner case; placement really is identical whether or not
+    `--fsd-note-highway` is enabled, verified by comparing the two draw()
+    functions' formulas directly; alpha is applied to every drawn element
+    (panel, chevron, both text lines) with no PIL text-measurement
+    trailing-space bug; `end_index` semantics (first CONFIRMED-exit sample,
+    not the last in-corner one) are used consistently everywhere they're
+    read, though the class docstring didn't say so until this fix (now
+    documents it explicitly); `tesla_combine.py`'s new `--fsd-pace-notes`
+    block is a faithful, non-divergent copy of the established
+    `--fsd-note-highway` pattern.
 
 ## Gotchas
 - Never commit footage or rendered outputs.

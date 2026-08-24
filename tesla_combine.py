@@ -24,6 +24,7 @@ Usage:
     python3 tesla_combine.py /path/to/event/folder --fsd-scoreboard  # composite an FSD streak scoreboard onto the hero tile (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --fsd-friction-circle  # composite an FSD friction-circle G-meter onto the hero tile (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --fsd-note-highway  # composite an FSD note-highway cornering ribbon onto the hero tile (needs gopro-overlay in ./.venv)
+    python3 tesla_combine.py /path/to/event/folder --fsd-pace-notes  # composite rally-style FSD pace-notes callouts onto the hero tile (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --verbose  # raw ffmpeg/deface output instead of the progress display
     python3 tesla_combine.py /path/to/event/folder --dry-run  # print commands, do nothing
 
@@ -40,7 +41,8 @@ Output (written next to the input folder unless --output-dir is given):
     <session>_<hero-angle>_scoreboard.mp4 -- (with --fsd-scoreboard) that hero tile, streak scoreboard composited on
     <session>_<hero-angle>_friction-circle.mp4 -- (with --fsd-friction-circle) that hero tile, friction-circle G-meter composited on
     <session>_<hero-angle>_note-highway.mp4 -- (with --fsd-note-highway) that hero tile, note-highway cornering ribbon composited on
-    <session>_grid[_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map].mp4 -- labeled multi-camera composite w/ clock
+    <session>_<hero-angle>_pace-notes.mp4 -- (with --fsd-pace-notes) that hero tile, rally-style pace-notes callouts composited on
+    <session>_grid[_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_pace-notes][_map].mp4 -- labeled multi-camera composite w/ clock
 """
 
 import argparse
@@ -58,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-SCRIPT_VERSION = "2.7"
+SCRIPT_VERSION = "2.8"
 # Separate from SCRIPT_VERSION so feature releases can bump the script version
 # without invalidating every cached per-camera concat (concat semantics are
 # unchanged). Bump this ONLY when the concat output itself would change.
@@ -188,7 +190,7 @@ def human_time(sec):
 class Step:
     """One unit of work in the job plan. `work` is in seconds of footage (output
     seconds for the grid), the unit every rate below is relative to."""
-    kind: str        # concat | blur | map_gps | map_render | map_scale | gauge_render | scoreboard_render | friction_circle_render | note_highway_render | grid
+    kind: str        # concat | blur | map_gps | map_render | map_scale | gauge_render | scoreboard_render | friction_circle_render | note_highway_render | pace_notes_render | grid
     label: str
     work: float
 
@@ -207,6 +209,7 @@ RATE_PRIORS = {
     "scoreboard_render": 1.0, # tesla_fsd_overlay.py FSD scoreboard render + composite
     "friction_circle_render": 1.0, # tesla_fsd_overlay.py FSD friction-circle render + composite
     "note_highway_render": 1.0, # tesla_fsd_overlay.py FSD note-highway render + composite
+    "pace_notes_render": 1.0,  # tesla_fsd_overlay.py FSD pace-notes render + composite
     "grid": 2.0,         # VideoToolbox hardware encode
 }
 KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "GPS extract",
@@ -214,6 +217,7 @@ KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "GPS extract",
                "gauge_render": "gauge render", "scoreboard_render": "scoreboard render",
                "friction_circle_render": "friction circle render",
                "note_highway_render": "note highway render",
+               "pace_notes_render": "pace notes render",
                "grid": "grid"}
 BAR_FULL, BAR_EMPTY = "█", "░"
 BAR_FULL_ASCII, BAR_EMPTY_ASCII = "#", "-"
@@ -1285,6 +1289,13 @@ FSD_OVERLAY_META = {
         "step_label": "note highway render",
         "run_what": "tesla_fsd_overlay (FSD note highway)",
     },
+    "pace-notes": {
+        "flag": "--fsd-pace-notes",
+        "log_label": "FSD pace notes",
+        "kind": "pace_notes_render",
+        "step_label": "pace notes render",
+        "run_what": "tesla_fsd_overlay (FSD pace notes)",
+    },
 }
 
 
@@ -1292,23 +1303,24 @@ def build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widget, ffmpeg, venv
                       out_path, tmpdir, dry_run, progress):
     """Composite an FSD showcase overlay -- the streak scoreboard
     (widget="scoreboard", --fsd-scoreboard), the friction-circle G-meter
-    (widget="friction-circle", --fsd-friction-circle), or the note-highway
-    cornering ribbon (widget="note-highway", --fsd-note-highway) -- onto the
-    hero camera tile, via tesla_fsd_overlay.py -- a separate driver script
-    under ./.venv (same venv-boundary reason build_gauge_overlay subprocesses
-    out to gopro-dashboard.py) rather than a gopro-overlay XML layout: all
-    three widgets are directly-drawn PIL widgets (StreakScoreboard/
-    FrictionCircle/NoteHighway), not composable from gopro-overlay's
+    (widget="friction-circle", --fsd-friction-circle), the note-highway
+    cornering ribbon (widget="note-highway", --fsd-note-highway), or the
+    rally-style pace-notes callout (widget="pace-notes", --fsd-pace-notes) --
+    onto the hero camera tile, via tesla_fsd_overlay.py -- a separate driver
+    script under ./.venv (same venv-boundary reason build_gauge_overlay
+    subprocesses out to gopro-dashboard.py) rather than a gopro-overlay XML
+    layout: all four widgets are directly-drawn PIL widgets (StreakScoreboard/
+    FrictionCircle/NoteHighway/PaceNotes), not composable from gopro-overlay's
     built-in component types. Returns out_path.
 
     Generalized from the original --fsd-scoreboard-only
     build_fsd_scoreboard_overlay -- a second near-identical function per
-    showcase idea would just be copy-paste with one word changed, and a
-    third and fourth idea (note-highway ribbon, then pace-notes) were already
-    known to be coming; note-highway has now landed through this same
-    function, no new build_* function needed. `widget` is passed straight
-    through to tesla_fsd_overlay.py's own --widget flag; FSD_OVERLAY_META
-    supplies the per-widget log/progress labels this function itself needs.
+    showcase idea would just be copy-paste with one word changed, and further
+    ideas (note-highway ribbon, then pace-notes) were already known to be
+    coming; all four have now landed through this same function, no new
+    build_* function needed. `widget` is passed straight through to
+    tesla_fsd_overlay.py's own --widget flag; FSD_OVERLAY_META supplies the
+    per-widget log/progress labels this function itself needs.
 
     `tile_dims` is accepted (mirroring build_gauge_overlay's/build_map_tile's
     shape) but not passed to the subprocess -- unlike the map tile, this
@@ -2089,6 +2101,20 @@ def build_parser() -> argparse.ArgumentParser:
                          "like 'repeaters'. Can be combined with --gauge/--fsd-scoreboard/"
                          "--fsd-friction-circle -- positioned full-width below the top-anchored "
                          "hero label and streak scoreboard, clear of all three other overlays.")
+    ap.add_argument("--fsd-pace-notes", action="store_true",
+                    help="composite rally-style FSD pace-notes callouts (a momentary text "
+                         "callout like 'RIGHT 3' with a direction chevron and a color-coded "
+                         "severity number, appearing a few seconds before a corner and "
+                         "clearing shortly after -- the way a rally co-driver reads "
+                         "pre-recorded notes just ahead of the driver) onto the hero camera "
+                         "tile. Same prerequisites as --map/--gauge/--fsd-scoreboard/"
+                         "--fsd-friction-circle/--fsd-note-highway (SEI telemetry, "
+                         "gopro-overlay in ./.venv -- see --map's help). v1 only supports a "
+                         "solo hero: --feature must be a single camera, not a pair like "
+                         "'repeaters'. Can be combined with --gauge/--fsd-scoreboard/"
+                         "--fsd-friction-circle/--fsd-note-highway -- positioned full-width, "
+                         "centered, directly below the note-highway ribbon's own band, clear "
+                         "of all four other overlays.")
     ap.add_argument("--force-concat", action="store_true",
                     help="rebuild the per-camera concats even if matching ones already exist")
     ap.add_argument("--skip-space-check", action="store_true", help="don't pre-flight free disk space")
@@ -2108,10 +2134,10 @@ def build_parser() -> argparse.ArgumentParser:
 class Tools:
     """Resolved external tool paths + label/blur/map/gauge/FSD-overlay capability
     flags for one run. map_venv_py/map_gopro/map_font are shared by --map,
-    --gauge, --fsd-scoreboard, --fsd-friction-circle and --fsd-note-highway --
-    all five use the same gopro-overlay installation (the three FSD showcase
-    flags only need map_venv_py; map_gopro/map_font are gopro-dashboard.py-
-    specific and unused by tesla_fsd_overlay.py)."""
+    --gauge, --fsd-scoreboard, --fsd-friction-circle, --fsd-note-highway and
+    --fsd-pace-notes -- all six use the same gopro-overlay installation (the
+    four FSD showcase flags only need map_venv_py; map_gopro/map_font are
+    gopro-dashboard.py-specific and unused by tesla_fsd_overlay.py)."""
     ffmpeg: str
     ffprobe: str
     has_text: bool
@@ -2162,21 +2188,23 @@ def setup_tools(args) -> Tools:
                 "face-detection model.)")
 
     if (args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway):
-        # --map, --gauge, --fsd-scoreboard, --fsd-friction-circle and
-        # --fsd-note-highway share the same gopro-overlay tooling and GPS
-        # extraction (see build_route_gpx) -- one discovery/validation block
-        # for all five. The three FSD showcase flags don't need
-        # gopro-dashboard.py itself (tesla_fsd_overlay.py is its own driver
-        # script), only the venv's Python and an installed gopro_overlay --
-        # both of which find_map_tooling already checks.
+            or args.fsd_note_highway or args.fsd_pace_notes):
+        # --map, --gauge, --fsd-scoreboard, --fsd-friction-circle,
+        # --fsd-note-highway and --fsd-pace-notes share the same
+        # gopro-overlay tooling and GPS extraction (see build_route_gpx) --
+        # one discovery/validation block for all six. The four FSD showcase
+        # flags don't need gopro-dashboard.py itself (tesla_fsd_overlay.py
+        # is its own driver script), only the venv's Python and an
+        # installed gopro_overlay -- both of which find_map_tooling already
+        # checks.
         script_dir = Path(__file__).resolve().parent
         map_venv_py, map_gopro, map_missing = find_map_tooling(script_dir)
         if map_missing:
             active = [n for n, f in (("--map", args.map), ("--gauge", args.gauge),
                                      ("--fsd-scoreboard", args.fsd_scoreboard),
                                      ("--fsd-friction-circle", args.fsd_friction_circle),
-                                     ("--fsd-note-highway", args.fsd_note_highway)) if f]
+                                     ("--fsd-note-highway", args.fsd_note_highway),
+                                     ("--fsd-pace-notes", args.fsd_pace_notes)) if f]
             flag = "/".join(active)
             die(f"{flag} needs the gopro-overlay tool in a sibling .venv next to this script.\n"
                 "Set it up with:\n"
@@ -2206,6 +2234,10 @@ def setup_tools(args) -> Tools:
 
     if args.fsd_note_highway and len(hero_angles_for(args.feature)) > 1:
         die("--fsd-note-highway needs a solo --feature (a pair like 'repeaters' has "
+            "two hero tiles) -- pick a single camera.")
+
+    if args.fsd_pace_notes and len(hero_angles_for(args.feature)) > 1:
+        die("--fsd-pace-notes needs a solo --feature (a pair like 'repeaters' has "
             "two hero tiles) -- pick a single camera.")
 
     return tools
@@ -2314,10 +2346,11 @@ def plan_steps(args, selections, footage):
         if args.blur_faces:
             steps.append(Step("blur", f"blur faces {angle}", footage[angle]))
     if (args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway):
+            or args.fsd_note_highway or args.fsd_pace_notes):
         # GPS extraction is shared -- one map_gps step regardless of which of
         # --map, --gauge, --fsd-scoreboard, --fsd-friction-circle,
-        # --fsd-note-highway (or several) were requested (see build_route_gpx).
+        # --fsd-note-highway, --fsd-pace-notes (or several) were requested
+        # (see build_route_gpx).
         map_source = "front" if "front" in selections else next(iter(selections))
         map_work = footage[map_source]
         steps.append(Step("map_gps", "GPS extract", map_work))
@@ -2333,6 +2366,8 @@ def plan_steps(args, selections, footage):
             steps.append(Step("friction_circle_render", "friction circle render", map_work))
         if args.fsd_note_highway:
             steps.append(Step("note_highway_render", "note highway render", map_work))
+        if args.fsd_pace_notes:
+            steps.append(Step("pace_notes_render", "pace notes render", map_work))
     if len(selections) > 1 or args.map:
         # The grid encodes the OUTPUT timeline, which --speed has already scaled.
         steps.append(Step("grid", "grid encode",
@@ -2472,13 +2507,14 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
 
     # Build the optional live route-map tile, --gauge dashboard overlay,
     # and/or the FSD showcase overlays (--fsd-scoreboard, --fsd-friction-
-    # circle, --fsd-note-highway). All five need the same GPS: extracted from
-    # the ORIGINAL front source clips (SEI lives in the source bitstream, not
-    # the concat/blurred outputs) and re-timed onto the grid timeline --
-    # build_route_gpx does this ONCE and is shared by all five, so requesting
-    # several together doesn't pay for it more than once.
+    # circle, --fsd-note-highway, --fsd-pace-notes). All six need the same
+    # GPS: extracted from the ORIGINAL front source clips (SEI lives in the
+    # source bitstream, not the concat/blurred outputs) and re-timed onto
+    # the grid timeline -- build_route_gpx does this ONCE and is shared by
+    # all six, so requesting several together doesn't pay for it more than
+    # once.
     if (args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway):
+            or args.fsd_note_highway or args.fsd_pace_notes):
         t0 = time.monotonic()
         map_source = "front" if "front" in plan.selections else next(iter(plan.selections))
         src_sel, src_off, _ = plan.selections[map_source]
@@ -2495,7 +2531,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
             # counting work that isn't coming.
             progress.abandon("map_render", "map_scale", "gauge_render",
                              "scoreboard_render", "friction_circle_render",
-                             "note_highway_render")
+                             "note_highway_render", "pace_notes_render")
         else:
             if args.map:
                 t0 = time.monotonic()
@@ -2614,6 +2650,32 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                 angle_paths[hero_angle] = built
                 stats["note_highway_built"] = True
 
+            if args.fsd_pace_notes:
+                t0 = time.monotonic()
+                # A solo hero is guaranteed by setup_tools (dies early on a
+                # paired --feature), same as --gauge/--fsd-scoreboard/
+                # --fsd-friction-circle/--fsd-note-highway above.
+                hero_angle = hero_angles_for(args.feature)[0]
+                # Persist the composited hero (not tmpdir): same rationale as
+                # --gauge/--fsd-scoreboard/--fsd-friction-circle/
+                # --fsd-note-highway -- a real, potentially slow, standalone
+                # artifact, and it replaces angle_paths[hero_angle] below so
+                # both build_filter and build_filter_landscape pick it up
+                # without either needing to know pace notes were composited.
+                # Chains after --gauge/--fsd-scoreboard/--fsd-friction-circle/
+                # --fsd-note-highway through angle_paths[hero_angle] if any of
+                # those also ran, same pattern every overlay in this file
+                # already uses -- pace notes composites last, on top of
+                # whatever the other overlays already drew.
+                pace_notes_out = out_dir / f"{session_name}_{hero_angle}_pace-notes.mp4"
+                built = build_fsd_overlay(
+                    angle_paths[hero_angle], gpx_path, dims[hero_angle], "pace-notes",
+                    ffmpeg, tools.map_venv_py, pace_notes_out, tmpdir,
+                    args.dry_run, progress)
+                stats["pace_notes_s"] += time.monotonic() - t0
+                angle_paths[hero_angle] = built
+                stats["pace_notes_built"] = True
+
     if len(angle_paths) < 2:
         log("\nOnly one camera angle found -- skipping grid, per-angle concat above is the "
             "final output.")
@@ -2653,6 +2715,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     suffix += "_scoreboard" if stats.get("scoreboard_built") else ""
     suffix += "_friction-circle" if stats.get("friction_circle_built") else ""
     suffix += "_note-highway" if stats.get("note_highway_built") else ""
+    suffix += "_pace-notes" if stats.get("pace_notes_built") else ""
     suffix += "_map" if MAP_TILE_KEY in angle_paths else ""
     out_grid = out_dir / f"{session_name}_grid{suffix}.mp4"
     cmd += ["-an", "-movflags", "+faststart", str(out_grid)]
@@ -2691,7 +2754,7 @@ def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
     log(f"  concat           {human_time(stats['concat_s'])} "
         f"({stats['built']} built, {stats['reused']} reused)")
     if ((args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway) and stats["gps_s"] > 0):
+            or args.fsd_note_highway or args.fsd_pace_notes) and stats["gps_s"] > 0):
         log(f"  GPS extract      {human_time(stats['gps_s'])}")
     if args.map:
         map_built = MAP_TILE_KEY in angle_paths
@@ -2709,6 +2772,9 @@ def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
     if args.fsd_note_highway:
         log(f"  FSD note highway {human_time(stats['note_highway_s'])}"
             f"{'' if stats['note_highway_built'] else '  (no GPS -- overlay skipped)'}")
+    if args.fsd_pace_notes:
+        log(f"  FSD pace notes   {human_time(stats['pace_notes_s'])}"
+            f"{'' if stats['pace_notes_built'] else '  (no GPS -- overlay skipped)'}")
     if args.blur_faces:
         log(f"  face blur        {human_time(stats['blur_s'])} "
             f"({stats['blurred']} blurred, {stats['blur_reused']} reused)")
@@ -2766,7 +2832,8 @@ def main(argv=None) -> int:
              "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
              "scoreboard_s": 0.0, "scoreboard_built": False,
              "friction_circle_s": 0.0, "friction_circle_built": False,
-             "note_highway_s": 0.0, "note_highway_built": False}
+             "note_highway_s": 0.0, "note_highway_built": False,
+             "pace_notes_s": 0.0, "pace_notes_built": False}
 
     folder = args.folder.resolve()
     if not folder.is_dir():

@@ -59,6 +59,23 @@ traces where you drove.
   `--fsd-scoreboard`/`--fsd-friction-circle` (shared). Can be combined with
   any of the other three — all four overlays occupy non-overlapping regions
   of the hero tile.
+- **FSD pace notes** (`--fsd-pace-notes`) — a momentary rally-style callout
+  ("RIGHT 3", with a direction chevron and a color-coded severity number)
+  that appears a couple of seconds before a corner and clears shortly after,
+  the way a real rally co-driver reads pre-recorded notes just ahead of the
+  driver. Severity is graded 1 (tightest/most dramatic) to 6 (loosest,
+  barely worth a call) from the corner's real peak lateral G; closely-linked
+  corners chain into one callout ("RIGHT 3" with a smaller "into LEFT 4"
+  line beneath it), and a long corner gets a "LONG" suffix. Unlike the other
+  three overlays (persistent gauges/panels drawn every frame), this one is
+  ephemeral — most frames show nothing at all, and appear/clear is a pure
+  alpha fade, no slide or resize. Composited full-width, centered, directly
+  below the note-highway ribbon's own band (whether or not `--fsd-note-highway`
+  is actually enabled), so it never collides with any of the other overlays.
+  Same GPS telemetry as `--map`/`--gauge`/`--fsd-scoreboard`/
+  `--fsd-friction-circle`/`--fsd-note-highway` (shared). Can be combined
+  with any of the other four — all four FSD showcase overlays plus `--gauge`
+  occupy non-overlapping regions of the hero tile.
 - **Landscape layout** (`--landscape`) — the featured camera at full native
   resolution on the left, every other camera (and the map, if any) in a thin
   sidebar column on the right, sized to match. Produces a real landscape
@@ -135,7 +152,7 @@ predicted from that measurement).
   ```
   The script auto-detects `ffmpeg-full` and falls back gracefully.
 - **Python 3.9+** for the core tool (standard library only).
-- For `--map` / `--gauge` / `--fsd-scoreboard` / `--fsd-friction-circle` / `--fsd-note-highway`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
+- For `--map` / `--gauge` / `--fsd-scoreboard` / `--fsd-friction-circle` / `--fsd-note-highway` / `--fsd-pace-notes`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
 - For `--blur-faces`: `pip install deface` (optional).
 
 ## Setup
@@ -146,18 +163,18 @@ cd teslacam-studio
 
 # Optional — only needed for the --map route overlay / --gauge dashboard overlay /
 # --fsd-scoreboard streak scoreboard / --fsd-friction-circle G-meter /
-# --fsd-note-highway cornering ribbon:
+# --fsd-note-highway cornering ribbon / --fsd-pace-notes rally callouts:
 python3.12 -m venv .venv
 ./.venv/bin/python -m pip install gopro-overlay
 ```
 
 The `--map`/`--gauge` features look for `gopro-dashboard.py` inside `./.venv`;
-`--fsd-scoreboard`/`--fsd-friction-circle`/`--fsd-note-highway` look for their
-own driver script (`tesla_fsd_overlay.py`) and the `gopro-overlay` library
-installed there. `--map` downloads OpenStreetMap tiles on first use (so it
+`--fsd-scoreboard`/`--fsd-friction-circle`/`--fsd-note-highway`/`--fsd-pace-notes`
+look for their own driver script (`tesla_fsd_overlay.py`) and the `gopro-overlay`
+library installed there. `--map` downloads OpenStreetMap tiles on first use (so it
 needs network access); `--gauge`/`--fsd-scoreboard`/`--fsd-friction-circle`/
-`--fsd-note-highway` composite onto your own footage and need no network
-access.
+`--fsd-note-highway`/`--fsd-pace-notes` composite onto your own footage and need
+no network access.
 
 ### Running the tests
 
@@ -207,8 +224,11 @@ python3 tesla_combine.py /path/to/event/folder --fsd-friction-circle
 # Composite an FSD note-highway cornering ribbon onto the hero tile (needs gopro-overlay in ./.venv)
 python3 tesla_combine.py /path/to/event/folder --fsd-note-highway
 
-# All four hero-tile overlays together (each occupies its own region)
-python3 tesla_combine.py /path/to/event/folder --gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway
+# Composite rally-style FSD pace-notes callouts onto the hero tile (needs gopro-overlay in ./.venv)
+python3 tesla_combine.py /path/to/event/folder --fsd-pace-notes
+
+# All five hero-tile overlays together (each occupies its own region)
+python3 tesla_combine.py /path/to/event/folder --gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway --fsd-pace-notes
 
 # Landscape layout (real 16:9-ish aspect ratio) instead of the tall grid
 python3 tesla_combine.py /path/to/event/folder --landscape --map
@@ -238,6 +258,7 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--fsd-scoreboard` | Composite an FSD streak scoreboard (hands-free time, corner count, peak G, takeovers) onto the hero tile (solo `--feature` only) |
 | `--fsd-friction-circle` | Composite an FSD friction-circle G-meter (lateral vs. longitudinal G, fading trail, peak-this-corner) onto the hero tile (solo `--feature` only) |
 | `--fsd-note-highway` | Composite an FSD note-highway cornering ribbon (scrolling signed lateral-G severity, "now" fixed at center) onto the hero tile (solo `--feature` only) |
+| `--fsd-pace-notes` | Composite rally-style FSD pace-notes callouts (a momentary "RIGHT 3"-style text callout before each corner) onto the hero tile (solo `--feature` only) |
 | `--landscape` | Hero camera at native res + thin sidebar column, instead of the tall grid |
 | `--native` | True native resolution (skips the hardware-fit scale-down) |
 | `--quality` | `fast` (default, hardware) or `high` (software libx264, CRF 18) |
@@ -270,7 +291,8 @@ Written next to the input folder unless `--output-dir` is given:
 | `<session>_<hero-angle>_scoreboard.mp4` | (with `--fsd-scoreboard`) that hero tile, streak scoreboard composited on |
 | `<session>_<hero-angle>_friction-circle.mp4` | (with `--fsd-friction-circle`) that hero tile, friction-circle G-meter composited on |
 | `<session>_<hero-angle>_note-highway.mp4` | (with `--fsd-note-highway`) that hero tile, note-highway cornering ribbon composited on |
-| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map].mp4` | the labeled multi-camera composite |
+| `<session>_<hero-angle>_pace-notes.mp4` | (with `--fsd-pace-notes`) that hero tile, rally-style pace-notes callouts composited on |
+| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_pace-notes][_map].mp4` | the labeled multi-camera composite |
 
 `playcheck.sh <file.mp4>` runs headless playback sanity checks (decode integrity,
 faststart index, hardware-decodable dimensions, constant frame rate).

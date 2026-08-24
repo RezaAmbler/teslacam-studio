@@ -232,6 +232,7 @@ def _tools_args(**kw):
     a.fsd_scoreboard = False
     a.fsd_friction_circle = False
     a.fsd_note_highway = False
+    a.fsd_pace_notes = False
     a.feature = "front"
     a.__dict__.update(kw)
     return a

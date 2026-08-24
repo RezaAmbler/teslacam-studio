@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
 """tesla_fsd_overlay.py — driver for FSD showcase overlays.
 
-Wired into tesla_combine.py's CLI as `--fsd-scoreboard`, `--fsd-friction-circle`
-and `--fsd-note-highway` (three of the four FSD-showcase visuals to actually
-ship): proves, end to end, that Tesla's per-frame G-force/autopilot telemetry
-(SEI -> tesla_gps.write_gpx()'s repurposed GPX tags -> gopro-overlay's
+Wired into tesla_combine.py's CLI as `--fsd-scoreboard`, `--fsd-friction-circle`,
+`--fsd-note-highway` and `--fsd-pace-notes` (all four of the planned FSD-showcase
+visuals now ship): proves, end to end, that Tesla's per-frame G-force/autopilot
+telemetry (SEI -> tesla_gps.write_gpx()'s repurposed GPX tags -> gopro-overlay's
 GPX-based pipeline -> tesla_fsd_metrics' pure decode/derivation -> a widget)
 can drive a real composited video, and draws the "streak scoreboard" visual
 (StreakScoreboard, --widget scoreboard, the default) -- an accumulating
 hands-free/corner/peak-G/takeover stat line -- the "friction circle" G-G
 diagram visual (FrictionCircle, --widget friction-circle) -- lateral G vs.
-longitudinal G on a ringed target with a fading trail -- or the "note
+longitudinal G on a ringed target with a fading trail -- the "note
 highway" cornering ribbon (NoteHighway, --widget note-highway) -- a
 horizontal scrolling strip of signed lateral-G severity with "now" fixed at
-center, showing the road BEFORE the car reaches it. The one still-deferred
-showcase idea (pace-notes) is its own follow-up branch's job;
-FsdDiagnosticText (--widget diagnostic) is kept around, not deleted, for
-debugging it. See CLAUDE.md for the full design rationale (axis mapping, GPX
-tag repurposing, why gopro-dashboard.py's CLI can't carry any of this on its
-own).
+center, showing the road BEFORE the car reaches it -- or the "pace notes"
+rally-style callout (PaceNotes, --widget pace-notes) -- a momentary text
+callout ("RIGHT 3") that appears a few seconds before a corner and clears
+shortly after, the way a rally co-driver reads pre-recorded notes just ahead
+of the driver. FsdDiagnosticText (--widget diagnostic) is kept around, not
+deleted, for debugging future work. See CLAUDE.md for the full design
+rationale (axis mapping, GPX tag repurposing, why gopro-dashboard.py's CLI
+can't carry any of this on its own).
 
 Must run under ./.venv (gopro-overlay installed there, not under the system
 Python tesla_combine.py itself uses) -- same venv-boundary reason `--map`/
 `--gauge` already subprocess out to gopro-dashboard.py:
 
     ./.venv/bin/python tesla_fsd_overlay.py <input-video> <output> \\
-        --gpx <path> --font <path> --ffmpeg-dir <dir> [--widget scoreboard|diagnostic]
+        --gpx <path> --font <path> --ffmpeg-dir <dir> \\
+        [--widget scoreboard|diagnostic|friction-circle|note-highway|pace-notes]
 
 `<input-video>` is a hero-camera video (e.g. tesla_combine.py's own
 `*-front-combined.mp4`); `--gpx` is a GPX written by tesla_gps.write_gpx()
@@ -762,6 +765,306 @@ class NoteHighway(Widget):
         _label("L", left_mid, y_mid + half_h / 2, "center")
 
 
+# --- pace notes (--fsd-pace-notes) --------------------------------------------
+# A momentary rally-style callout ("RIGHT 3") that appears a few seconds
+# BEFORE a corner and clears shortly after -- unlike the other three FSD
+# widgets (persistent panels/gauges drawn every frame), this one is
+# EPHEMERAL: most frames draw nothing at all. Designed with a Fable-model
+# creative consult (same process the other three widgets went through --
+# see CLAUDE.md's "The pace notes" design-notes bullet for the full brief
+# and the reasoning behind the specific numbers below).
+#
+# Position: horizontally centered, directly BELOW the note-highway ribbon's
+# own band -- computed from the SAME NOTE_HIGHWAY_* constants NoteHighway's
+# own draw() uses for its bottom edge, whether or not --fsd-note-highway is
+# actually enabled in a given run (every FSD overlay pass is its own blind,
+# independent compositing step -- see NoteHighway's own placement comment
+# above for why placement has to come from fixed, hand-designed regions,
+# not measured live against whatever else happens to be present). This
+# clears every other overlay's fixed region by construction: TL hero label,
+# TR StreakScoreboard, BL --gauge, BR FrictionCircle, and the NoteHighway
+# ribbon strip itself, whether or not it's actually drawn this run.
+PACE_NOTES_GAP_PX = NOTE_HIGHWAY_GAP_PX   # reuses the exact gap constant
+                                          # NoteHighway uses above itself --
+                                          # same gap, below the ribbon's own
+                                          # (real or assumed) band.
+PACE_NOTES_PAD_FRAC = 0.20               # inner panel padding, as a fraction
+                                          # of the primary line's own height.
+PACE_NOTES_PRIMARY_H_FRAC = 0.085        # primary line band height, as a
+                                          # fraction of the tile's height --
+                                          # shorter than the ribbon's own
+                                          # NOTE_HIGHWAY_HEIGHT_FRAC (0.11),
+                                          # since this is one short line of
+                                          # bold text, not a plotted chart.
+PACE_NOTES_CHAIN_H_FRAC = 0.62           # the smaller "into LEFT 4" chain
+                                          # line's height, as a fraction of
+                                          # the primary line's own height.
+
+# Timing (Fable's recommendation): a corner on this codebase's real
+# mountain-road test footage typically lasts a few seconds (see
+# CornerCounter's own real-footage notes in CLAUDE.md), and a real rally
+# co-driver calls a note a couple of seconds ahead of the corner it
+# describes.
+PACE_NOTES_LEAD_SECONDS = 2.5      # callout appears this many seconds BEFORE
+                                    # the corner's real start.
+PACE_NOTES_HOLD_SECONDS = 1.0      # the callout's OUTER window (fade-in
+                                    # start through fade-out end) extends
+                                    # this many seconds AFTER the corner's
+                                    # start (anchored to START, not END --
+                                    # see tesla_fsd_metrics.pace_note_window's
+                                    # own docstring for why) -- NOT how long
+                                    # it stays at FULL opacity: the fade-out
+                                    # ramp runs INSIDE this window's last
+                                    # PACE_NOTES_FADE_OUT_SECONDS, so the
+                                    # callout is actually fully gone by
+                                    # HOLD_SECONDS after the corner's start,
+                                    # and full opacity itself ends at
+                                    # HOLD_SECONDS - FADE_OUT_SECONDS.
+PACE_NOTES_FADE_IN_SECONDS = 0.3   # ~3 render frames
+PACE_NOTES_FADE_OUT_SECONDS = 0.6  # ~6 render frames -- this ramp runs
+                                    # INSIDE the last FADE_OUT_SECONDS of the
+                                    # HOLD_SECONDS window above, not after it.
+PACE_NOTES_LONG_SECONDS = 4.0      # a corner lasting at least this long gets
+                                    # a "LONG" suffix on its callout.
+PACE_NOTES_CHAIN_GAP_SECONDS = 2.0  # two corners chain into one callout
+                                    # ("RIGHT 3" + a smaller "into LEFT 4")
+                                    # when no more than this many seconds
+                                    # separate them.
+PACE_NOTES_MIN_CORNER_SECONDS = 0.7  # corners shorter than this are dropped
+                                    # entirely -- a blip too short to be
+                                    # worth a rally call.
+
+# Derived from RENDER_STEP_SECONDS (module-level, above), same reasoning
+# FRICTION_CIRCLE_TRAIL_LEN/NOTE_HIGHWAY_PAST_N already document: change one
+# without the other and a "2.5 second" lead silently becomes a different
+# duration, with nothing to catch the drift.
+PACE_NOTES_LEAD_N = round(PACE_NOTES_LEAD_SECONDS / RENDER_STEP_SECONDS)
+PACE_NOTES_HOLD_N = round(PACE_NOTES_HOLD_SECONDS / RENDER_STEP_SECONDS)
+PACE_NOTES_FADE_IN_N = round(PACE_NOTES_FADE_IN_SECONDS / RENDER_STEP_SECONDS)
+PACE_NOTES_FADE_OUT_N = round(PACE_NOTES_FADE_OUT_SECONDS / RENDER_STEP_SECONDS)
+PACE_NOTES_LONG_N = round(PACE_NOTES_LONG_SECONDS / RENDER_STEP_SECONDS)
+PACE_NOTES_CHAIN_GAP_N = round(PACE_NOTES_CHAIN_GAP_SECONDS / RENDER_STEP_SECONDS)
+PACE_NOTES_MIN_CORNER_N = round(PACE_NOTES_MIN_CORNER_SECONDS / RENDER_STEP_SECONDS)
+
+PACE_NOTES_BG = (0, 0, 0, 190)             # slightly denser than the persistent
+                                            # panels' 160/180 -- an ephemeral
+                                            # callout has to pop against
+                                            # moving road, on screen only
+                                            # briefly.
+PACE_NOTES_TEXT_RGB = (255, 255, 255, 255)
+PACE_NOTES_CHAIN_LABEL_RGB = (255, 255, 255, 190)  # "into"/direction word on
+                                            # the smaller chain line -- a
+                                            # notch dimmer than the primary
+                                            # line's own white, so the
+                                            # primary call still reads as
+                                            # the main event.
+# Grade color: reuses the scoreboard's established red/amber/green severity
+# language -- 1-2 (tightest, most dramatic) red, 3-4 amber, 5-6 (loosest)
+# green. Only the grade NUMBER is colored; the direction word and chevron
+# stay white, so color always answers "how sharp", chevron/word answer
+# "which way".
+PACE_NOTES_GRADE_COLORS = {1: (255, 90, 70, 255), 2: (255, 90, 70, 255),
+                           3: (255, 190, 70, 255), 4: (255, 190, 70, 255),
+                           5: (120, 220, 140, 255), 6: (120, 220, 140, 255)}
+
+
+class PaceNotes(Widget):
+    """The rally pace-notes showcase visual (--widget pace-notes,
+    --fsd-pace-notes): a momentary text callout -- "RIGHT 3", with a
+    direction chevron and a color-coded severity number -- that appears
+    PACE_NOTES_LEAD_SECONDS before a corner starts and is fully gone by
+    PACE_NOTES_HOLD_SECONDS after (the PACE_NOTES_FADE_OUT_SECONDS fade-out
+    ramp runs INSIDE that window, not after it -- see PACE_NOTES_HOLD_
+    SECONDS' own comment), the way a real rally co-driver reads a note just
+    ahead of the driver rather than displaying it continuously.
+
+    Unlike the other three FSD widgets (persistent panels drawn every
+    frame), this one draws NOTHING on most frames -- see draw()'s own early
+    return. All of the actual detection/grading/chaining/timing math is
+    precomputed ONCE in main() (fsd_metrics.segment_corners ->
+    fsd_metrics.build_pace_notes, over the WHOLE lateral_g_timeline,
+    mirroring NoteHighway's own "needs the whole drive up front"
+    architecture -- see its class docstring) and handed in as `notes`;
+    draw() only ever does a pure lookup (fsd_metrics.active_pace_note /
+    pace_note_alpha) against the current self._index, using the exact same
+    self._index-incremented-once-per-draw() pattern FrictionCircle/
+    NoteHighway already established.
+
+    "Animation" across successive 0.1s-apart frames is ALPHA ONLY -- no
+    position slide, no size change -- computed by pace_note_alpha and
+    applied uniformly to every shape's fill color via _fade() below. This is
+    the same direct-RGBA-on-transparent-canvas technique the friction
+    circle's fading trail already proved composites correctly against real
+    rendered frames (see FrictionCircle's own docstring): SingleBuffer
+    starts each frame fully transparent, so a faded fill's alpha is written
+    to the frame as-is and ffmpeg's overlay filter blends it correctly.
+
+    Direction: the chevron points, and is drawn on, the side matching the
+    corner's direction (left-pointing at the panel's own left edge for a
+    left corner, right-pointing at the right edge for a right corner) --
+    `Corner.direction` (tesla_fsd_metrics) already carries the correct sign,
+    itself derived by CALLING g_to_offset (not re-deriving the convention
+    independently -- see segment_corners' own docstring for why that
+    matters, and CLAUDE.md for the history of this exact mistake class in
+    this codebase).
+    """
+
+    def __init__(self, entry, font, notes,
+                lead_n=PACE_NOTES_LEAD_N, hold_n=PACE_NOTES_HOLD_N,
+                fade_in_n=PACE_NOTES_FADE_IN_N, fade_out_n=PACE_NOTES_FADE_OUT_N):
+        self.entry = entry
+        self.font = font
+        self.notes = notes
+        self.lead_n = lead_n
+        self.hold_n = hold_n
+        self.fade_in_n = fade_in_n
+        self.fade_out_n = fade_out_n
+        self._index = 0
+
+    @staticmethod
+    def _fade(rgba, alpha):
+        """Scale an RGBA fill's own alpha channel by `alpha` (0.0-1.0) --
+        the entire appear/clear "animation" (see the class docstring)."""
+        r, g, b, a = rgba
+        return (r, g, b, max(0, min(255, round(a * alpha))))
+
+    @staticmethod
+    def _segments_width(draw, segments, font):
+        total = 0
+        for text, _color in segments:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            total += bbox[2] - bbox[0]
+        return total
+
+    @staticmethod
+    def _draw_segments(draw, x, y, segments, font):
+        """Draw a left-to-right run of (text, color) segments sharing one
+        font/baseline, e.g. white "RIGHT " followed by a color-coded grade
+        digit -- `y` is the already-metrics-adjusted top (see draw()'s own
+        callers, which measure the FULL concatenated text once so every
+        segment sits on one consistent baseline rather than each segment
+        re-centering itself slightly differently)."""
+        cur_x = x
+        for text, color in segments:
+            draw.text((cur_x, y), text, font=font, fill=color)
+            bbox = draw.textbbox((0, 0), text, font=font)
+            cur_x += bbox[2] - bbox[0]
+        return cur_x - x
+
+    def draw(self, image, draw):
+        index = self._index
+        self._index += 1  # advance for the NEXT draw() call -- same pattern
+                          # FrictionCircle/NoteHighway already use.
+
+        note = fsd_metrics.active_pace_note(self.notes, index, self.lead_n, self.hold_n)
+        if note is None:
+            return  # the common case: most frames show no callout at all.
+        # Identity lookup (not list.index/`==`), so a value-equal PaceNote
+        # elsewhere in the list could never be mismatched to this one --
+        # pace_note_alpha needs the note's own INDEX (not just the note
+        # itself) so it can consult the exact same possibly-truncated-
+        # against-its-successor window active_pace_note already used to
+        # select it (see visible_window's docstring for why keeping these
+        # two independently re-derive the window is exactly the
+        # inconsistency this guards against).
+        i = next(idx for idx, n in enumerate(self.notes) if n is note)
+        alpha = fsd_metrics.pace_note_alpha(self.notes, i, index, self.lead_n, self.hold_n,
+                                            self.fade_in_n, self.fade_out_n)
+        if alpha <= 0.0:
+            return
+
+        img_w, img_h = image.size
+
+        # Same fixed-known-heights placement NoteHighway's own draw() uses
+        # for ITS bottom edge -- computed here whether or not
+        # --fsd-note-highway is actually enabled this run (see the module
+        # comment above), so this panel's position never depends on what
+        # else happens to be composited alongside it.
+        scoreboard_bottom = SCOREBOARD_MARGIN + round(img_h * SCOREBOARD_PANEL_H_FRAC)
+        ribbon_y2 = (max(NOTE_HIGHWAY_HERO_LABEL_CLEARANCE_PX, scoreboard_bottom)
+                    + NOTE_HIGHWAY_GAP_PX + round(img_h * NOTE_HIGHWAY_HEIGHT_FRAC))
+        y1 = ribbon_y2 + PACE_NOTES_GAP_PX
+
+        primary_h = max(2, round(img_h * PACE_NOTES_PRIMARY_H_FRAC))
+        chained = note.chain_grade is not None
+        chain_h = max(1, round(primary_h * PACE_NOTES_CHAIN_H_FRAC)) if chained else 0
+        chain_gap = max(1, round(primary_h * 0.15)) if chained else 0
+        panel_h = primary_h + chain_gap + chain_h
+
+        pad = max(2, round(primary_h * PACE_NOTES_PAD_FRAC))
+        primary_font_size = max(10, round(primary_h * 0.55))
+        primary_font = self.font.font_variant(size=primary_font_size)
+        chain_font_size = max(8, round(primary_font_size * 0.65))
+        chain_font = self.font.font_variant(size=chain_font_size)
+
+        direction = note.corner.direction
+        dir_word = "RIGHT" if direction >= 0 else "LEFT"
+        grade_color = self._fade(PACE_NOTES_GRADE_COLORS[note.grade], alpha)
+        text_color = self._fade(PACE_NOTES_TEXT_RGB, alpha)
+
+        primary_segments = [(f"{dir_word} ", text_color), (str(note.grade), grade_color)]
+        if note.long:
+            primary_segments.append((" LONG", text_color))
+        primary_text = "".join(t for t, _ in primary_segments)
+
+        chevron_size = max(6, round(primary_font_size * 0.55))
+        chevron_gap = max(2, round(primary_font_size * 0.3))
+        text_w = self._segments_width(draw, primary_segments, primary_font)
+        primary_content_w = chevron_size + chevron_gap + text_w
+
+        chained_segments = []
+        chain_text_w = 0
+        if chained:
+            chain_dir_word = "RIGHT" if note.chain_direction >= 0 else "LEFT"
+            chain_label_color = self._fade(PACE_NOTES_CHAIN_LABEL_RGB, alpha)
+            chain_grade_color = self._fade(PACE_NOTES_GRADE_COLORS[note.chain_grade], alpha)
+            chained_segments = [("into ", chain_label_color),
+                                (f"{chain_dir_word} ", chain_label_color),
+                                (str(note.chain_grade), chain_grade_color)]
+            chain_text_w = self._segments_width(draw, chained_segments, chain_font)
+
+        panel_w = max(2, max(primary_content_w, chain_text_w) + 2 * pad)
+        x1 = round(img_w / 2 - panel_w / 2)
+        x2 = x1 + panel_w
+        y2 = y1 + panel_h
+
+        radius = max(2, round(primary_h * 0.25))
+        draw.rounded_rectangle([x1, y1, x2, y2], radius=radius,
+                               fill=self._fade(PACE_NOTES_BG, alpha))
+
+        # Primary line: chevron on the side matching direction (see the
+        # class docstring), text centered as a block (chevron + gap + text)
+        # in the panel. Vertical position measured once off the FULL
+        # concatenated primary text so every segment shares one baseline.
+        pbbox = draw.textbbox((0, 0), primary_text, font=primary_font)
+        primary_text_h = pbbox[3] - pbbox[1]
+        primary_y = y1 + (primary_h - primary_text_h) / 2 - pbbox[1]
+        chevron_y = y1 + primary_h / 2
+        content_x1 = round(img_w / 2 - primary_content_w / 2)
+        if direction >= 0:
+            self._draw_segments(draw, content_x1, primary_y, primary_segments, primary_font)
+            base_x = content_x1 + text_w + chevron_gap
+            tip_x = base_x + chevron_size
+        else:
+            tip_x = content_x1
+            base_x = content_x1 + chevron_size
+            self._draw_segments(draw, base_x + chevron_gap, primary_y,
+                                primary_segments, primary_font)
+        draw.polygon([(base_x, chevron_y - chevron_size / 2),
+                     (tip_x, chevron_y),
+                     (base_x, chevron_y + chevron_size / 2)],
+                    fill=text_color)
+
+        if chained:
+            chain_text = "".join(t for t, _ in chained_segments)
+            cbbox = draw.textbbox((0, 0), chain_text, font=chain_font)
+            chain_text_h = cbbox[3] - cbbox[1]
+            chain_y = (y1 + primary_h + chain_gap + (chain_h - chain_text_h) / 2
+                      - cbbox[1])
+            chain_x = round(img_w / 2 - chain_text_w / 2)
+            self._draw_segments(draw, chain_x, chain_y, chained_segments, chain_font)
+
+
 class FsdDiagnosticText(Widget):
     """Throwaway diagnostic overlay: plain text proving lateral_g/
     longitudinal_g/hands_free_seconds/corner_count all reach a widget with
@@ -809,7 +1112,7 @@ class FsdDiagnosticText(Widget):
             )
 
 
-def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None):
+def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None, notes=None):
     """Returns a `create_widgets(entry)` callable of the shape Overlay()
     (gopro_overlay/layout.py) expects -- proven directly usable outside the
     XML layout system by the library's own non-XML speed_awareness_layout
@@ -821,10 +1124,10 @@ def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None):
     `widget`: "scoreboard" (default, --widget) builds the real StreakScoreboard
     showcase visual; "friction-circle" builds the FrictionCircle G-meter
     showcase visual; "note-highway" builds the NoteHighway cornering-ribbon
-    showcase visual; "diagnostic" keeps FsdDiagnosticText available (not
-    deleted) for future debugging of the one still-deferred FSD-overlay idea
-    (pace-notes), which will want the same kind of raw-value
-    proof-of-plumbing check this branch's own verification relied on.
+    showcase visual; "pace-notes" builds the PaceNotes rally-callout showcase
+    visual; "diagnostic" keeps FsdDiagnosticText available (not deleted) for
+    future debugging, the same kind of raw-value proof-of-plumbing check
+    every one of these widgets relied on during its own verification.
 
     `lateral_g_timeline`: the full-drive lateral_g array NoteHighway needs
     (see its own class docstring for why) -- unlike every other widget here,
@@ -833,17 +1136,24 @@ def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None):
     required (non-None) when `widget == "note-highway"`; every other widget
     ignores this parameter entirely.
 
-    NOTE: a design note worth revisiting now that all four FSD showcase
-    visuals exist (scoreboard, friction-circle, note-highway, and the
-    still-deferred pace-notes) -- `--gauge --fsd-scoreboard
-    --fsd-friction-circle --fsd-note-highway` together now means FOUR
-    sequential hero-tile re-encode generations (build_fsd_overlay/
+    `notes`: the precomputed list of tesla_fsd_metrics.PaceNote PaceNotes
+    needs (see its own class docstring) -- built once in main() from the
+    SAME full-drive lateral_g timeline NoteHighway uses (fsd_metrics.
+    segment_corners -> fsd_metrics.build_pace_notes), for the same "the
+    widget needs to know the future" reason. Only required (non-None) when
+    `widget == "pace-notes"`; every other widget ignores this parameter too.
+
+    NOTE: a design note flagged during the friction-circle review and
+    revisited at each subsequent widget -- `--gauge --fsd-scoreboard
+    --fsd-friction-circle --fsd-note-highway --fsd-pace-notes` together now
+    means FIVE sequential hero-tile re-encode generations (build_fsd_overlay/
     build_gauge_overlay each subprocess out their own full video re-encode).
-    Flagged during the friction-circle review and deferred until a second
-    widget existed to make it concrete; worth reconsidering now: combining
-    multiple FSD widgets into ONE compositing pass (one Overlay with several
-    widgets in its list, same as this function already returns a list) would
-    cut that to one re-encode regardless of how many flags are combined.
+    Still not done: combining multiple FSD widgets into ONE compositing pass
+    (one Overlay with several widgets in its list, same as this function
+    already returns a list) would cut that to one re-encode regardless of
+    how many flags are combined. Worth doing now that all four FSD showcase
+    visuals exist and no more are planned -- there's no longer a "wait for
+    the next one" reason to defer it further.
     """
     text_font = font.font_variant(size=22)
 
@@ -854,6 +1164,8 @@ def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None):
             return [FrictionCircle(entry, font)]
         if widget == "note-highway":
             return [NoteHighway(entry, font, lateral_g_timeline)]
+        if widget == "pace-notes":
+            return [PaceNotes(entry, font, notes)]
         return [StreakScoreboard(entry, font)]
 
     return create
@@ -941,12 +1253,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Driver for FSD showcase overlays: decodes the GPX "
                     "repurposed-tag -> lateral_g/longitudinal_g/"
                     "autopilot_engaged -> derived-metric pipeline and "
-                    "composites the streak-scoreboard, friction-circle, or "
-                    "note-highway showcase visual (or, with --widget "
-                    "diagnostic, the original throwaway raw-value text "
-                    "overlay). Invoked by tesla_combine.py's "
+                    "composites the streak-scoreboard, friction-circle, "
+                    "note-highway, or pace-notes showcase visual (or, with "
+                    "--widget diagnostic, the original throwaway raw-value "
+                    "text overlay). Invoked by tesla_combine.py's "
                     "--fsd-scoreboard/--fsd-friction-circle/"
-                    "--fsd-note-highway flags -- see CLAUDE.md.")
+                    "--fsd-note-highway/--fsd-pace-notes flags -- see CLAUDE.md.")
     ap.add_argument("input", type=Path, help="hero camera video (e.g. the "
                     "*-front-combined.mp4 tesla_combine.py already produces)")
     ap.add_argument("output", type=Path, help="output video path")
@@ -959,11 +1271,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="directory containing the ffmpeg/ffprobe binaries "
                         "to use (default: PATH)")
     ap.add_argument("--widget", default="scoreboard",
-                    choices=["scoreboard", "diagnostic", "friction-circle", "note-highway"],
+                    choices=["scoreboard", "diagnostic", "friction-circle",
+                            "note-highway", "pace-notes"],
                     help="which overlay to draw (default: scoreboard). scoreboard: the real "
                         "streak-scoreboard showcase visual. friction-circle: the G-G diagram "
                         "showcase visual. note-highway: the cornering-severity ribbon showcase "
-                        "visual. diagnostic: the original "
+                        "visual. pace-notes: the rally-style callout showcase visual. "
+                        "diagnostic: the original "
                         "throwaway raw-value text overlay, kept for debugging.")
     return ap
 
@@ -1013,22 +1327,34 @@ def main(argv=None) -> int:
     frame_meta.process(make_axis_decode_processor())
     frame_meta.process(make_stateful_processor())
 
-    # NoteHighway (--widget note-highway) needs the WHOLE drive's lateral_g
-    # timeline up front, not just the current entry() -- see its own class
-    # docstring. Built here, exactly once, as a single list comprehension:
-    # AFTER both process() passes above (so every entry's .lateral_g is
-    # already populated) and BEFORE Overlay() is constructed below (so the
-    # widget has it at draw time, not just at some later point). frame_meta[i]
+    # NoteHighway (--widget note-highway) AND PaceNotes (--widget pace-notes)
+    # both need the WHOLE drive's lateral_g timeline up front, not just the
+    # current entry() -- see NoteHighway's own class docstring for why. Built
+    # here, exactly once, as a single list comprehension: AFTER both
+    # process() passes above (so every entry's .lateral_g is already
+    # populated) and BEFORE Overlay() is constructed below (so a widget has
+    # it at draw time, not just at some later point). frame_meta[i]
     # (FrameMeta.__getitem__, gopro_overlay/framemeta.py) returns entries in
     # framelist order -- the same order/cadence the render loop's own
     # stepper below walks in lockstep with (confirmed empirically -- see
     # NoteHighway's own class docstring) -- so index i here is exactly the
-    # array position NoteHighway's self._index will reach on draw-call i.
+    # array position a widget's own self._index will reach on draw-call i.
     # Only built when actually needed: for every other widget this would be
     # a wasted O(len(frame_meta)) allocation.
     lateral_g_timeline = None
-    if args.widget == "note-highway":
+    notes = None
+    if args.widget in ("note-highway", "pace-notes"):
         lateral_g_timeline = [frame_meta[i].lateral_g for i in range(len(frame_meta))]
+    if args.widget == "pace-notes":
+        # segment_corners/build_pace_notes are pure, offline, one-pass
+        # functions over the whole timeline (see their own docstrings in
+        # tesla_fsd_metrics.py) -- PaceNotes' draw() then does nothing but a
+        # cheap lookup against this precomputed list every render step.
+        corners = fsd_metrics.segment_corners(lateral_g_timeline,
+                                              min_samples=PACE_NOTES_MIN_CORNER_N)
+        notes = fsd_metrics.build_pace_notes(corners, PACE_NOTES_LONG_N,
+                                             PACE_NOTES_CHAIN_GAP_N)
+        log(f"Pace notes: {len(notes)} callout(s) from {len(corners)} corner(s)")
 
     output: Path = args.output
     output.unlink(missing_ok=True)
@@ -1074,7 +1400,8 @@ def main(argv=None) -> int:
     progress = ProgressBarProgress("Render")
 
     overlay = Overlay(framemeta=frame_meta,
-                      create_widgets=create_widgets_for(font, args.widget, lateral_g_timeline))
+                      create_widgets=create_widgets_for(font, args.widget,
+                                                       lateral_g_timeline, notes))
 
     progress.start(len(stepper))
     with ffmpeg.generate() as writer:
