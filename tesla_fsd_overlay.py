@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""tesla_fsd_overlay.py — foundation driver for FSD showcase overlays.
+"""tesla_fsd_overlay.py — driver for FSD showcase overlays.
 
-Proves, end to end, that Tesla's per-frame G-force/autopilot telemetry (SEI
--> tesla_gps.write_gpx()'s repurposed GPX tags -> gopro-overlay's GPX-based
-pipeline -> tesla_fsd_metrics' pure decode/derivation -> a widget) can drive a
-real composited video. NOT a user-facing tesla_combine.py flag yet, and NOT
-any of the four real showcase ideas' (friction circle, hands-free/corner-count
-scoreboard, note-highway ribbon, pace-notes) final visual design -- each of
-those is its own follow-up branch's job. This branch only proves the plumbing
-and gives them a shared, tested foundation. See CLAUDE.md for the full design
-rationale (axis mapping, GPX tag repurposing, why gopro-dashboard.py's CLI
-can't carry any of this on its own).
+Wired into tesla_combine.py's CLI as `--fsd-scoreboard` (first of the four
+FSD-showcase visuals to actually ship): proves, end to end, that Tesla's
+per-frame G-force/autopilot telemetry (SEI -> tesla_gps.write_gpx()'s
+repurposed GPX tags -> gopro-overlay's GPX-based pipeline -> tesla_fsd_metrics'
+pure decode/derivation -> a widget) can drive a real composited video, and
+draws the real "streak scoreboard" visual (StreakScoreboard, --widget
+scoreboard, the default) -- an accumulating hands-free/corner/peak-G/takeover
+stat line. The three still-deferred showcase ideas (friction circle,
+note-highway ribbon, pace-notes) are each their own follow-up branch's job;
+FsdDiagnosticText (--widget diagnostic) is kept around, not deleted, for
+debugging those. See CLAUDE.md for the full design rationale (axis mapping,
+GPX tag repurposing, why gopro-dashboard.py's CLI can't carry any of this on
+its own).
 
 Must run under ./.venv (gopro-overlay installed there, not under the system
 Python tesla_combine.py itself uses) -- same venv-boundary reason `--map`/
 `--gauge` already subprocess out to gopro-dashboard.py:
 
     ./.venv/bin/python tesla_fsd_overlay.py <input-video> <output> \\
-        --gpx <path> --font <path> --ffmpeg-dir <dir>
+        --gpx <path> --font <path> --ffmpeg-dir <dir> [--widget scoreboard|diagnostic]
 
 `<input-video>` is a hero-camera video (e.g. tesla_combine.py's own
 `*-front-combined.mp4`); `--gpx` is a GPX written by tesla_gps.write_gpx()
@@ -32,8 +35,8 @@ code path closely (loading, FFMPEGOverlayVideo, the stepper/SingleBuffer/
 Overlay.draw render loop) -- each piece read verbatim from the installed
 gopro-overlay 0.134.0 package this branch was built against, and ported
 near-verbatim since it's already a proven-working loop body. What's new here
-is the two process() passes decoding/deriving the FSD fields, and
-FsdDiagnosticText in place of an XML-driven layout.
+is the two process() passes decoding/deriving the FSD fields, and the
+StreakScoreboard/FsdDiagnosticText widgets in place of an XML-driven layout.
 """
 
 from __future__ import annotations
@@ -84,6 +87,144 @@ def find_font() -> str:
     fatal("No usable font found; pass --font explicitly.")
 
 
+# --- streak scoreboard (--widget scoreboard, the default) -------------------
+# A single-line dark rounded panel, top-right of the hero tile -- matching
+# --gauge's established visual language (tesla_combine.py's GAUGE_* panel is
+# bg=(0,0,0,180)-ish translucent), but purpose-built here as a directly-drawn
+# widget rather than a gopro-overlay XML layout: --gauge's dial/compass/chart
+# each need real widget geometry, this is one line of styled text, so a
+# hand-rolled PIL draw is simpler than a layout XML round-trip for it.
+#
+# Position: TOP-RIGHT, deliberately not top-left. tesla_combine.py's grid
+# filter graph (_tile_chain) draws the hero tile's own "FRONT"-style label at
+# x=20:y=20 (HERO_FONT_SIZE=64) AFTER this compositing step runs (this script
+# only ever sees the bare hero video -- the grid label doesn't exist yet at
+# this point in the pipeline) -- so a top-left scoreboard here would collide
+# with that later-drawn label. Top-right avoids that collision AND --gauge's
+# own bottom-left panel, so `--gauge --fsd-scoreboard` together (which
+# tesla_combine.py chains sequentially, gauge first) don't overlap either.
+#
+# Every fraction below started as a synthetic-render estimate (same status
+# GAUGE_PANEL_W_FRAC etc started with in tesla_combine.py) and has since been
+# confirmed against real rendered frames -- both the tall grid and
+# --landscape, alone and combined with --gauge -- legible, no overflow, no
+# collision with the hero label or --gauge's panel in any of those.
+SCOREBOARD_PANEL_W_FRAC = 0.85   # panel width, as a fraction of the tile width -- wide,
+                                 # because a single line carrying the badge plus four
+                                 # stats needs the room; measured to comfortably fit the
+                                 # worst-case text length (a >1hr hands-free readout) at
+                                 # SCOREBOARD_FONT_SCALE across every tile size tested.
+SCOREBOARD_PANEL_H_FRAC = 0.07   # panel height, as a fraction of the tile height --
+                                 # a single line, so much shorter than --gauge's
+                                 # 4-section GAUGE_PANEL_H_FRAC (0.17) box.
+SCOREBOARD_MARGIN = 24          # px from the tile's top-right corner (matches GAUGE_MARGIN)
+SCOREBOARD_FONT_SCALE = 0.5     # font size, as a fraction of the panel's inner (post-padding)
+                                 # height -- deliberately well under 1.0 so the line's real
+                                 # measured width (not just its height) fits inside
+                                 # SCOREBOARD_PANEL_W_FRAC's panel at typical tile sizes.
+
+SCOREBOARD_PANEL_BG = (0, 0, 0, 180)         # translucent dark panel, matching --gauge
+SCOREBOARD_ENGAGED_BG = (20, 130, 40, 230)   # badge: green tint while FSD is engaged
+SCOREBOARD_DISENGAGED_BG = (110, 45, 45, 230)  # badge: gray/red tint while not engaged
+
+
+class StreakScoreboard(Widget):
+    """The real "streak scoreboard" showcase visual: an accumulating stat
+    line -- hands-free time, corner count, peak cornering G, takeover count --
+    that builds a visible track record on screen as the drive progresses.
+    Replaces FsdDiagnosticText as the default draw target (see --widget).
+
+    One dark translucent panel (SCOREBOARD_PANEL_BG, rounded corners) holding
+    a color-coded "FSD ENGAGED"/"FSD OFF" badge chip (green while engaged,
+    gray/red while not) followed by plain white stats text. Geometry is
+    computed from the actual frame size at draw time (not a fixed layout),
+    so it works unchanged for both the tall grid's full-width hero row and
+    landscape's native-res hero block -- same approach write_gauge_layout
+    takes via tile_w/tile_h, just resolved here from `image.size` instead of
+    a size passed in, since this widget composites directly rather than
+    going through a gopro-overlay XML layout.
+
+    KNOWN LIMITATION: the takeover count follows TakeoverCounter, which
+    (per tesla_fsd_metrics.TakeoverCounter's own docstring and CLAUDE.md) has
+    never been exercised against a real disengagement event -- every drive
+    probed so far stayed engaged throughout. The rest of the line (hands-free
+    time, corner count, peak G) IS verified against real footage.
+    """
+
+    PAD_FRAC = 0.18        # inner panel padding, as a fraction of panel height
+    BADGE_PAD_FRAC = 0.35  # badge chip's horizontal text padding, as a fraction of font size
+    GAP_FRAC = 0.5         # gap between the badge and the stats text, as a fraction of font size
+
+    def __init__(self, entry, font):
+        self.entry = entry
+        self.font = font
+
+    def draw(self, image, draw):
+        e = self.entry()
+        engaged = bool(e.autopilot_engaged)
+        hands_free = fsd_metrics.format_hms(e.hands_free_seconds or 0.0)
+        corners = e.corner_count or 0
+        peak = e.peak_lateral_g or 0.0
+        takeovers = e.takeover_count or 0
+
+        img_w, img_h = image.size
+        panel_w = max(2, round(img_w * SCOREBOARD_PANEL_W_FRAC))
+        panel_h = max(2, round(img_h * SCOREBOARD_PANEL_H_FRAC))
+        x2 = img_w - SCOREBOARD_MARGIN
+        x1 = x2 - panel_w
+        y1 = SCOREBOARD_MARGIN
+        y2 = y1 + panel_h
+
+        pad = max(4, round(panel_h * self.PAD_FRAC))
+        radius = max(2, round(panel_h * 0.2))
+        draw.rounded_rectangle([x1, y1, x2, y2], radius=radius, fill=SCOREBOARD_PANEL_BG)
+
+        font_size = max(8, round((panel_h - 2 * pad) * SCOREBOARD_FONT_SCALE))
+
+        badge_text = "FSD ENGAGED" if engaged else "FSD OFF"
+        stats_text = (f"hands-free {hands_free} · corner {corners} · "
+                      f"peak {peak:.2f}g · takeovers {takeovers}")
+
+        # SCOREBOARD_PANEL_W_FRAC/FONT_SCALE were sized to fit this line
+        # comfortably (see their comments), but that was checked against
+        # Menlo -- a monospace font this project always finds first
+        # (FONT_CANDIDATES). If a caller ever loads a wider, proportional
+        # fallback font, or a tile size well outside what's been tested,
+        # this shrinks the font a step at a time until the real measured
+        # width (via textbbox, not assumed) fits inside the panel, rather
+        # than silently letting text run past the right edge.
+        gap = max(2, round(font_size * self.GAP_FRAC))
+        badge_pad = max(2, round(font_size * self.BADGE_PAD_FRAC))
+        available_w = (x2 - pad) - (x1 + pad) - 2 * badge_pad - gap
+        font = self.font.font_variant(size=font_size)
+        while font_size > 8:
+            badge_bbox = draw.textbbox((0, 0), badge_text, font=font)
+            stats_bbox = draw.textbbox((0, 0), stats_text, font=font)
+            total_w = (badge_bbox[2] - badge_bbox[0]) + (stats_bbox[2] - stats_bbox[0])
+            if total_w <= available_w:
+                break
+            font_size -= 1
+            badge_pad = max(2, round(font_size * self.BADGE_PAD_FRAC))
+            gap = max(2, round(font_size * self.GAP_FRAC))
+            font = self.font.font_variant(size=font_size)
+
+        badge_bbox = draw.textbbox((0, 0), badge_text, font=font)
+        badge_text_w = badge_bbox[2] - badge_bbox[0]
+        badge_x1, badge_y1 = x1 + pad, y1 + pad
+        badge_x2, badge_y2 = badge_x1 + badge_text_w + 2 * badge_pad, y2 - pad
+        badge_bg = SCOREBOARD_ENGAGED_BG if engaged else SCOREBOARD_DISENGAGED_BG
+        draw.rounded_rectangle([badge_x1, badge_y1, badge_x2, badge_y2],
+                               radius=max(2, round((badge_y2 - badge_y1) * 0.25)), fill=badge_bg)
+        badge_text_y = (badge_y1 + (badge_y2 - badge_y1 - (badge_bbox[3] - badge_bbox[1])) / 2
+                        - badge_bbox[1])
+        draw.text((badge_x1 + badge_pad, badge_text_y), badge_text, font=font, fill=(255, 255, 255, 255))
+
+        stats_x = badge_x2 + gap
+        stats_bbox = draw.textbbox((0, 0), stats_text, font=font)
+        stats_text_y = y1 + (panel_h - (stats_bbox[3] - stats_bbox[1])) / 2 - stats_bbox[1]
+        draw.text((stats_x, stats_text_y), stats_text, font=font, fill=(255, 255, 255, 255))
+
+
 class FsdDiagnosticText(Widget):
     """Throwaway diagnostic overlay: plain text proving lateral_g/
     longitudinal_g/hands_free_seconds/corner_count all reach a widget with
@@ -131,18 +272,27 @@ class FsdDiagnosticText(Widget):
             )
 
 
-def create_widgets_for(font):
+def create_widgets_for(font, widget="scoreboard"):
     """Returns a `create_widgets(entry)` callable of the shape Overlay()
     (gopro_overlay/layout.py) expects -- proven directly usable outside the
     XML layout system by the library's own non-XML speed_awareness_layout
     (same file). No XML, no metric_accessor_from lookup, no patching needed:
     entry() is just an Entry whose .lateral_g/.corner_count/etc. attributes
     exist because our own process() passes below put them there (see
-    Entry.__getattr__ in gopro_overlay/entry.py -- no fixed schema at all)."""
+    Entry.__getattr__ in gopro_overlay/entry.py -- no fixed schema at all).
+
+    `widget`: "scoreboard" (default, --widget) builds the real StreakScoreboard
+    showcase visual; "diagnostic" keeps FsdDiagnosticText available (not
+    deleted) for future debugging of the three still-deferred FSD-overlay
+    ideas, which will want the same kind of raw-value proof-of-plumbing check
+    this branch's own verification relied on.
+    """
     text_font = font.font_variant(size=22)
 
     def create(entry):
-        return [FsdDiagnosticText(Coordinate(24, 24), entry, text_font)]
+        if widget == "diagnostic":
+            return [FsdDiagnosticText(Coordinate(24, 24), entry, text_font)]
+        return [StreakScoreboard(entry, font)]
 
     return create
 
@@ -185,6 +335,7 @@ def make_stateful_processor():
     """
     counter = fsd_metrics.CornerCounter()
     hands_free = fsd_metrics.HandsFreeAccumulator()
+    takeovers = fsd_metrics.TakeoverCounter()
     last_dt = [None]  # single-element list: a mutable cell for the closure
 
     def processor(entry: Entry):
@@ -195,12 +346,22 @@ def make_stateful_processor():
         last_dt[0] = entry.dt
 
         counter.update(entry.lateral_g)
+        # hands_free treats an unknown (None) sample as conservative-display
+        # "not engaged" (bool(None) is False) -- fine, since it just skips
+        # accumulating time it can't confirm. takeovers must NOT do the same
+        # coercion: TakeoverCounter.update needs the real None to tell "we
+        # don't know" apart from "confirmed disengaged," or a telemetry gap
+        # (e.g. retime_samples' edge-hold pad) reads as a fabricated
+        # takeover -- see TakeoverCounter's docstring for the confirmed bug
+        # this fixes.
         hands_free.update(bool(entry.autopilot_engaged), dt_seconds)
+        takeovers.update(entry.autopilot_engaged)
 
         return {
             "corner_count": counter.corner_count,
             "peak_lateral_g": counter.peak_lateral_g,
             "hands_free_seconds": hands_free.hands_free_seconds,
+            "takeover_count": takeovers.takeover_count,
         }
 
     return processor
@@ -208,11 +369,13 @@ def make_stateful_processor():
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="Foundation driver for FSD showcase overlays: proves the "
-                    "GPX repurposed-tag -> lateral_g/longitudinal_g/"
-                    "autopilot_engaged -> derived-metric pipeline end to end "
-                    "with a throwaway diagnostic text overlay. Not a "
-                    "user-facing tesla_combine.py flag yet -- see CLAUDE.md.")
+        description="Driver for FSD showcase overlays: decodes the GPX "
+                    "repurposed-tag -> lateral_g/longitudinal_g/"
+                    "autopilot_engaged -> derived-metric pipeline and "
+                    "composites the real streak-scoreboard visual (or, with "
+                    "--widget diagnostic, the original throwaway raw-value "
+                    "text overlay). Invoked by tesla_combine.py's "
+                    "--fsd-scoreboard flag -- see CLAUDE.md.")
     ap.add_argument("input", type=Path, help="hero camera video (e.g. the "
                     "*-front-combined.mp4 tesla_combine.py already produces)")
     ap.add_argument("output", type=Path, help="output video path")
@@ -224,6 +387,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ffmpeg-dir", type=Path, default=None,
                     help="directory containing the ffmpeg/ffprobe binaries "
                         "to use (default: PATH)")
+    ap.add_argument("--widget", default="scoreboard", choices=["scoreboard", "diagnostic"],
+                    help="which overlay to draw (default: scoreboard). scoreboard: the real "
+                        "streak-scoreboard showcase visual. diagnostic: the original "
+                        "throwaway raw-value text overlay, kept for debugging.")
     return ap
 
 
@@ -315,7 +482,7 @@ def main(argv=None) -> int:
     stepper = frame_meta.stepper(timeunits(seconds=0.1 * timelapse_correction))
     progress = ProgressBarProgress("Render")
 
-    overlay = Overlay(framemeta=frame_meta, create_widgets=create_widgets_for(font))
+    overlay = Overlay(framemeta=frame_meta, create_widgets=create_widgets_for(font, args.widget))
 
     progress.start(len(stepper))
     with ffmpeg.generate() as writer:

@@ -50,7 +50,7 @@ class FsdFields(NamedTuple):
     """Decoded per-frame FSD telemetry, ready for a widget to read."""
     lateral_g: Optional[float]
     longitudinal_g: Optional[float]
-    autopilot_engaged: bool
+    autopilot_engaged: Optional[bool]
 
 
 def decode_fsd_fields(cad: Optional[float], power: Optional[float],
@@ -64,14 +64,23 @@ def decode_fsd_fields(cad: Optional[float], power: Optional[float],
     `hr` -> autopilot_state -> autopilot_engaged (True only for the one
             confirmed "engaged" state code; see AUTOPILOT_ENGAGED_STATE)
 
-    Missing (None) inputs pass through as None/False rather than raising --
-    a GPX point that predates the repurposed-tag change, or a frame tesla_gps
-    never observed a full SEI sample for, should degrade gracefully rather
-    than crash the whole render.
+    Missing (None) inputs pass through as None -- a GPX point that predates
+    the repurposed-tag change, or a frame tesla_gps never observed a full SEI
+    sample for, should degrade gracefully rather than crash the whole render.
+
+    autopilot_engaged is deliberately Optional[bool], NOT a plain bool that
+    collapses "unknown" into "not engaged": retime_samples nulls this field
+    across its edge-hold pads (a real telemetry gap, e.g. SEI ending before
+    the video does), and a caller that can't tell "we don't know" from "we
+    know it's disengaged" will misread a data gap as a real disengagement --
+    confirmed as a real bug (a phantom takeover_count) when the caller was a
+    plain bool here. TakeoverCounter/CornerCounter must treat this None as
+    "skip this sample," not as False.
     """
     lateral_g = cad / STANDARD_GRAVITY_MPS2 if cad is not None else None
     longitudinal_g = power / STANDARD_GRAVITY_MPS2 if power is not None else None
-    autopilot_engaged = hr is not None and int(round(hr)) == AUTOPILOT_ENGAGED_STATE
+    autopilot_engaged = (None if hr is None
+                         else int(round(hr)) == AUTOPILOT_ENGAGED_STATE)
     return FsdFields(lateral_g=lateral_g, longitudinal_g=longitudinal_g,
                      autopilot_engaged=autopilot_engaged)
 
@@ -132,6 +141,66 @@ class CornerCounter:
         if self._in_corner and magnitude < self.exit_g:
             self._in_corner = False
         return False
+
+
+class TakeoverCounter:
+    """Counts autopilot disengagements: a CONFIRMED engaged -> CONFIRMED
+    not-engaged falling edge, once per edge.
+
+    Unlike CornerCounter, no hysteresis is needed here -- `autopilot_engaged`
+    (tesla_fsd_metrics.decode_fsd_fields) is a clean boolean derived from an
+    SEI state code, not a noisy continuous sensor value that could chatter
+    across a single threshold. It IS, however, Optional -- None means "we
+    don't know," not "disengaged" (see decode_fsd_fields' docstring). This
+    must be None-safe the same way CornerCounter.update already is: a real
+    bug (a phantom takeover_count) was confirmed end-to-end when this method
+    treated a None (e.g. from retime_samples' edge-hold pad, nulled because
+    a telemetry gap is NOT a confirmed disengagement) the same as False --
+    every drive whose SEI coverage ends before the video does would then
+    report a fabricated takeover the instant the pad's None samples begin.
+
+    KNOWN LIMITATION (see CLAUDE.md): every real drive probed so far
+    (17.5km) stayed engaged (autopilot_state == 1) the entire time -- zero
+    real disengagements observed. This class is implemented and
+    unit-testable against synthetic data, but has NOT been verified against
+    a real disengagement event. "Looks right in a synthetic test" is not the
+    same claim as "confirmed against reality."
+    """
+
+    def __init__(self):
+        self.takeover_count = 0
+        self._engaged = False
+
+    def update(self, engaged: Optional[bool]) -> bool:
+        """Feed one autopilot_engaged sample (None-safe -- an unknown sample
+        neither counts as a takeover nor changes the tracked state, so a
+        stretch of missing telemetry can never itself look like a
+        disengagement).
+
+        Returns True on the exact sample that incremented takeover_count (a
+        confirmed engaged -> confirmed not-engaged falling edge), False
+        otherwise -- staying in either state, a rising (re-engage) edge, or
+        an unknown (None) sample, doesn't count."""
+        if engaged is None:
+            return False
+        counted = self._engaged and not engaged
+        if counted:
+            self.takeover_count += 1
+        self._engaged = engaged
+        return counted
+
+
+def format_hms(seconds: float) -> str:
+    """Format a non-negative seconds count as "M:SS" (e.g. "14:32") or,
+    once it reaches an hour, "H:MM:SS" (e.g. "1:04:32") -- the legible-on-
+    screen counterpart to HandsFreeAccumulator's raw hands_free_seconds,
+    used by the scoreboard widget's readout."""
+    total = max(0, int(round(seconds)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 class HandsFreeAccumulator:

@@ -229,6 +229,7 @@ def _tools_args(**kw):
     a.map_mag = 2.0
     a.gauge = False
     a.gauge_units = "mph"
+    a.fsd_scoreboard = False
     a.feature = "front"
     a.__dict__.update(kw)
     return a

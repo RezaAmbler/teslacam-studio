@@ -8,10 +8,13 @@ Guidance for Claude Code working in teslacam-studio. See `README.md` for the use
 A macOS tool that combines a Tesla Sentry/Dashcam event folder (6 per-camera
 `YYYY-MM-DD_HH-MM-SS-<angle>.mp4` clips) into one labeled grid video with a
 burned-in clock, optional face blur, an optional live GPS route-map overlay,
-and an optional speed/compass dashboard overlay.
+an optional speed/compass dashboard overlay, and an optional FSD streak
+scoreboard overlay.
 
 - `tesla_combine.py` — the main compositor (concat → grid via ffmpeg filter_complex).
 - `tesla_gps.py` — standalone SEI→GPX/telemetry extractor (stdlib only, no deps).
+- `tesla_fsd_overlay.py` / `tesla_fsd_metrics.py` — FSD showcase overlay driver
+  (must run under `./.venv`) and its pure-Python metric derivation.
 - `playcheck.sh` — headless playback sanity checks for an output mp4.
 
 ## Environment & setup
@@ -112,12 +115,39 @@ and an optional speed/compass dashboard overlay.
   default. `course_deg` stays unused — the `compass` widget reads `cog`, which
   gopro-overlay computes itself from consecutive lat/lon (geodesic bearing), so
   the compass needs zero data changes, same as the existing map tile.
-- **FSD showcase overlays — foundation (`tesla_fsd_overlay.py` /
-  `tesla_fsd_metrics.py`):** groundwork for four deferred visual ideas (a
-  hands-free/corner-count streak scoreboard, a friction-circle G-force meter,
-  a scrolling "note highway" anticipation ribbon, rally pace-notes), each its
-  own follow-up branch off `fsd-overlay-foundation` — not yet wired into
-  `tesla_combine.py`'s CLI at all. Two findings drove the design:
+- **FSD showcase overlays (`tesla_fsd_overlay.py` / `tesla_fsd_metrics.py`):**
+  groundwork for four planned visual ideas (a hands-free/corner-count streak
+  scoreboard, a friction-circle G-force meter, a scrolling "note highway"
+  anticipation ribbon, rally pace-notes). The first of the four — the streak
+  scoreboard — is now real and wired into `tesla_combine.py`'s CLI as
+  `--fsd-scoreboard` (`fsd-streak-scoreboard` branch, off the merged
+  `fsd-overlay-foundation`); the other three remain each their own follow-up
+  branch's job. `StreakScoreboard` (`tesla_fsd_overlay.py`) replaces the
+  branch's original `FsdDiagnosticText` throwaway plain-text overlay as the
+  default draw target (`--widget scoreboard`, vs. `--widget diagnostic` --
+  the old diagnostic is kept, not deleted, for debugging the next three
+  ideas the same way it helped prove this one's plumbing). It draws a single
+  dark translucent panel, **top-right** of the hero tile: a color-coded "FSD
+  ENGAGED"/"FSD OFF" badge (green while engaged, gray/red while not) followed
+  by hands-free time, corner count, peak cornering G, and takeover count.
+  Top-right is deliberate, not arbitrary: `tesla_combine.py`'s grid filter
+  graph (`_tile_chain`) draws the hero tile's own `"FRONT"`-style label at
+  `x=20:y=20` (`HERO_FONT_SIZE=64`) *after* this compositing step runs (this
+  script only ever sees the bare hero video, not the eventual grid label), so
+  a top-left scoreboard would collide with that later-drawn label; top-right
+  also avoids `--gauge`'s own bottom-left panel, so `--gauge --fsd-scoreboard`
+  together (which `tesla_combine.py` chains sequentially through
+  `angle_paths[hero_angle]` — gauge composites first, scoreboard onto that
+  output next, same pattern `--blur-faces` → `--gauge` already uses) don't
+  overlap either. `TakeoverCounter` (`tesla_fsd_metrics.py`) counts
+  `autopilot_engaged` engaged→not-engaged falling edges, no hysteresis needed
+  (unlike `CornerCounter`) since the input is already a clean boolean, not a
+  noisy continuous value. **Known limitation:** every real drive probed so
+  far (17.5km) stayed engaged the entire time — zero real disengagements
+  observed — so `TakeoverCounter` is implemented and unit-tested against
+  synthetic data only, and has NOT been verified against a real disengagement
+  event. Don't mistake "looks right in a synthetic test" for "confirmed
+  against reality" here. Two findings drove the original foundation's design:
   - **IMU axis mapping resolved with real data**, since Tesla documents none
     of this: correlated 28,000 telemetry points (17.5km of real mountain
     driving) against two independent signals — `linear_acceleration_mps2_x`
@@ -151,7 +181,8 @@ and an optional speed/compass dashboard overlay.
     must run under `./.venv` same as `--map`/`--gauge`'s subprocess
     boundary) built by mirroring `gopro-dashboard.py`'s own `--use-gpx-only
     --input <video>` render loop, with our own `process()` steps and a
-    diagnostic `Widget` instead of XML.
+    directly-drawn `Widget` (`StreakScoreboard`, or `FsdDiagnosticText` under
+    `--widget diagnostic`) instead of XML.
   - **Data plumbing:** only `linear_acceleration_mps2_x/y` and
     `autopilot_state` needed to newly reach the GPX (speed/lat/lon/`cog`
     are already there) — `tesla_gps.write_gpx()` repurposes three more of
@@ -161,11 +192,12 @@ and an optional speed/compass dashboard overlay.
     through to it. `tesla_fsd_metrics.py` (zero `gopro_overlay` dependency,
     stdlib only) decodes those back into `lateral_g`/`longitudinal_g`/
     `autopilot_engaged` and derives `corner_count` (a hysteresis
-    threshold-crossing detector on `|lateral_g|`) and `hands_free_seconds`
-    — kept dependency-free so `tests/` (system Python, no gopro-overlay
-    installed) can test the derivation math directly; `tesla_fsd_overlay.py`
-    unwraps gopro-overlay's `pint` `Quantity` values to plain floats before
-    calling into it.
+    threshold-crossing detector on `|lateral_g|`), `hands_free_seconds`, and
+    (as of `--fsd-scoreboard`) `takeover_count` (`TakeoverCounter`, a plain
+    engaged→not-engaged falling-edge count) — kept dependency-free so `tests/`
+    (system Python, no gopro-overlay installed) can test the derivation math
+    directly; `tesla_fsd_overlay.py` unwraps gopro-overlay's `pint` `Quantity`
+    values to plain floats before calling into it.
 - **Progress (`Progress`, stdlib only):** the run is planned up front as a list of
   `Step(kind, label, work)` (`plan_steps`), `work` in footage-seconds. Fractions
   are never timer guesses — ffmpeg is run with `-progress pipe:1 -loglevel error`
@@ -205,6 +237,33 @@ and an optional speed/compass dashboard overlay.
   correlation itself (not just the plumbing) is a real empirical finding,
   not a spec, and hasn't been cross-checked against a second, independent
   drive yet.
+- `--fsd-scoreboard`/`StreakScoreboard`: verified end-to-end against real
+  footage through the *full integrated* `tesla_combine.py` pipeline (not just
+  the standalone driver) — `--fsd-scoreboard` alone, `--gauge --fsd-scoreboard`
+  together (confirms the chaining order and that neither panel collides with
+  the other or the hero tile's own label), and both again under `--landscape
+  --map` (confirms the widget's frame-size-derived geometry, not a fixed
+  tile-size assumption, really does work unchanged across layouts).
+  `playcheck.sh` clean on every render, including `+faststart` (which the
+  foundation branch's standalone diagnostic script doesn't set, but the
+  integrated pipeline does). `SCOREBOARD_PANEL_W_FRAC`/`_H_FRAC`/
+  `SCOREBOARD_MARGIN` are accordingly tuned, not a starting guess.
+  A second independent review (same process as the foundation branch's) then
+  caught a real bug before commit: `decode_fsd_fields` collapsed a *missing*
+  `autopilot_state` sample (`hr is None` — e.g. `retime_samples`' edge-hold
+  pad, nulled deliberately because a telemetry gap isn't a confirmed
+  disengagement) into a plain `False`, and `TakeoverCounter.update` wasn't
+  None-aware the way `CornerCounter.update` already was — so any drive whose
+  SEI coverage ends before the video does would report a phantom takeover
+  the instant the pad's unknown samples began. Confirmed with an executable
+  repro before the fix (`autopilot_engaged` is now `Optional[bool]`,
+  `TakeoverCounter.update` now short-circuits on `None` exactly like
+  `CornerCounter.update` does). `TakeoverCounter` still can't be verified
+  against a real *disengagement* with currently-available footage (see the
+  bullet above) — that gap is expected to persist past this branch, not just
+  until the next one; the bug just fixed was about *missing data* being
+  misread as a disengagement, a different and now-closed hole from "we've
+  never seen a real one to check against."
 
 ## Gotchas
 - Never commit footage or rendered outputs.

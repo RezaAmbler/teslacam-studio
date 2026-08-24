@@ -506,3 +506,148 @@ def test_encoder_args_quality_high_overrides_oversized_native_no_warning():
     assert "18" in args
     assert "20" not in args
     assert warning is None
+
+
+# --- --fsd-scoreboard: CLI parsing/defaults ----------------------------------
+
+def test_cli_fsd_scoreboard_default_off():
+    args = tc.build_parser().parse_args(["/some/folder"])
+    assert args.fsd_scoreboard is False
+
+
+def test_cli_fsd_scoreboard_flag():
+    args = tc.build_parser().parse_args(["/some/folder", "--fsd-scoreboard"])
+    assert args.fsd_scoreboard is True
+
+
+# --- --fsd-scoreboard + a paired --feature: the die() path in setup_tools ---
+
+def _scoreboard_tools_args(**kw):
+    class A:
+        pass
+    a = A()
+    a.no_labels = False
+    a.blur_faces = False
+    a.map = False
+    a.map_zoom = 19
+    a.map_mag = 2.0
+    a.gauge = False
+    a.gauge_units = "mph"
+    a.fsd_scoreboard = False
+    a.feature = "front"
+    a.__dict__.update(kw)
+    return a
+
+
+def test_fsd_scoreboard_pair_feature_is_rejected(monkeypatch, tmp_path):
+    # Hermetic: stub out real tool discovery (ffmpeg/font/gopro-overlay) so
+    # this exercises only the --fsd-scoreboard + paired --feature validation
+    # itself, not this machine's actual environment. Mirrors
+    # test_gauge.py::test_gauge_pair_feature_is_rejected exactly -- same
+    # restriction, same reasoning (composites onto one hero tile).
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_scoreboard=True, feature="repeaters"))
+
+
+def test_fsd_scoreboard_solo_feature_is_accepted(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    tools = tc.setup_tools(_scoreboard_tools_args(fsd_scoreboard=True, feature="left_pillar"))
+    assert tools.map_venv_py == tmp_path / "py"
+    assert tools.map_gopro == tmp_path / "gopro"
+
+
+def test_fsd_scoreboard_missing_tooling_message_names_the_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (None, None, ["gopro-overlay"]))
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_scoreboard_tools_args(fsd_scoreboard=True))
+
+
+# --- --fsd-scoreboard: filename suffix (build_grid, --dry-run) ---------------
+
+def _scoreboard_grid_plan(tmp_path):
+    """A minimal two-camera Plan good enough to drive build_grid end to end
+    under --dry-run -- no real ffmpeg/footage needed (see this file's own
+    docstring): probe_dims/probe_duration/the actual gopro-overlay subprocess
+    are all skipped on the --dry-run path, and build_filter's composition is
+    pure string-building from dims/paths, so fabricated dims and non-existent
+    video paths are enough to exercise the real code."""
+    selections = {
+        "front": (["front1.mp4"], 0.0, 600.0),
+        "back": (["back1.mp4"], 0.0, 600.0),
+    }
+    dims = {"front": (1280, 960), "back": (1280, 960)}
+    footage = {"front": 600.0, "back": 600.0}
+    plan = tc.Plan(
+        folder=tmp_path, out_dir=tmp_path, session_name="session",
+        by_angle={"front": [], "back": []},
+        session_start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        n_clips=2, in_bytes=0, selections=selections, dims=dims, epoch=0,
+        footage=footage, steps=[],
+    )
+    return plan
+
+
+def test_fsd_scoreboard_filename_suffix(tmp_path):
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-scoreboard", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
+             "scoreboard_s": 0.0, "scoreboard_built": False, "grid_s": 0.0}
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["scoreboard_built"] is True
+    assert "_scoreboard" in out_grid.name
+    assert out_grid.name == "session_grid_scoreboard.mp4"
+
+
+def test_fsd_scoreboard_and_gauge_suffix_order(tmp_path):
+    # --gauge --fsd-scoreboard together chain sequentially through
+    # angle_paths[hero_angle] (gauge composites first); the filename records
+    # both, gauge before scoreboard, matching the chain order.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--gauge", "--fsd-scoreboard", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"), map_gopro=Path("fake-gopro"),
+                     map_font="/System/Library/Fonts/Menlo.ttc")
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
+             "scoreboard_s": 0.0, "scoreboard_built": False, "grid_s": 0.0}
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, final_w, final_h = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                               tmp_path, progress)
+
+    assert stats["gauge_built"] is True
+    assert stats["scoreboard_built"] is True
+    assert out_grid.name == "session_grid_gauge_scoreboard.mp4"

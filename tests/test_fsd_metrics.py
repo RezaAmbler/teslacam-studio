@@ -21,10 +21,14 @@ def test_decode_fsd_fields_converts_mps2_to_g():
 
 def test_decode_fsd_fields_autopilot_only_engaged_for_confirmed_state():
     # Only autopilot_state == 1 is confirmed as "engaged" against real footage
-    # (CLAUDE.md) -- any other observed/absent value must NOT count as engaged.
+    # (CLAUDE.md) -- any other OBSERVED value is a confirmed False, but a
+    # MISSING value (hr=None) must decode to None, not False -- collapsing
+    # "we don't know" into "confirmed disengaged" was a real bug (a phantom
+    # TakeoverCounter takeover across a telemetry gap), see CLAUDE.md and
+    # TakeoverCounter's docstring.
     assert m.decode_fsd_fields(cad=0.0, power=0.0, hr=0).autopilot_engaged is False
     assert m.decode_fsd_fields(cad=0.0, power=0.0, hr=2).autopilot_engaged is False
-    assert m.decode_fsd_fields(cad=0.0, power=0.0, hr=None).autopilot_engaged is False
+    assert m.decode_fsd_fields(cad=0.0, power=0.0, hr=None).autopilot_engaged is None
     assert m.decode_fsd_fields(cad=0.0, power=0.0, hr=1).autopilot_engaged is True
 
 
@@ -32,7 +36,7 @@ def test_decode_fsd_fields_missing_inputs_pass_through_as_none():
     fields = m.decode_fsd_fields(cad=None, power=None, hr=None)
     assert fields.lateral_g is None
     assert fields.longitudinal_g is None
-    assert fields.autopilot_engaged is False
+    assert fields.autopilot_engaged is None
 
 
 def test_decode_fsd_fields_zero_is_not_missing():
@@ -140,3 +144,100 @@ def test_hands_free_accumulator_ignores_nonpositive_dt():
     acc.update(True, 0.0)
     acc.update(True, -1.0)
     assert acc.hands_free_seconds == 0.0
+
+
+# --- TakeoverCounter ----------------------------------------------------------
+
+def test_takeover_counter_starts_at_zero():
+    counter = m.TakeoverCounter()
+    assert counter.takeover_count == 0
+
+
+def test_takeover_counter_engaged_to_disengaged_counts_once():
+    counter = m.TakeoverCounter()
+    edges = [counter.update(v) for v in [True, False]]
+    assert counter.takeover_count == 1
+    assert edges == [False, True]  # fires exactly on the falling edge
+
+
+def test_takeover_counter_disengaged_to_engaged_does_not_count():
+    counter = m.TakeoverCounter()
+    edges = [counter.update(v) for v in [False, True]]
+    assert counter.takeover_count == 0
+    assert edges == [False, False]
+
+
+def test_takeover_counter_staying_engaged_does_not_count():
+    counter = m.TakeoverCounter()
+    for v in [True, True, True, True]:
+        counter.update(v)
+    assert counter.takeover_count == 0
+
+
+def test_takeover_counter_staying_disengaged_does_not_count():
+    counter = m.TakeoverCounter()
+    for v in [False, False, False]:
+        counter.update(v)
+    assert counter.takeover_count == 0
+
+
+def test_takeover_counter_multiple_disengagements_count_each():
+    counter = m.TakeoverCounter()
+    # engaged -> takeover -> re-engage -> takeover again
+    sequence = [True, False, False, True, True, False]
+    for v in sequence:
+        counter.update(v)
+    assert counter.takeover_count == 2
+
+
+def test_takeover_counter_first_sample_disengaged_does_not_count():
+    # No prior state to fall from -- starting disengaged isn't a takeover.
+    counter = m.TakeoverCounter()
+    counter.update(False)
+    assert counter.takeover_count == 0
+
+
+def test_takeover_counter_none_samples_do_not_count_or_change_state():
+    # A confirmed regression test: an unknown (None) sample -- e.g.
+    # retime_samples' edge-hold pad, nulled because a telemetry gap is not a
+    # confirmed disengagement -- must never itself look like a takeover, and
+    # must not disturb the tracked engaged/disengaged state either. Before
+    # the fix, engaged->None was treated as engaged->False and counted.
+    counter = m.TakeoverCounter()
+    edges = [counter.update(v) for v in [True, None, None, True]]
+    assert counter.takeover_count == 0
+    assert edges == [False, False, False, False]
+
+
+def test_takeover_counter_none_then_disengaged_still_counts_once():
+    # A gap followed by a REAL, confirmed disengagement must still count --
+    # None-safety must not suppress genuine takeovers, only fabricated ones.
+    counter = m.TakeoverCounter()
+    edges = [counter.update(v) for v in [True, None, False]]
+    assert counter.takeover_count == 1
+    assert edges == [False, False, True]
+
+
+# --- format_hms -----------------------------------------------------------------
+
+@pytest.mark.parametrize("seconds,expected", [
+    (0, "0:00"),
+    (5, "0:05"),
+    (59, "0:59"),
+    (60, "1:00"),
+    (872, "14:32"),
+    (3599, "59:59"),
+    (3600, "1:00:00"),
+    (3872, "1:04:32"),
+    (4200, "1:10:00"),
+])
+def test_format_hms(seconds, expected):
+    assert m.format_hms(seconds) == expected
+
+
+def test_format_hms_rounds_fractional_seconds():
+    assert m.format_hms(89.6) == "1:30"
+
+
+def test_format_hms_negative_clamps_to_zero():
+    assert m.format_hms(-5) == "0:00"
