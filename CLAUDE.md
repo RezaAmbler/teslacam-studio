@@ -647,21 +647,30 @@ scoreboard overlay.
   sees ±2s of lookahead, worth knowing when retuning the window constants).
 
   **Separately discovered (not a note-highway bug, found via the same
-  verification methodology): `FILENAME_RE` silently drops `-START`-suffixed
-  clips.** `FILENAME_RE` (`tesla_combine.py`) requires an angle to be
-  immediately followed by `.mp4`, so a real clip named e.g.
-  `..._front-START.mp4` (present in two of this user's actual event
-  folders, apparently from an earlier folder-reorganization pass) fails to
-  match and `discover_clips()` drops it with **no warning**. In the
-  render used for the verification above, this made `--trim-start
-  17:22:00` actually start at 17:22:05 — a silent 5-second truncation, no
-  error printed, output just quietly 55s instead of the requested 60s.
-  Confirmed, but out of scope for this branch and not yet fixed — flagged
-  for a follow-up (either widen the regex to tolerate a suffix, or at
-  minimum warn on any `.mp4` in the folder that `FILENAME_RE` didn't match).
+  verification methodology) and since fixed: `FILENAME_RE` silently dropped
+  `-START`-suffixed clips.** `FILENAME_RE` (`tesla_combine.py`) required an
+  angle to be immediately followed by `.mp4`, so a clip renamed with a
+  `-START` suffix (the user's own marker for where they want a final video
+  to begin, on the first clip of an event folder they've otherwise trimmed
+  down to just the footage they want included — not a Tesla naming
+  convention) failed to match and `discover_clips()` dropped it with **no
+  warning**. In the render used for the verification above, this made
+  `--trim-start 17:22:00` actually start at 17:22:05 — a silent 5-second
+  truncation, no error printed, output just quietly 55s instead of the
+  requested 60s. Fixed: `FILENAME_RE` now accepts an optional non-capturing
+  `-START` suffix before `.mp4` (the angle capture group is unaffected —
+  `front-START.mp4` still yields `front`, not `front-START`); verified
+  against the real affected folder that the `-START` clip is now discovered
+  and correctly selected/offset for a trim window starting inside it. See
+  the Gotchas section below for the `-START` convention itself.
 
 ## Gotchas
 - Never commit footage or rendered outputs.
+- A clip filename may carry a user-added `-START` suffix (e.g.
+  `..._front-START.mp4`) marking where the user wants a final video to
+  begin, on an event folder they've otherwise trimmed down to just the
+  footage they want included — it's the user's own convention, not a Tesla
+  one. `FILENAME_RE` matches it like any other clip of that angle.
 - The encode path is macOS/VideoToolbox-specific.
 - `report_gap` reports clock drift from squeezed recording gaps; fixed to work
   under `--trim-end` too.
