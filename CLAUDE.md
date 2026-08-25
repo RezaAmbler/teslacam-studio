@@ -771,17 +771,23 @@ scoreboard overlay.
     the number — is the correct look for a "HUD-style" map, not an
     unwanted side effect of the fix.
   - **Placement/sizing** (`MAP_OVERLAY_SIZE_FRAC=0.32`, `_MARGIN=24`,
-    `_PAD_FRAC=0.05`, `_BG_ALPHA=180`, `_LINE_WIDTH=4`) reached the
-    confirmed-against-a-real-frame stage on the first pass (after the
-    alpha fix above) — no further iteration needed. Verified against real
-    Tesla footage (a real mountain drive, `--landscape --quality high`,
-    the same footage/window every other overlay in this file was verified
-    against): route line, position dot, and street/river labels are all
-    legible at this size/opacity over live moving video, including where
-    the road surface shows through the translucent border — the exact
-    thing the research spike flagged as genuinely unproven (a sidebar tile
-    sits on a plain background; this competes with live video). No
-    collision with the hero label (top-left) or the sidebar column in any
+    `_PAD_FRAC=0.05`, `_LINE_WIDTH=4`) reached the confirmed-against-a-
+    real-frame stage on the first pass (after the alpha fix above) — no
+    further iteration needed. `_BG_ALPHA` started at 180 (matching
+    `--gauge`'s own panel) but was lowered to **110** (~43% opaque, down
+    from ~71%) after a user review of a real render asked for the HUD to
+    read as more see-through — re-verified against a real render at 110:
+    the panel border/edges now visibly blend with the live video
+    underneath at a glance, not just measurably in a pixel sample.
+    Verified against real Tesla footage (a real mountain drive,
+    `--landscape --quality high`, the same footage/window every other
+    overlay in this file was verified against): route line, position dot,
+    and street/river labels are all legible at this size/opacity over live
+    moving video, including where the road surface shows through the
+    translucent border — the exact thing the research spike flagged as
+    genuinely unproven (a sidebar tile sits on a plain background; this
+    competes with live video). No collision with the hero label (top-left)
+    or the sidebar column in any
     layout tested.
   - **Corner/collision design verified against real combined renders**, not
     just `pick_map_overlay_corner`'s own unit tests: `--map-overlay`

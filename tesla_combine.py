@@ -202,10 +202,14 @@ MAP_OVERLAY_PAD_FRAC = 0.05   # thin border between the panel edge and the map r
                               # -- "makes a child controllably transparent" is Frame's own
                               # docstring), so the map content itself is exactly as translucent
                               # as the pad around it, confirmed by looking at a real render.
-MAP_OVERLAY_BG_ALPHA = 180    # matches --gauge's own panel bg alpha value; actual translucency
-                              # comes from the separate `opacity=` XML attribute this alpha value
-                              # feeds (see the note above -- `bg=`'s own alpha component alone is
-                              # NOT enough, confirmed against a real render)
+MAP_OVERLAY_BG_ALPHA = 110    # actual translucency comes from the separate `opacity=` XML
+                              # attribute this alpha value feeds (see the note above -- `bg=`'s
+                              # own alpha component alone is NOT enough, confirmed against a real
+                              # render). Started at 180 (matching --gauge's own panel bg alpha)
+                              # but lowered after a user review of a real render asked for the
+                              # HUD to be more see-through -- 110 (~43% opaque, down from ~71%)
+                              # was verified legible against a real render at this value (see
+                              # Verification status).
 MAP_OVERLAY_LINE_WIDTH = 4    # route line width -- thinner than the sidebar tile's default
                               # (6, write_map_layout) since this panel is smaller and a
                               # thick line would eat a larger share of its small map area
