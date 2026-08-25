@@ -982,30 +982,35 @@ def test_filename_re_matches_plain_clip():
     assert m.group(2) == "front"
 
 
-def test_filename_re_matches_user_start_suffix():
-    # A user-added "-START" marker (not a Tesla naming convention) on the
-    # first clip of a session they've trimmed down to what they want in a
-    # final video -- must still match and group like any other clip of that
-    # angle, or discover_clips() silently drops it. Confirmed real bug: this
-    # caused --trim-start to silently start several seconds late with no
-    # warning when the dropped clip was the first one overlapping the window.
-    m = tc.FILENAME_RE.match("2026-08-22_17-21-05-front-START.mp4")
-    assert m is not None
-    assert m.group(1) == "2026-08-22_17-21-05"
-    assert m.group(2) == "front"  # not "front-START" -- angle group unaffected
-
-
 def test_filename_re_rejects_unrelated_suffix():
-    # Not a blanket "any suffix is fine" -- only the specific -START marker.
+    # Any renamed/stray file with a suffix before .mp4 doesn't match -- this
+    # tool doesn't try to guess intent from filename variants; see
+    # test_discover_clips_warns_on_skipped_files for how a mismatch like
+    # this is surfaced instead (a warning, not a silent drop).
     assert tc.FILENAME_RE.match("2026-08-22_17-21-05-front-copy.mp4") is None
+    assert tc.FILENAME_RE.match("2026-08-22_17-21-05-front-START.mp4") is None
 
 
-def test_discover_clips_includes_start_suffixed_clip(tmp_path):
+def test_discover_clips_warns_on_skipped_files(tmp_path, capsys):
+    # A renamed/stray .mp4 that doesn't match FILENAME_RE is excluded from
+    # the render (correct -- this tool doesn't know how to place it on the
+    # timeline) but must warn, by name, rather than silently shrinking the
+    # render with nothing to explain why (confirmed real risk: a folder
+    # trimmed/renamed by hand can end up missing exactly the clip a
+    # --trim-start window needed).
+    (tmp_path / "2026-08-22_17-21-05-front.mp4").touch()
     (tmp_path / "2026-08-22_17-21-05-front-START.mp4").touch()
-    (tmp_path / "2026-08-22_17-22-05-front.mp4").touch()
-    (tmp_path / "2026-08-22_17-21-05-back.mp4").touch()
     by_angle, session_start = tc.discover_clips(tmp_path)
     front_names = [p.name for _, p in by_angle["front"]]
-    assert "2026-08-22_17-21-05-front-START.mp4" in front_names
-    # session_start reflects the -START clip's real (earlier) timestamp
-    assert session_start == datetime(2026, 8, 22, 17, 21, 5)
+    assert front_names == ["2026-08-22_17-21-05-front.mp4"]  # the renamed one is excluded
+    printed = capsys.readouterr().out
+    assert "1 .mp4 file(s)" in printed
+    assert "2026-08-22_17-21-05-front-START.mp4" in printed
+
+
+def test_discover_clips_no_warning_when_everything_matches(tmp_path, capsys):
+    (tmp_path / "2026-08-22_17-21-05-front.mp4").touch()
+    (tmp_path / "2026-08-22_17-21-05-back.mp4").touch()
+    tc.discover_clips(tmp_path)
+    printed = capsys.readouterr().out
+    assert "WARNING" not in printed

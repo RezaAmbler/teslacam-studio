@@ -733,22 +733,26 @@ scoreboard overlay.
   sees ±2s of lookahead, worth knowing when retuning the window constants).
 
   **Separately discovered (not a note-highway bug, found via the same
-  verification methodology) and since fixed: `FILENAME_RE` silently dropped
-  `-START`-suffixed clips.** `FILENAME_RE` (`tesla_combine.py`) required an
-  angle to be immediately followed by `.mp4`, so a clip renamed with a
-  `-START` suffix (the user's own marker for where they want a final video
-  to begin, on the first clip of an event folder they've otherwise trimmed
-  down to just the footage they want included — not a Tesla naming
-  convention) failed to match and `discover_clips()` dropped it with **no
+  verification methodology): `discover_clips()` silently dropped any `.mp4`
+  that didn't match `FILENAME_RE`.** The user had renamed a clip with a
+  `-START` suffix as their own personal marker (not a naming convention this
+  tool needs to understand — later clarified it was never meant to be
+  recognized), and `FILENAME_RE` requiring the angle to be immediately
+  followed by `.mp4` meant `discover_clips()` dropped it with **no
   warning**. In the render used for the verification above, this made
   `--trim-start 17:22:00` actually start at 17:22:05 — a silent 5-second
   truncation, no error printed, output just quietly 55s instead of the
-  requested 60s. Fixed: `FILENAME_RE` now accepts an optional non-capturing
-  `-START` suffix before `.mp4` (the angle capture group is unaffected —
-  `front-START.mp4` still yields `front`, not `front-START`); verified
-  against the real affected folder that the `-START` clip is now discovered
-  and correctly selected/offset for a trim window starting inside it. See
-  the Gotchas section below for the `-START` convention itself.
+  requested 60s. First fix special-cased `-START` in the regex; reverted
+  after the user clarified `-START` wasn't meant to be recognized, and it
+  turned out to be too narrow anyway — the same folder also has `-SKIP`
+  (×5) and `-END` suffixes from the same personal-curation habit, none of
+  which a `-START`-only regex would have caught. **Real fix**: don't special-
+  case any suffix at all — `discover_clips()` now warns, by name, on every
+  `.mp4` that doesn't match `FILENAME_RE`, still excluding it from the
+  render (correct — this tool doesn't know how to place an arbitrarily-named
+  file on the timeline) but making the exclusion visible instead of silent.
+  Confirmed against the real affected folder: the warning lists all 7
+  renamed files by name (`-START`, 5× `-SKIP`, `-END`) in one line.
 - `--map-overlay`/`pick_map_overlay_corner`/`write_map_overlay_layout`: went
   through the same real-render verification loop as every prior overlay,
   and it changed the design mid-branch rather than confirming a guess.
@@ -887,11 +891,12 @@ scoreboard overlay.
 
 ## Gotchas
 - Never commit footage or rendered outputs.
-- A clip filename may carry a user-added `-START` suffix (e.g.
-  `..._front-START.mp4`) marking where the user wants a final video to
-  begin, on an event folder they've otherwise trimmed down to just the
-  footage they want included — it's the user's own convention, not a Tesla
-  one. `FILENAME_RE` matches it like any other clip of that angle.
+- The user personally renames clips they've curated for a final video with
+  suffixes like `-START`/`-SKIP`/`-END` (their own convention, not
+  something this tool interprets) — `discover_clips()` doesn't try to
+  understand these, it just warns by name on any `.mp4` that doesn't match
+  `FILENAME_RE` and excludes it from the render, rather than silently
+  shrinking the output.
 - The encode path is macOS/VideoToolbox-specific.
 - `report_gap` reports clock drift from squeezed recording gaps; fixed to work
   under `--trim-end` too.

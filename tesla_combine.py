@@ -67,15 +67,8 @@ SCRIPT_VERSION = "2.8"
 CONCAT_CACHE_VERSION = "2.0"
 
 CAMERA_ANGLES = ["front", "back", "left_repeater", "right_repeater", "left_pillar", "right_pillar"]
-# The optional "-START" suffix is a user-added marker (not a Tesla naming
-# convention) on the first clip of a session they've trimmed down to the
-# footage they actually want in a final video -- it must still match and
-# group like any other clip of that angle, or discover_clips() silently
-# drops it (confirmed: this caused a --trim-start to silently start several
-# seconds late with no warning). The angle capture group (group 2) is
-# unaffected -- "front-START.mp4" still yields "front", not "front-START".
 FILENAME_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})-(front|back|left_repeater|right_repeater|left_pillar|right_pillar)(?:-START)?\.mp4$"
+    r"^(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})-(front|back|left_repeater|right_repeater|left_pillar|right_pillar)\.mp4$"
 )
 LABEL_TEXT = {
     "front": "FRONT", "back": "BACK",
@@ -1673,12 +1666,24 @@ def probe_duration(ffprobe, path):
 
 
 def discover_clips(folder):
-    """Returns {angle: [(start_datetime, path), ...]} sorted by time, plus session start."""
+    """Returns {angle: [(start_datetime, path), ...]} sorted by time, plus session start.
+
+    Any .mp4 in the folder that doesn't match FILENAME_RE (a renamed file, a
+    stray export, an unrelated video someone dropped in) is silently excluded
+    from the render -- correct, since it isn't a clip this tool knows how to
+    place on the timeline, but "silent" is the risk: a folder trimmed down or
+    renamed by hand can end up missing exactly the clip a --trim-start window
+    needed, quietly shortening the render with nothing to say why. Warn once
+    with the count and names so a mismatch is visible instead of discovered
+    later as an unexplained short output.
+    """
     by_angle = {a: [] for a in CAMERA_ANGLES}
     all_ts = []
+    skipped = []
     for p in sorted(folder.glob("*.mp4")):
         m = FILENAME_RE.match(p.name)
         if not m:
+            skipped.append(p.name)
             continue
         ts_str, angle = m.groups()
         dt = datetime.strptime(ts_str, "%Y-%m-%d_%H-%M-%S")
@@ -1688,6 +1693,10 @@ def discover_clips(folder):
     if not by_angle:
         die(f"No Tesla dashcam clips found in {folder}\n"
             f"Expected names like 2026-07-14_18-52-35-front.mp4")
+    if skipped:
+        log(f"WARNING: {len(skipped)} .mp4 file(s) in {folder} didn't match the expected "
+            f"Tesla clip naming and were skipped (not included in the render): "
+            f"{', '.join(skipped)}")
     return by_angle, min(all_ts)
 
 
