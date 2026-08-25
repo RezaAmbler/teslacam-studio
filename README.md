@@ -44,7 +44,10 @@ traces where you drove.
   traces clean arcs; jerky driving scatters. Same GPS telemetry as `--map`/
   `--gauge`/`--fsd-scoreboard` (shared). Can be combined with `--gauge`/
   `--fsd-scoreboard` — the three overlays occupy different corners of the
-  hero tile.
+  hero tile, and `--fsd-scoreboard`/`--fsd-friction-circle`/
+  `--fsd-note-highway` composite together in a single combined pass
+  regardless of how many of the three are requested (`--gauge` is a
+  separate pass, a different underlying tool).
 - **FSD note highway** (`--fsd-note-highway`) — a horizontal scrolling ribbon
   of cornering severity, composited full-width across the hero camera tile,
   below the hero label and streak scoreboard: signed lateral G plotted as a
@@ -60,7 +63,8 @@ traces where you drove.
   without reading the code. Same GPS telemetry as `--map`/`--gauge`/
   `--fsd-scoreboard`/`--fsd-friction-circle` (shared). Can be combined with
   any of the other three — all four overlays occupy non-overlapping regions
-  of the hero tile.
+  of the hero tile, and the three `--fsd-*` widgets composite together in a
+  single pass no matter how many are requested.
 - **HUD-style map inset** (`--map-overlay`) — a small, translucent live route
   map composited directly onto a corner of the hero camera tile, instead of
   (or alongside) `--map`'s sidebar tile. Same moving map/route-trace widget
@@ -288,9 +292,7 @@ Written next to the input folder unless `--output-dir` is given:
 | `<session>_<angle>_blurred.mp4` | (with `--blur-faces`) that concat, faces anonymized |
 | `<session>_maptile.mp4` | (with `--map`) the standalone live route-map tile |
 | `<session>_<hero-angle>_gauge.mp4` | (with `--gauge`) that hero tile, dashboard overlay composited on |
-| `<session>_<hero-angle>_scoreboard.mp4` | (with `--fsd-scoreboard`) that hero tile, streak scoreboard composited on |
-| `<session>_<hero-angle>_friction-circle.mp4` | (with `--fsd-friction-circle`) that hero tile, friction-circle G-meter composited on |
-| `<session>_<hero-angle>_note-highway.mp4` | (with `--fsd-note-highway`) that hero tile, note-highway cornering ribbon composited on |
+| `<session>_<hero-angle>_<widgets>.mp4` | (with any of `--fsd-scoreboard`/`--fsd-friction-circle`/`--fsd-note-highway`) that hero tile, with every requested FSD widget composited on in a single pass — `<widgets>` is the active widget names joined by `_`, e.g. `_scoreboard`, or `_scoreboard_friction-circle_note-highway` if all three are requested together |
 | `<session>_<hero-angle>_map-overlay.mp4` | (with `--map-overlay`) that hero tile, translucent HUD map inset composited on |
 | `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4` | the labeled multi-camera composite |
 

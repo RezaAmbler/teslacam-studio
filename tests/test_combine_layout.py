@@ -658,7 +658,7 @@ def test_fsd_scoreboard_filename_suffix(tmp_path):
     angle_paths = {"front": tmp_path / "front_combined.mp4",
                    "back": tmp_path / "back_combined.mp4"}
     stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
-             "scoreboard_s": 0.0, "scoreboard_built": False, "grid_s": 0.0}
+             "fsd_overlay_s": 0.0, "scoreboard_built": False, "grid_s": 0.0}
     steps = tc.plan_steps(args, plan.selections, plan.footage)
     progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
 
@@ -684,7 +684,7 @@ def test_fsd_scoreboard_and_gauge_suffix_order(tmp_path):
     angle_paths = {"front": tmp_path / "front_combined.mp4",
                    "back": tmp_path / "back_combined.mp4"}
     stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
-             "scoreboard_s": 0.0, "scoreboard_built": False, "grid_s": 0.0}
+             "fsd_overlay_s": 0.0, "scoreboard_built": False, "grid_s": 0.0}
     steps = tc.plan_steps(args, plan.selections, plan.footage)
     progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
 
@@ -754,10 +754,13 @@ def _friction_circle_stats(**overrides):
     """A stats dict with every key build_grid/print_stats might touch across
     --gauge/--fsd-scoreboard/--fsd-friction-circle, all defaulted off -- the
     same shape _scoreboard_grid_plan's callers already build by hand, just
-    extended with the friction-circle keys the refactor added."""
+    extended with the friction-circle keys the refactor added. All three
+    --fsd-* widgets now share ONE timing counter (stats["fsd_overlay_s"] --
+    see build_fsd_overlay's consolidation), but each still gets its own
+    "*_built" flag, so those stay separate."""
     stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
-             "scoreboard_s": 0.0, "scoreboard_built": False,
-             "friction_circle_s": 0.0, "friction_circle_built": False, "grid_s": 0.0}
+             "fsd_overlay_s": 0.0,
+             "scoreboard_built": False, "friction_circle_built": False, "grid_s": 0.0}
     stats.update(overrides)
     return stats
 
@@ -892,9 +895,11 @@ def _note_highway_stats(**overrides):
     """A stats dict with every key build_grid/print_stats might touch across
     --gauge/--fsd-scoreboard/--fsd-friction-circle/--fsd-note-highway, all
     defaulted off -- extends _friction_circle_stats' shape with the
-    note-highway keys this branch added."""
+    note-highway keys this branch added (just another "*_built" flag --
+    "fsd_overlay_s" is already shared by all three, see
+    _friction_circle_stats)."""
     stats = _friction_circle_stats()
-    stats.update({"note_highway_s": 0.0, "note_highway_built": False})
+    stats.update({"note_highway_built": False})
     stats.update(overrides)
     return stats
 
@@ -971,6 +976,168 @@ def test_fsd_note_highway_dry_run_passes_widget_flag(tmp_path, capsys):
 
     printed = capsys.readouterr().out
     assert "--widget note-highway" in printed
+
+
+# --- FSD overlay consolidation: one combined pass, not one pass per flag -----
+# The actual behavioral change this branch makes: --gauge stays its own
+# subprocess (a genuinely different tool), but the three --fsd-* flags now
+# share ONE tesla_fsd_overlay.py invocation instead of three sequential
+# ones. These tests are deliberately distinct from the pre-existing
+# filename-suffix/dry-run-command tests above (which only ever exercised
+# one --fsd-* flag at a time, or checked the filename shape, not the call
+# count) -- this is the real regression test for the consolidation itself.
+
+def test_fsd_overlay_dry_run_single_combined_invocation(tmp_path, capsys):
+    # All three --fsd-* flags together must print exactly ONE
+    # tesla_fsd_overlay.py command line, carrying all three widget names in
+    # one --widget invocation -- not three separate command lines.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--gauge", "--fsd-scoreboard", "--fsd-friction-circle",
+         "--fsd-note-highway", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"), map_gopro=Path("fake-gopro"),
+                     map_font="/System/Library/Fonts/Menlo.ttc")
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    printed = capsys.readouterr().out
+    # Exactly one tesla_fsd_overlay.py command line (--gauge's own
+    # gopro-dashboard.py command is a separate, expected invocation).
+    assert printed.count("tesla_fsd_overlay.py") == 1
+    assert "--widget scoreboard friction-circle note-highway" in printed
+
+
+def test_fsd_overlay_consolidation_single_build_call_all_widgets(monkeypatch, tmp_path):
+    # Monkeypatch build_fsd_overlay itself and count/inspect calls -- confirms
+    # build_grid really does call it exactly once with all three widget names,
+    # not three times with one widget each (the old per-flag behavior).
+    import io
+    calls = []
+
+    def fake_build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widgets,
+                               ffmpeg, venv_py, out_path, tmpdir, dry_run, progress):
+        calls.append(list(widgets))
+        return out_path
+
+    monkeypatch.setattr(tc, "build_fsd_overlay", fake_build_fsd_overlay)
+
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--gauge", "--fsd-scoreboard", "--fsd-friction-circle",
+         "--fsd-note-highway", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"), map_gopro=Path("fake-gopro"),
+                     map_font="/System/Library/Fonts/Menlo.ttc")
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    assert len(calls) == 1
+    assert calls[0] == ["scoreboard", "friction-circle", "note-highway"]
+
+
+def test_fsd_overlay_consolidation_single_call_with_two_of_three(monkeypatch, tmp_path):
+    # Also confirm a PARTIAL combination (two of the three flags, no --gauge)
+    # still collapses to one call carrying just the two active widget names,
+    # not a full three or a per-flag call.
+    import io
+    calls = []
+
+    def fake_build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widgets,
+                               ffmpeg, venv_py, out_path, tmpdir, dry_run, progress):
+        calls.append(list(widgets))
+        return out_path
+
+    monkeypatch.setattr(tc, "build_fsd_overlay", fake_build_fsd_overlay)
+
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-scoreboard", "--fsd-note-highway", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    assert len(calls) == 1
+    assert calls[0] == ["scoreboard", "note-highway"]
+
+
+def test_fsd_overlay_dry_run_two_widget_subset_command(tmp_path, capsys):
+    # The single-widget dry-run command tests above (friction-circle alone,
+    # note-highway alone) don't exercise the multi-value --widget case at
+    # all -- confirm a two-of-three combination's printed command carries
+    # BOTH names, in the fixed (scoreboard, friction-circle, note-highway)
+    # order build_grid always uses, not CLI argument order.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-friction-circle", "--fsd-scoreboard", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    printed = capsys.readouterr().out
+    assert printed.count("tesla_fsd_overlay.py") == 1
+    assert "--widget scoreboard friction-circle" in printed
+
+
+def test_fsd_overlay_step_abandoned_when_no_gps(monkeypatch, tmp_path):
+    # If GPS extraction finds no SEI telemetry at all (build_route_gpx
+    # returns None), the still-pending fsd_overlay_render step must be
+    # dropped by build_grid's progress.abandon(...) call -- this pins the
+    # actual kind STRING passed there. abandon() silently ignores any kind
+    # name it doesn't recognize (see Progress.abandon's own docstring), so a
+    # typo in that call's argument list (e.g. a leftover
+    # "scoreboard_render" from before the consolidation) would leave this
+    # step stuck "pending" forever with nothing left in the plan to ever
+    # finish it -- corrupting the job's ETA -- without any test failing.
+    # Real GPS extraction never runs here: build_route_gpx is monkeypatched
+    # directly, bypassing --dry-run's own "always succeeds" GPS stub (see
+    # that function's own dry_run branch), so this is the one way to
+    # exercise the no-GPS path without real footage.
+    import io
+    monkeypatch.setattr(tc, "build_route_gpx", lambda *a, **k: None)
+
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--fsd-scoreboard", "--fsd-friction-circle", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = _note_highway_stats()
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    tc.build_grid(args, tools, plan, angle_paths, stats, tmp_path, progress)
+
+    fsd_step_idx = next(i for i, s in enumerate(progress.steps)
+                        if s.kind == "fsd_overlay_render")
+    assert progress.state[fsd_step_idx] == "skipped"
+    assert stats["scoreboard_built"] is False
+    assert stats["friction_circle_built"] is False
 
 
 # --- FILENAME_RE / discover_clips -------------------------------------------

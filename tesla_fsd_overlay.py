@@ -10,22 +10,29 @@ can drive a real composited video, and draws the "streak scoreboard" visual
 (StreakScoreboard, --widget scoreboard, the default) -- an accumulating
 hands-free/corner/peak-G/takeover stat line -- the "friction circle" G-G
 diagram visual (FrictionCircle, --widget friction-circle) -- lateral G vs.
-longitudinal G on a ringed target with a fading trail -- or the "note
+longitudinal G on a ringed target with a fading trail -- and/or the "note
 highway" cornering ribbon (NoteHighway, --widget note-highway) -- a
 horizontal scrolling strip of signed lateral-G severity with "now" fixed at
-center, showing the road BEFORE the car reaches it. The one still-deferred
+center, showing the road BEFORE the car reaches it. `--widget` takes one or
+more values (nargs="+") and draws ALL of them in a SINGLE decode/draw/encode
+pass -- tesla_combine.py's build_fsd_overlay collects every active
+--fsd-* flag into one combined invocation rather than one subprocess per
+flag (see create_widgets_for's own "Design note, now revisited" for why this
+consolidation happened and what it replaced). The one still-deferred
 showcase idea (pace-notes) is its own follow-up branch's job;
 FsdDiagnosticText (--widget diagnostic) is kept around, not deleted, for
-debugging it. See CLAUDE.md for the full design rationale (axis mapping, GPX
-tag repurposing, why gopro-dashboard.py's CLI can't carry any of this on its
-own).
+debugging it -- not meant to combine with the real widgets (see
+build_arg_parser's own --widget help; enforced in main()). See CLAUDE.md for
+the full design rationale (axis mapping, GPX tag repurposing, why
+gopro-dashboard.py's CLI can't carry any of this on its own).
 
 Must run under ./.venv (gopro-overlay installed there, not under the system
 Python tesla_combine.py itself uses) -- same venv-boundary reason `--map`/
 `--gauge` already subprocess out to gopro-dashboard.py:
 
     ./.venv/bin/python tesla_fsd_overlay.py <input-video> <output> \\
-        --gpx <path> --font <path> --ffmpeg-dir <dir> [--widget scoreboard|diagnostic]
+        --gpx <path> --font <path> --ffmpeg-dir <dir> \\
+        [--widget scoreboard friction-circle note-highway | diagnostic]
 
 `<input-video>` is a hero-camera video (e.g. tesla_combine.py's own
 `*-front-combined.mp4`); `--gpx` is a GPX written by tesla_gps.write_gpx()
@@ -809,7 +816,7 @@ class FsdDiagnosticText(Widget):
             )
 
 
-def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None):
+def create_widgets_for(font, widgets=("scoreboard",), lateral_g_timeline=None):
     """Returns a `create_widgets(entry)` callable of the shape Overlay()
     (gopro_overlay/layout.py) expects -- proven directly usable outside the
     XML layout system by the library's own non-XML speed_awareness_layout
@@ -818,43 +825,67 @@ def create_widgets_for(font, widget="scoreboard", lateral_g_timeline=None):
     exist because our own process() passes below put them there (see
     Entry.__getattr__ in gopro_overlay/entry.py -- no fixed schema at all).
 
-    `widget`: "scoreboard" (default, --widget) builds the real StreakScoreboard
-    showcase visual; "friction-circle" builds the FrictionCircle G-meter
-    showcase visual; "note-highway" builds the NoteHighway cornering-ribbon
-    showcase visual; "diagnostic" keeps FsdDiagnosticText available (not
-    deleted) for future debugging of the one still-deferred FSD-overlay idea
-    (pace-notes), which will want the same kind of raw-value
-    proof-of-plumbing check this branch's own verification relied on.
+    `widgets`: an iterable of widget names (--widget is now `nargs="+"`, so
+    the CLI can request any combination) -- "scoreboard" builds the real
+    StreakScoreboard showcase visual; "friction-circle" builds the
+    FrictionCircle G-meter showcase visual; "note-highway" builds the
+    NoteHighway cornering-ribbon showcase visual; "diagnostic" keeps
+    FsdDiagnosticText available (not deleted) for future debugging of the
+    one still-deferred FSD-overlay idea (pace-notes), which will want the
+    same kind of raw-value proof-of-plumbing check this branch's own
+    verification relied on. Returns ONE widget instance per requested name,
+    in the order given -- Overlay() draws every widget in the list onto the
+    SAME frame each draw() call, so requesting several here means one
+    decode/draw/encode pass draws all of them, not one pass per widget (see
+    "Design note, now revisited" below); the order given is also the
+    painter's-algorithm draw order (later entries draw on top of earlier
+    ones), matching the layering the old sequential passes produced
+    (scoreboard first/bottom, note-highway last/topmost -- see build_grid's
+    own fixed widget ordering). This function does NOT itself reject
+    combining "diagnostic" with a real widget -- that validation lives in
+    main() (see --widget's own build_arg_parser help), so a caller that
+    bypasses main() (e.g. calling this function directly, as a test might)
+    is not stopped from requesting an unsupported combination here.
 
     `lateral_g_timeline`: the full-drive lateral_g array NoteHighway needs
     (see its own class docstring for why) -- unlike every other widget here,
     which only ever reads entry()'s current sample, this one needs the whole
     timeline up front, so it can't get by on `entry`/`font` alone. Only
-    required (non-None) when `widget == "note-highway"`; every other widget
-    ignores this parameter entirely.
+    required (non-None) when "note-highway" is among `widgets`; every other
+    widget ignores this parameter entirely.
 
-    NOTE: a design note worth revisiting now that all four FSD showcase
-    visuals exist (scoreboard, friction-circle, note-highway, and the
-    still-deferred pace-notes) -- `--gauge --fsd-scoreboard
-    --fsd-friction-circle --fsd-note-highway` together now means FOUR
-    sequential hero-tile re-encode generations (build_fsd_overlay/
-    build_gauge_overlay each subprocess out their own full video re-encode).
-    Flagged during the friction-circle review and deferred until a second
-    widget existed to make it concrete; worth reconsidering now: combining
-    multiple FSD widgets into ONE compositing pass (one Overlay with several
-    widgets in its list, same as this function already returns a list) would
-    cut that to one re-encode regardless of how many flags are combined.
+    Design note, now revisited (this IS that revisit, not just another
+    deferral): a design note used to live here observing that
+    `--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`
+    together meant FOUR sequential hero-tile re-encode generations
+    (build_gauge_overlay's own subprocess, plus one build_fsd_overlay
+    subprocess PER --fsd-* flag) -- measured on a real ~47-minute session at
+    ~3h09m projected for a single such pass alone, so four sequentially ran
+    well over half a day. That's now fixed: `--widget` takes multiple values,
+    this function builds and returns ALL of them in one list (Overlay()
+    already only ever needed a widget *list*, never assumed length 1), and
+    tesla_combine.py's build_fsd_overlay/build_grid now collect every active
+    --fsd-* flag and make exactly ONE tesla_fsd_overlay.py call carrying all
+    of them -- cutting those three-or-fewer FSD passes down to one
+    regardless of how many of the three flags are combined (--gauge stays
+    its own separate subprocess/tool; that pass isn't part of this
+    consolidation). See CLAUDE.md's "Verification status" entry for this
+    branch for what was actually measured/confirmed, not just planned.
     """
     text_font = font.font_variant(size=22)
 
     def create(entry):
-        if widget == "diagnostic":
-            return [FsdDiagnosticText(Coordinate(24, 24), entry, text_font)]
-        if widget == "friction-circle":
-            return [FrictionCircle(entry, font)]
-        if widget == "note-highway":
-            return [NoteHighway(entry, font, lateral_g_timeline)]
-        return [StreakScoreboard(entry, font)]
+        out = []
+        for widget in widgets:
+            if widget == "diagnostic":
+                out.append(FsdDiagnosticText(Coordinate(24, 24), entry, text_font))
+            elif widget == "friction-circle":
+                out.append(FrictionCircle(entry, font))
+            elif widget == "note-highway":
+                out.append(NoteHighway(entry, font, lateral_g_timeline))
+            else:
+                out.append(StreakScoreboard(entry, font))
+        return out
 
     return create
 
@@ -941,10 +972,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Driver for FSD showcase overlays: decodes the GPX "
                     "repurposed-tag -> lateral_g/longitudinal_g/"
                     "autopilot_engaged -> derived-metric pipeline and "
-                    "composites the streak-scoreboard, friction-circle, or "
-                    "note-highway showcase visual (or, with --widget "
-                    "diagnostic, the original throwaway raw-value text "
-                    "overlay). Invoked by tesla_combine.py's "
+                    "composites any combination of the streak-scoreboard, "
+                    "friction-circle, and note-highway showcase visuals in "
+                    "ONE pass (or, with --widget diagnostic alone, the "
+                    "original throwaway raw-value text overlay). Invoked by "
+                    "tesla_combine.py's "
                     "--fsd-scoreboard/--fsd-friction-circle/"
                     "--fsd-note-highway flags -- see CLAUDE.md.")
     ap.add_argument("input", type=Path, help="hero camera video (e.g. the "
@@ -958,18 +990,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ffmpeg-dir", type=Path, default=None,
                     help="directory containing the ffmpeg/ffprobe binaries "
                         "to use (default: PATH)")
-    ap.add_argument("--widget", default="scoreboard",
+    ap.add_argument("--widget", nargs="+", default=["scoreboard"],
                     choices=["scoreboard", "diagnostic", "friction-circle", "note-highway"],
-                    help="which overlay to draw (default: scoreboard). scoreboard: the real "
+                    help="which overlay(s) to draw, one or more (default: scoreboard). All "
+                        "requested widgets are drawn in a single decode/draw/encode pass "
+                        "(this is the whole point of taking multiple values -- see "
+                        "create_widgets_for's docstring). scoreboard: the real "
                         "streak-scoreboard showcase visual. friction-circle: the G-G diagram "
                         "showcase visual. note-highway: the cornering-severity ribbon showcase "
-                        "visual. diagnostic: the original "
-                        "throwaway raw-value text overlay, kept for debugging.")
+                        "visual. diagnostic: the original throwaway raw-value text overlay, "
+                        "kept for debugging -- not meant to be combined with the real widgets "
+                        "(it's a plain, unpositioned text block that isn't corner-aware the "
+                        "way the real widgets are, so it would overlap whichever of them is "
+                        "also requested); combining it with a real widget is rejected in "
+                        "main(), not silently allowed to draw both.")
     return ap
 
 
 def main(argv=None) -> int:
     args = build_arg_parser().parse_args(argv)
+
+    # "diagnostic" is a throwaway raw-value debugging overlay with no
+    # corner-aware placement of its own (unlike the three real widgets, each
+    # of which owns a fixed, collision-free corner/region -- see each
+    # widget's own module comment) -- drawn top-left at a fixed Coordinate,
+    # so combining it with any real widget would just overlap. Enforced here
+    # rather than silently drawing both.
+    if "diagnostic" in args.widget and len(args.widget) > 1:
+        fatal("--widget diagnostic can't be combined with the real showcase "
+              f"widgets (got: {' '.join(args.widget)}) -- diagnostic has no "
+              "corner-aware placement and would overlap them.")
 
     font_path = args.font or find_font()
     try:
@@ -1025,9 +1075,12 @@ def main(argv=None) -> int:
     # NoteHighway's own class docstring) -- so index i here is exactly the
     # array position NoteHighway's self._index will reach on draw-call i.
     # Only built when actually needed: for every other widget this would be
-    # a wasted O(len(frame_meta)) allocation.
+    # a wasted O(len(frame_meta)) allocation. Membership, not equality --
+    # args.widget is now a list (--widget is nargs="+"), and note-highway
+    # might be requested alongside scoreboard/friction-circle in the same
+    # combined pass.
     lateral_g_timeline = None
-    if args.widget == "note-highway":
+    if "note-highway" in args.widget:
         lateral_g_timeline = [frame_meta[i].lateral_g for i in range(len(frame_meta))]
 
     output: Path = args.output
