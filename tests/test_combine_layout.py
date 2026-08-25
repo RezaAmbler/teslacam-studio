@@ -573,6 +573,7 @@ def _scoreboard_tools_args(**kw):
     a.map_mag = 2.0
     a.gauge = False
     a.gauge_units = "mph"
+    a.map_overlay = False
     a.fsd_scoreboard = False
     a.fsd_friction_circle = False
     a.fsd_note_highway = False

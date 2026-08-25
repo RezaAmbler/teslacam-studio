@@ -79,6 +79,23 @@ def test_write_gauge_layout_bottom_left_margin(tmp_path):
     assert y == 1876 - h - tc.GAUGE_MARGIN
 
 
+def test_write_gauge_layout_sets_opacity_not_just_bg_alpha(tmp_path):
+    # gopro-overlay's Frame widget (gopro_overlay/widgets/widgets.py) builds
+    # its alpha mask from a SEPARATE `opacity` XML attribute (0.0-1.0), not
+    # from `bg`'s own alpha component -- `bg=`'s alpha is cosmetic only
+    # (Frame.draw() calls rect.putalpha(self.mask), overwriting whatever
+    # alpha `bg=` embedded). Discovered verifying --map-overlay against a
+    # real rendered frame: without `opacity=`, this panel -- despite
+    # bg="0,0,0,180" -- rendered fully OPAQUE, not translucent, in a real
+    # render (confirmed by sampling actual output pixels; see CLAUDE.md's
+    # Verification status). Regression-pins the fix.
+    path = tmp_path / "gauge.xml"
+    tc.write_gauge_layout(path, 2896, 1876, "mph")
+    frame = _parse_gauge_layout(path)
+    opacity = float(frame.get("opacity"))
+    assert opacity == pytest.approx(tc.GAUGE_BG_ALPHA / 255, abs=0.001)
+
+
 def test_write_gauge_layout_contains_all_four_widgets(tmp_path):
     path = tmp_path / "gauge.xml"
     tc.write_gauge_layout(path, 2896, 1876, "mph")
@@ -229,6 +246,7 @@ def _tools_args(**kw):
     a.map_mag = 2.0
     a.gauge = False
     a.gauge_units = "mph"
+    a.map_overlay = False
     a.fsd_scoreboard = False
     a.fsd_friction_circle = False
     a.fsd_note_highway = False

@@ -24,6 +24,7 @@ Usage:
     python3 tesla_combine.py /path/to/event/folder --fsd-scoreboard  # composite an FSD streak scoreboard onto the hero tile (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --fsd-friction-circle  # composite an FSD friction-circle G-meter onto the hero tile (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --fsd-note-highway  # composite an FSD note-highway cornering ribbon onto the hero tile (needs gopro-overlay in ./.venv)
+    python3 tesla_combine.py /path/to/event/folder --map-overlay  # composite a translucent HUD map inset onto the hero tile's corner (needs gopro-overlay in ./.venv)
     python3 tesla_combine.py /path/to/event/folder --verbose  # raw ffmpeg/deface output instead of the progress display
     python3 tesla_combine.py /path/to/event/folder --dry-run  # print commands, do nothing
 
@@ -40,7 +41,8 @@ Output (written next to the input folder unless --output-dir is given):
     <session>_<hero-angle>_scoreboard.mp4 -- (with --fsd-scoreboard) that hero tile, streak scoreboard composited on
     <session>_<hero-angle>_friction-circle.mp4 -- (with --fsd-friction-circle) that hero tile, friction-circle G-meter composited on
     <session>_<hero-angle>_note-highway.mp4 -- (with --fsd-note-highway) that hero tile, note-highway cornering ribbon composited on
-    <session>_grid[_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map].mp4 -- labeled multi-camera composite w/ clock
+    <session>_<hero-angle>_map-overlay.mp4 -- (with --map-overlay) that hero tile, translucent HUD map inset composited on
+    <session>_grid[_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4 -- labeled multi-camera composite w/ clock
 """
 
 import argparse
@@ -58,7 +60,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-SCRIPT_VERSION = "2.7"
+SCRIPT_VERSION = "2.8"
 # Separate from SCRIPT_VERSION so feature releases can bump the script version
 # without invalidating every cached per-camera concat (concat semantics are
 # unchanged). Bump this ONLY when the concat output itself would change.
@@ -135,6 +137,82 @@ GAUGE_PAD_FRAC = 0.08       # inner padding, as a fraction of panel height
 GAUGE_SECTION_WEIGHTS = (3, 2, 2, 3)
 GAUGE_CHART_SECONDS = 30    # chart's rolling window -- also drives its label text
 GAUGE_COMPASS_ARROW_RGB = "255,0,0"   # heading arrow color (red -- standard compass convention)
+# The panel's translucency alpha (0-255, matching a plain 8-bit alpha channel).
+# NOTE: gopro-overlay's <frame> Frame widget (gopro_overlay/widgets/widgets.py)
+# builds its mask from a SEPARATE `opacity` XML attribute (0.0-1.0), not from
+# `bg`'s own alpha component -- Frame.draw() calls `rect.putalpha(self.mask)`,
+# which OVERWRITES the whole rect's alpha (mask built from `opacity`, default
+# 1.0 = fully opaque) regardless of what alpha `bg=` embedded. `bg`'s alpha
+# component is therefore cosmetic only; `opacity=` is what actually controls
+# translucency. Discovered verifying --map-overlay against a REAL rendered
+# frame (see CLAUDE.md's Verification status): the panel read as fully
+# opaque black, not the intended ~70% translucent, because this attribute was
+# missing -- confirmed against gopro-overlay's own bundled example layouts
+# (e.g. layouts/default-1920x1080.xml's "gps-lock" frame), which set BOTH
+# `bg=` and `opacity=` together, never `bg=`'s alpha alone.
+GAUGE_BG_ALPHA = 180
+
+# --- HUD-style translucent map inset (--map-overlay) --------------------------
+# An alternative to the sidebar --map tile: instead of a separate grid tile, a
+# small square moving_journey_map (the SAME widget the sidebar tile uses --
+# see write_map_layout) is composited directly onto a corner of the hero camera
+# tile, inside a translucent panel frame -- a HUD-style inset rather than a
+# plain grid cell. This was scoped as a research spike first (see
+# docs/translucent-map-overlay-findings.md on the backlog-additions branch),
+# which asserted the translucency MECHANISM was already proven by --gauge's
+# own panel (bg="0,0,0,180"). Verifying THIS flag against a real rendered
+# frame (not just re-reading the spike's claim) found that assertion was
+# WRONG as stated: `bg=`'s own alpha component is cosmetic only -- Frame.draw()
+# (gopro_overlay/widgets/widgets.py) calls rect.putalpha(self.mask), where the
+# mask comes from a SEPARATE `opacity` XML attribute (default 1.0), which
+# overwrites whatever alpha `bg=` embedded. Without `opacity=` also set, both
+# --gauge's existing panel and this one rendered fully OPAQUE, not translucent
+# -- confirmed by sampling real output pixels (a "0,0,0,180" panel read back
+# as pure (0,0,0), not a blend with the video underneath) and cross-checked
+# against gopro-overlay's own bundled example layouts (e.g.
+# layouts/default-1920x1080.xml's "gps-lock" frame), which always pair `bg=`
+# with a separate `opacity=`, never rely on `bg=`'s alpha alone. Fixed here
+# (write_map_overlay_layout now also emits `opacity=`) AND in --gauge's
+# write_gauge_layout (GAUGE_BG_ALPHA, same root cause, same fix) -- see
+# CLAUDE.md's Verification status entry for the full before/after pixel
+# comparison. MAP_OVERLAY_BG_ALPHA still starts from --gauge's own value
+# (a reasonable starting point either way), just no longer described as a
+# "proven" mechanism that turned out not to be proven.
+#
+# What legibility/sizing (as opposed to the alpha mechanism itself) actually
+# needed verifying -- the spike's real open question -- is what
+# MAP_OVERLAY_SIZE_FRAC/_MARGIN/_PAD_FRAC below are for, and per this
+# codebase's own convention (GAUGE_*/FRICTION_CIRCLE_*/etc.) they're a
+# starting guess until verified against a real rendered frame (see
+# CLAUDE.md's Verification status entry for what was actually confirmed).
+#
+# Deliberately square (unlike the sidebar tile, which crops/centers a square
+# widget to fill a non-square cell edge-to-edge -- see write_map_layout):
+# moving_journey_map is inherently square, and a square HUD panel sidesteps
+# that crop math entirely while still reading as "roughly one grid-cell
+# equivalent" in the corner of a much larger hero tile.
+MAP_OVERLAY_SIZE_FRAC = 0.32  # panel's side length, as a fraction of min(tile_w, tile_h)
+MAP_OVERLAY_MARGIN = 24       # px from the hero tile's chosen corner (matches GAUGE_MARGIN)
+MAP_OVERLAY_PAD_FRAC = 0.05   # thin border between the panel edge and the map raster inside
+                              # it -- just enough for the panel's own rounded-frame edge to
+                              # read as a HUD border, not a wide empty margin eating into the
+                              # small inset's map area. NOT a translucent-vs-opaque boundary:
+                              # gopro-overlay's Frame widget applies the SAME opacity mask to
+                              # its whole rect, pad AND map raster alike (see the note above
+                              # -- "makes a child controllably transparent" is Frame's own
+                              # docstring), so the map content itself is exactly as translucent
+                              # as the pad around it, confirmed by looking at a real render.
+MAP_OVERLAY_BG_ALPHA = 110    # actual translucency comes from the separate `opacity=` XML
+                              # attribute this alpha value feeds (see the note above -- `bg=`'s
+                              # own alpha component alone is NOT enough, confirmed against a real
+                              # render). Started at 180 (matching --gauge's own panel bg alpha)
+                              # but lowered after a user review of a real render asked for the
+                              # HUD to be more see-through -- 110 (~43% opaque, down from ~71%)
+                              # was verified legible against a real render at this value (see
+                              # Verification status).
+MAP_OVERLAY_LINE_WIDTH = 4    # route line width -- thinner than the sidebar tile's default
+                              # (6, write_map_layout) since this panel is smaller and a
+                              # thick line would eat a larger share of its small map area
 
 
 # The live progress display, if one is running. log()/die() consult it so an
@@ -188,7 +266,7 @@ def human_time(sec):
 class Step:
     """One unit of work in the job plan. `work` is in seconds of footage (output
     seconds for the grid), the unit every rate below is relative to."""
-    kind: str        # concat | blur | map_gps | map_render | map_scale | gauge_render | scoreboard_render | friction_circle_render | note_highway_render | grid
+    kind: str        # concat | blur | map_gps | map_render | map_scale | gauge_render | scoreboard_render | friction_circle_render | note_highway_render | map_overlay_render | grid
     label: str
     work: float
 
@@ -207,6 +285,7 @@ RATE_PRIORS = {
     "scoreboard_render": 1.0, # tesla_fsd_overlay.py FSD scoreboard render + composite
     "friction_circle_render": 1.0, # tesla_fsd_overlay.py FSD friction-circle render + composite
     "note_highway_render": 1.0, # tesla_fsd_overlay.py FSD note-highway render + composite
+    "map_overlay_render": 1.0, # gopro-overlay HUD map-inset render + ffmpeg overlay
     "grid": 2.0,         # VideoToolbox hardware encode
 }
 KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "GPS extract",
@@ -214,6 +293,7 @@ KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "GPS extract",
                "gauge_render": "gauge render", "scoreboard_render": "scoreboard render",
                "friction_circle_render": "friction circle render",
                "note_highway_render": "note highway render",
+               "map_overlay_render": "map overlay render",
                "grid": "grid"}
 BAR_FULL, BAR_EMPTY = "█", "░"
 BAR_FULL_ASCII, BAR_EMPTY_ASCII = "#", "-"
@@ -957,7 +1037,7 @@ def write_gauge_layout(path, tile_w, tile_h, units):
     Path(path).write_text(
         "<layout>\n"
         f'    <frame x="{panel_x}" y="{panel_y}" width="{panel_w}" height="{panel_h}" '
-        f'cr="{pad}" bg="0,0,0,180">\n'
+        f'cr="{pad}" bg="0,0,0,{GAUGE_BG_ALPHA}" opacity="{GAUGE_BG_ALPHA / 255:.3f}">\n'
         f'        <translate x="{msi_x}" y="{pad}">\n'
         f'            <component type="msi" size="{dial}" metric="speed" '
         f'units="{units}" needle="1"/>\n'
@@ -981,6 +1061,138 @@ def write_gauge_layout(path, tile_w, tile_h, units):
         f'        <component type="chart" x="{chart_x}" y="{chart_y}" metric="speed" '
         f'units="{units}" width="{chart_w}" height="{chart_h}" '
         f'seconds="{GAUGE_CHART_SECONDS}"/>\n'
+        "    </frame>\n"
+        "</layout>\n"
+    )
+
+
+# The four corners considered for --map-overlay's HUD panel. Top-left is
+# deliberately never a candidate: it's always reserved for the grid's own
+# hero-tile label (drawn later, in the grid filter graph, at x=20:y=20 --
+# see _tile_chain/HERO_FONT_SIZE), the same reason every other hero-tile
+# overlay in this codebase (StreakScoreboard, FrictionCircle, the note
+# highway's own clearance band) avoids it.
+MAP_OVERLAY_CORNERS = ("bottom-right", "bottom-left", "top-right")
+
+
+def pick_map_overlay_corner(gauge, scoreboard, friction_circle, note_highway,
+                            clock_bottom_left=False):
+    """Pick which hero-tile corner --map-overlay's HUD panel uses, given which
+    OTHER hero-tile overlay flags are also active this run. Pure/testable --
+    extracted so the collision-avoidance logic itself (not just "it happened
+    to look fine in one render") is pinned by a test.
+
+    Preference order, and why:
+      1. bottom-right -- the research spike's own recommendation (docs/
+         translucent-map-overlay-findings.md, backlog-additions branch):
+         avoids --gauge's bottom-left panel by construction, same as how
+         --map (the sidebar tile) and --gauge already coexist today.
+      2. bottom-left -- falls back here if --fsd-friction-circle also
+         claimed bottom-right (FRICTION_CIRCLE_MARGIN/_SIZE_FRAC, in
+         tesla_fsd_overlay.py) -- the one real collision risk this flag
+         needs to design around, since both panels anchor to the same
+         corner with a similar margin convention and a similarly-sized
+         footprint; shrinking one to "coexist" in the same corner would
+         still crowd both, so this hands the corner over cleanly instead.
+         ALSO treated as claimed when `clock_bottom_left` is set (see its
+         own parameter doc below) -- a second, unrelated reason bottom-left
+         can be unavailable.
+      3. top-right -- falls back here if bottom-right AND bottom-left are
+         BOTH already claimed. Treated as claimed by EITHER
+         --fsd-scoreboard (StreakScoreboard's own top-right panel) OR
+         --fsd-note-highway (whose full-width ribbon sits just below the
+         hero label, close enough to the top that a top-right panel
+         anchored at MAP_OVERLAY_MARGIN would collide with it too, even
+         though the ribbon itself is centered rather than corner-anchored).
+      4. If even top-right is claimed, there is no free corner left on the
+         hero tile. Rather than invent a fifth ad hoc position, this settles
+         back on bottom-right and accepts sharing it with the friction
+         circle -- documented as a known limitation (see CLAUDE.md's
+         Verification status) the same way TakeoverCounter's never-seen-a-
+         real-disengagement gap is documented rather than silently
+         engineered around. Reachable two ways: the FOUR-overlay combo
+         --gauge + --fsd-friction-circle + --map-overlay + (--fsd-scoreboard
+         or --fsd-note-highway); or, with `clock_bottom_left` set, the
+         THREE-overlay combo --fsd-friction-circle + --map-overlay +
+         (--fsd-scoreboard or --fsd-note-highway) -- no --gauge needed,
+         since the burned-in clock claims bottom-left on its own.
+
+    `clock_bottom_left`: pass True when the grid's own burned-in clock
+    (`_apply_tail`, drawn at x=20:y=h-th-20 on the FINAL CANVAS, whenever
+    labels are on) will land inside the hero tile's own bottom-left corner
+    -- which happens under `--landscape` (the hero spans the full canvas
+    height at the left edge, so canvas bottom-left IS hero-tile bottom-left,
+    unconditionally) -- so bottom-left is unavailable regardless of
+    --gauge. Confirmed as a REAL collision, not a hypothetical one: a real
+    `--landscape --fsd-friction-circle --map-overlay` render (labels on,
+    no --gauge) showed the clock's text box drawn directly over the map
+    inset's bottom edge before this parameter existed. The equivalent risk
+    in the DEFAULT (non-landscape) grid -- the hero row can also end up as
+    the canvas's last/bottom row on a low-camera-count session, e.g. only
+    front+back present -- is NOT modeled here: it depends on which OTHER
+    camera angles are present, not just which overlay flags are active, so
+    it doesn't fit this function's pure flags-in-corner-out signature, and
+    it's a PRE-EXISTING exposure --gauge's own bottom-left panel has always
+    had in that layout (this branch doesn't create or worsen it). Left as a
+    known, documented, deferred gap rather than silently ignored.
+    """
+    occupied = {
+        "bottom-right": friction_circle,
+        "bottom-left": gauge or clock_bottom_left,
+        "top-right": scoreboard or note_highway,
+    }
+    for corner in MAP_OVERLAY_CORNERS:
+        if not occupied[corner]:
+            return corner
+    return MAP_OVERLAY_CORNERS[0]  # every corner claimed -- see docstring point 4
+
+
+def write_map_overlay_layout(path, tile_w, tile_h, corner, zoom,
+                             line_width=MAP_OVERLAY_LINE_WIDTH,
+                             bg_alpha=MAP_OVERLAY_BG_ALPHA):
+    """Write a gopro-overlay layout holding the --map-overlay HUD panel: a
+    square moving_journey_map -- the same widget the sidebar --map tile uses
+    (see write_map_layout), just smaller and positioned in one hero-tile
+    corner instead of filling a whole grid cell -- wrapped in a <frame> whose
+    `opacity=` (a SEPARATE attribute from `bg=`'s own color -- see
+    MAP_OVERLAY_BG_ALPHA's own comment for why both are needed, and
+    write_gauge_layout's matching fix) makes the WHOLE panel translucent,
+    map raster included, not just a translucent border around an opaque map.
+
+    `bg_alpha` (0-255) defaults to MAP_OVERLAY_BG_ALPHA but is overridable
+    per-call -- see --map-overlay-alpha, which threads a user-chosen value
+    all the way through build_map_overlay to here, letting the CLI default
+    (tuned once against a real render, see CLAUDE.md) be a starting point
+    rather than the only option.
+
+    Unlike write_map_layout, no crop/centre-offset trick is needed here: the
+    panel itself is deliberately square (MAP_OVERLAY_SIZE_FRAC of the tile's
+    SHORTER side), so the inherently-square widget just fits inside it with a
+    uniform pad on every side -- see the MAP_OVERLAY_* constants' own comments
+    for why.
+
+    `corner` is one of MAP_OVERLAY_CORNERS ("bottom-right"/"bottom-left"/
+    "top-right") -- see pick_map_overlay_corner for how it's chosen.
+    """
+    if corner not in MAP_OVERLAY_CORNERS:
+        raise ValueError(f"unknown --map-overlay corner: {corner!r}")
+
+    panel = max(2, round(min(tile_w, tile_h) * MAP_OVERLAY_SIZE_FRAC))
+    pad = max(2, round(panel * MAP_OVERLAY_PAD_FRAC))
+    map_size = max(2, panel - 2 * pad)
+
+    panel_x = MAP_OVERLAY_MARGIN if corner == "bottom-left" else tile_w - panel - MAP_OVERLAY_MARGIN
+    panel_y = MAP_OVERLAY_MARGIN if corner == "top-right" else tile_h - panel - MAP_OVERLAY_MARGIN
+
+    Path(path).write_text(
+        "<layout>\n"
+        f'    <frame x="{panel_x}" y="{panel_y}" width="{panel}" height="{panel}" '
+        f'cr="{pad}" bg="0,0,0,{bg_alpha}" '
+        f'opacity="{bg_alpha / 255:.3f}">\n'
+        f'        <translate x="{pad}" y="{pad}">\n'
+        f'            <component type="moving_journey_map" name="route" '
+        f'size="{map_size}" zoom="{zoom}" line-width="{line_width}"/>\n'
+        "        </translate>\n"
         "    </frame>\n"
         "</layout>\n"
     )
@@ -1207,35 +1419,41 @@ def build_map_tile(gpx_path, grid_dur, tile_dims, ffmpeg, venv_py, gopro_script,
     return out_path
 
 
-def build_gauge_overlay(hero_video_path, gpx_path, tile_dims, units, ffmpeg, venv_py,
-                        gopro_script, font, out_path, tmpdir, dry_run, progress):
-    """Composite the speed/compass dashboard panel onto the hero camera tile.
-    Returns out_path.
+def build_gopro_layout_overlay(hero_video_path, gpx_path, layout_path, ffmpeg, venv_py,
+                               gopro_script, font, out_path, dry_run, progress,
+                               flag, log_label, kind, step_label, run_what):
+    """Composite an ALREADY-WRITTEN gopro-overlay XML layout onto the hero
+    camera tile. Returns out_path.
 
-    Unlike build_map_tile (which renders a synthetic-size widget layer and
-    needs --overlay-size), this hands gopro-dashboard.py the hero video
-    itself as its positional `input` argument (immediately followed by
-    `output` -- gopro-dashboard.py's argparser has both `input` and `output`
-    as bare positionals, and with a run of optional flags in between the two
-    tokens it mis-assigns them, e.g. treating a lone leading `input` token as
-    satisfying the required `output` positional instead and erroring on the
-    trailing path as "unrecognized arguments"; confirmed by running it for
-    real. Keeping them adjacent, before any --flags, parses correctly): with
-    --use-gpx-only AND a video input, gopro-dashboard reads that video's real
-    dimensions/duration itself (find_recording(), a plain ffprobe of the
-    video stream -- no GoPro-specific metadata track needed) and runs its own
-    internal ffmpeg `[0:v][1:v]overlay` compositing pass (FFMPEGOverlayVideo,
-    in gopro_overlay/ffmpeg_overlay.py) -- producing a fully-composited output
+    Shared tail of build_gauge_overlay and build_map_overlay: both differ
+    only in how their own layout XML gets written (write_gauge_layout's
+    dial/compass/chart panel vs. write_map_overlay_layout's translucent map
+    inset) and where in the hero tile it ends up -- the gopro-dashboard.py
+    invocation itself, the --dry-run printing, and the progress bookkeeping
+    are otherwise identical, so this is the one place that logic lives (the
+    same "one function, not several near-identical ones" convention
+    build_fsd_overlay already established for the FSD showcase overlays,
+    applied here to the gopro-dashboard.py-driven overlays instead).
+
+    This hands gopro-dashboard.py the hero video itself as its positional
+    `input` argument (immediately followed by `output` -- gopro-dashboard.py's
+    argparser has both `input` and `output` as bare positionals, and with a
+    run of optional flags in between the two tokens it mis-assigns them, e.g.
+    treating a lone leading `input` token as satisfying the required `output`
+    positional instead and erroring on the trailing path as "unrecognized
+    arguments"; confirmed by running it for real. Keeping them adjacent,
+    before any --flags, parses correctly): with --use-gpx-only AND a video
+    input, gopro-dashboard reads that video's real dimensions/duration itself
+    (find_recording(), a plain ffprobe of the video stream -- no GoPro-
+    specific metadata track needed) and runs its own internal ffmpeg
+    `[0:v][1:v]overlay` compositing pass (FFMPEGOverlayVideo, in
+    gopro_overlay/ffmpeg_overlay.py) -- producing a fully-composited output
     video in one subprocess call. No filter-graph code of our own is
-    involved; build_filter/build_filter_landscape never learn a gauge was
+    involved; build_filter/build_filter_landscape never learn an overlay was
     composited -- they just see a different source file at the same
     resolution (angle_paths[hero] is swapped in build_grid before either
     runs).
     """
-    tile_w, tile_h = tile_dims
-    layout_path = tmpdir / "gauge_layout.xml"
-    write_gauge_layout(layout_path, tile_w, tile_h, units=units)
-
     gopro_cmd = [
         str(venv_py), str(gopro_script), str(hero_video_path), str(out_path),
         "--use-gpx-only", "--gpx", str(gpx_path),
@@ -1244,19 +1462,65 @@ def build_gauge_overlay(hero_video_path, gpx_path, tile_dims, units, ffmpeg, ven
     ]
 
     if dry_run:
-        log("== [--gauge] would composite the speed/compass dashboard panel "
-            "onto the hero camera tile ==")
+        log(f"== [{flag}] would composite the {log_label} onto the hero camera tile ==")
         printable = " ".join(f"'{a}'" if " " in a else a for a in gopro_cmd)
         log(f"$ {printable}")
         return out_path
 
-    log(f"== [--gauge] compositing dashboard overlay onto {Path(hero_video_path).name} ==")
-    # Same as the map render: gopro-overlay reports no parseable progress here.
-    progress.begin("gauge_render", "gauge overlay render", determinate=False,
-                   out=out_path)
-    run(gopro_cmd, dry_run=False, what="gopro-dashboard (gauge overlay)", progress=progress)
+    log(f"== [{flag}] compositing {log_label} onto {Path(hero_video_path).name} ==")
+    # gopro-overlay reports no parseable progress here.
+    progress.begin(kind, step_label, determinate=False, out=out_path)
+    run(gopro_cmd, dry_run=False, what=run_what, progress=progress)
     progress.end()
     return out_path
+
+
+def build_gauge_overlay(hero_video_path, gpx_path, tile_dims, units, ffmpeg, venv_py,
+                        gopro_script, font, out_path, tmpdir, dry_run, progress):
+    """Composite the speed/compass dashboard panel onto the hero camera tile.
+    Returns out_path. See build_gopro_layout_overlay for how the actual
+    gopro-dashboard.py compositing (shared with build_map_overlay) works.
+    """
+    tile_w, tile_h = tile_dims
+    layout_path = tmpdir / "gauge_layout.xml"
+    write_gauge_layout(layout_path, tile_w, tile_h, units=units)
+    return build_gopro_layout_overlay(
+        hero_video_path, gpx_path, layout_path, ffmpeg, venv_py, gopro_script, font,
+        out_path, dry_run, progress, flag="--gauge",
+        log_label="speed/compass dashboard panel", kind="gauge_render",
+        step_label="gauge overlay render", run_what="gopro-dashboard (gauge overlay)")
+
+
+def build_map_overlay(hero_video_path, gpx_path, tile_dims, corner, zoom, ffmpeg, venv_py,
+                      gopro_script, font, out_path, tmpdir, dry_run, progress,
+                      bg_alpha=MAP_OVERLAY_BG_ALPHA):
+    """Composite the translucent HUD-style route-map inset onto a corner of
+    the hero camera tile. Returns out_path. See build_gopro_layout_overlay
+    for how the actual gopro-dashboard.py compositing (shared with
+    build_gauge_overlay) works; see pick_map_overlay_corner for how `corner`
+    is chosen when other hero-tile overlays are also active.
+
+    `bg_alpha` (0-255) is the panel's translucency -- see --map-overlay-alpha
+    and write_map_overlay_layout's own docstring; defaults to
+    MAP_OVERLAY_BG_ALPHA, the CLI's own default.
+
+    Additive alongside --map (the sidebar tile): both use the exact same
+    already-extracted/re-timed GPX (build_route_gpx, called once by
+    build_grid regardless of how many of --map/--gauge/--map-overlay/the FSD
+    showcase flags are active), just rendered through two independent
+    gopro-dashboard.py invocations -- one to a standalone tile file
+    (build_map_tile), one composited straight onto the hero (here). Neither
+    knows the other ran.
+    """
+    tile_w, tile_h = tile_dims
+    layout_path = tmpdir / "map_overlay_layout.xml"
+    write_map_overlay_layout(layout_path, tile_w, tile_h, corner=corner, zoom=zoom,
+                             bg_alpha=bg_alpha)
+    return build_gopro_layout_overlay(
+        hero_video_path, gpx_path, layout_path, ffmpeg, venv_py, gopro_script, font,
+        out_path, dry_run, progress, flag="--map-overlay",
+        log_label="live route-map HUD inset", kind="map_overlay_render",
+        step_label="map overlay render", run_what="gopro-dashboard (map overlay)")
 
 
 # Per-widget log/progress labels for build_fsd_overlay -- the only thing that
@@ -2089,6 +2353,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "like 'repeaters'. Can be combined with --gauge/--fsd-scoreboard/"
                          "--fsd-friction-circle -- positioned full-width below the top-anchored "
                          "hero label and streak scoreboard, clear of all three other overlays.")
+    ap.add_argument("--map-overlay", action="store_true",
+                    help="composite a small, semi-transparent HUD-style live route map "
+                         "directly onto a corner of the hero camera tile -- an alternative "
+                         "(or addition) to --map's sidebar tile. Same prerequisites as --map "
+                         "(SEI telemetry, gopro-overlay in ./.venv -- see --map's help; shares "
+                         "the same GPS extraction) and reuses --map-zoom. v1 only supports a "
+                         "solo hero: --feature must be a single camera, not a pair like "
+                         "'repeaters'. Prefers the hero tile's bottom-right corner (clear of "
+                         "--gauge's bottom-left panel); falls back to another corner if "
+                         "--fsd-friction-circle (which also uses bottom-right) is also active. "
+                         "Can be combined with --map -- both a sidebar tile AND a HUD inset is "
+                         "a valid, if unusual, combination.")
+    ap.add_argument("--map-overlay-alpha", type=int, default=MAP_OVERLAY_BG_ALPHA,
+                    help=f"translucency of the --map-overlay HUD panel, 0 (invisible) to 255 "
+                         f"(fully opaque). Default {MAP_OVERLAY_BG_ALPHA} (~"
+                         f"{round(MAP_OVERLAY_BG_ALPHA / 255 * 100)}% opaque), tuned against a "
+                         f"real render -- see CLAUDE.md. Ignored unless --map-overlay is set.")
     ap.add_argument("--force-concat", action="store_true",
                     help="rebuild the per-camera concats even if matching ones already exist")
     ap.add_argument("--skip-space-check", action="store_true", help="don't pre-flight free disk space")
@@ -2108,10 +2389,10 @@ def build_parser() -> argparse.ArgumentParser:
 class Tools:
     """Resolved external tool paths + label/blur/map/gauge/FSD-overlay capability
     flags for one run. map_venv_py/map_gopro/map_font are shared by --map,
-    --gauge, --fsd-scoreboard, --fsd-friction-circle and --fsd-note-highway --
-    all five use the same gopro-overlay installation (the three FSD showcase
-    flags only need map_venv_py; map_gopro/map_font are gopro-dashboard.py-
-    specific and unused by tesla_fsd_overlay.py)."""
+    --gauge, --map-overlay, --fsd-scoreboard, --fsd-friction-circle and
+    --fsd-note-highway -- all six use the same gopro-overlay installation (the
+    three FSD showcase flags only need map_venv_py; map_gopro/map_font are
+    gopro-dashboard.py-specific and unused by tesla_fsd_overlay.py)."""
     ffmpeg: str
     ffprobe: str
     has_text: bool
@@ -2161,12 +2442,12 @@ def setup_tools(args) -> Tools:
                 "(CPU-only works -- no GPU required; the first run downloads a ~36MB "
                 "face-detection model.)")
 
-    if (args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway):
-        # --map, --gauge, --fsd-scoreboard, --fsd-friction-circle and
-        # --fsd-note-highway share the same gopro-overlay tooling and GPS
+    if (args.map or args.gauge or args.map_overlay or args.fsd_scoreboard
+            or args.fsd_friction_circle or args.fsd_note_highway):
+        # --map, --gauge, --map-overlay, --fsd-scoreboard, --fsd-friction-circle
+        # and --fsd-note-highway share the same gopro-overlay tooling and GPS
         # extraction (see build_route_gpx) -- one discovery/validation block
-        # for all five. The three FSD showcase flags don't need
+        # for all six. The three FSD showcase flags don't need
         # gopro-dashboard.py itself (tesla_fsd_overlay.py is its own driver
         # script), only the venv's Python and an installed gopro_overlay --
         # both of which find_map_tooling already checks.
@@ -2174,6 +2455,7 @@ def setup_tools(args) -> Tools:
         map_venv_py, map_gopro, map_missing = find_map_tooling(script_dir)
         if map_missing:
             active = [n for n, f in (("--map", args.map), ("--gauge", args.gauge),
+                                     ("--map-overlay", args.map_overlay),
                                      ("--fsd-scoreboard", args.fsd_scoreboard),
                                      ("--fsd-friction-circle", args.fsd_friction_circle),
                                      ("--fsd-note-highway", args.fsd_note_highway)) if f]
@@ -2182,19 +2464,35 @@ def setup_tools(args) -> Tools:
                 "Set it up with:\n"
                 "  python3.12 -m venv .venv && ./.venv/bin/python -m pip install gopro-overlay\n"
                 f"Missing: {', '.join(map_missing)}")
-        if args.map:
+        if args.map or args.map_overlay:
+            # --map-overlay reuses --map-zoom (no separate --map-overlay-zoom
+            # flag -- it's the same moving_journey_map widget, just smaller
+            # and positioned differently), so validate it whenever EITHER map
+            # mode is active, not just --map. --map-mag stays --map-only:
+            # --map-overlay's compositing path (build_gopro_layout_overlay)
+            # doesn't have build_map_tile's separate synthetic-render+upscale
+            # pass to hang a magnification step off of.
             if not 1 <= args.map_zoom <= 19:
                 die(f"--map-zoom {args.map_zoom} is out of range; OSM tiles support 1-19 "
                     f"(default 19; use --map-mag to go tighter).")
+        if args.map:
             if not 1.0 <= args.map_mag <= 4.0:
                 die(f"--map-mag {args.map_mag} is out of range; use 1.0 (off) to 4.0. "
                     f"Higher magnifies more (tighter) but softer.")
+        if args.map_overlay:
+            if not 0 <= args.map_overlay_alpha <= 255:
+                die(f"--map-overlay-alpha {args.map_overlay_alpha} is out of range; use "
+                    f"0 (invisible) to 255 (fully opaque).")
         tools.map_venv_py, tools.map_gopro = map_venv_py, map_gopro
         tools.map_font = find_map_font()
 
     if args.gauge and len(hero_angles_for(args.feature)) > 1:
         die("--gauge needs a solo --feature (a pair like 'repeaters' has two hero "
             "tiles) -- pick a single camera.")
+
+    if args.map_overlay and len(hero_angles_for(args.feature)) > 1:
+        die("--map-overlay needs a solo --feature (a pair like 'repeaters' has two "
+            "hero tiles) -- pick a single camera.")
 
     if args.fsd_scoreboard and len(hero_angles_for(args.feature)) > 1:
         die("--fsd-scoreboard needs a solo --feature (a pair like 'repeaters' has two "
@@ -2313,11 +2611,12 @@ def plan_steps(args, selections, footage):
         steps.append(Step("concat", f"concat {angle}", footage[angle]))
         if args.blur_faces:
             steps.append(Step("blur", f"blur faces {angle}", footage[angle]))
-    if (args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway):
+    if (args.map or args.gauge or args.map_overlay or args.fsd_scoreboard
+            or args.fsd_friction_circle or args.fsd_note_highway):
         # GPS extraction is shared -- one map_gps step regardless of which of
-        # --map, --gauge, --fsd-scoreboard, --fsd-friction-circle,
-        # --fsd-note-highway (or several) were requested (see build_route_gpx).
+        # --map, --gauge, --map-overlay, --fsd-scoreboard,
+        # --fsd-friction-circle, --fsd-note-highway (or several) were
+        # requested (see build_route_gpx).
         map_source = "front" if "front" in selections else next(iter(selections))
         map_work = footage[map_source]
         steps.append(Step("map_gps", "GPS extract", map_work))
@@ -2333,6 +2632,8 @@ def plan_steps(args, selections, footage):
             steps.append(Step("friction_circle_render", "friction circle render", map_work))
         if args.fsd_note_highway:
             steps.append(Step("note_highway_render", "note highway render", map_work))
+        if args.map_overlay:
+            steps.append(Step("map_overlay_render", "map overlay render", map_work))
     if len(selections) > 1 or args.map:
         # The grid encodes the OUTPUT timeline, which --speed has already scaled.
         steps.append(Step("grid", "grid encode",
@@ -2471,14 +2772,15 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
         dims = {a: probe_dims(ffprobe, p) for a, p in angle_paths.items()}
 
     # Build the optional live route-map tile, --gauge dashboard overlay,
-    # and/or the FSD showcase overlays (--fsd-scoreboard, --fsd-friction-
-    # circle, --fsd-note-highway). All five need the same GPS: extracted from
-    # the ORIGINAL front source clips (SEI lives in the source bitstream, not
-    # the concat/blurred outputs) and re-timed onto the grid timeline --
-    # build_route_gpx does this ONCE and is shared by all five, so requesting
-    # several together doesn't pay for it more than once.
-    if (args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway):
+    # --map-overlay HUD map inset, and/or the FSD showcase overlays
+    # (--fsd-scoreboard, --fsd-friction-circle, --fsd-note-highway). All six
+    # need the same GPS: extracted from the ORIGINAL front source clips (SEI
+    # lives in the source bitstream, not the concat/blurred outputs) and
+    # re-timed onto the grid timeline -- build_route_gpx does this ONCE and
+    # is shared by all six, so requesting several together doesn't pay for
+    # it more than once.
+    if (args.map or args.gauge or args.map_overlay or args.fsd_scoreboard
+            or args.fsd_friction_circle or args.fsd_note_highway):
         t0 = time.monotonic()
         map_source = "front" if "front" in plan.selections else next(iter(plan.selections))
         src_sel, src_off, _ = plan.selections[map_source]
@@ -2495,7 +2797,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
             # counting work that isn't coming.
             progress.abandon("map_render", "map_scale", "gauge_render",
                              "scoreboard_render", "friction_circle_render",
-                             "note_highway_render")
+                             "note_highway_render", "map_overlay_render")
         else:
             if args.map:
                 t0 = time.monotonic()
@@ -2614,6 +2916,54 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                 angle_paths[hero_angle] = built
                 stats["note_highway_built"] = True
 
+            if args.map_overlay:
+                t0 = time.monotonic()
+                # A solo hero is guaranteed by setup_tools (dies early on a
+                # paired --feature), same as --gauge/the FSD showcase
+                # overlays above.
+                hero_angle = hero_angles_for(args.feature)[0]
+                # Corner choice depends on which OTHER hero-tile overlays are
+                # active this run -- see pick_map_overlay_corner's own
+                # docstring for the full preference order and why
+                # --fsd-friction-circle (also bottom-right by default) is the
+                # one real collision risk. Computed here, not in setup_tools,
+                # since it only needs the CLI flags (all already known by
+                # then, actually) -- kept here anyway so it sits next to the
+                # one place that consumes it, matching how hero_angle itself
+                # is resolved locally in every other overlay block above
+                # rather than threaded through Tools/Plan.
+                #
+                # clock_bottom_left=True under --landscape (with labels on):
+                # the hero tile spans the full canvas height at the left
+                # edge in that layout, so canvas bottom-left (where the
+                # burned-in clock is drawn, _apply_tail) IS hero-tile
+                # bottom-left, unconditionally -- confirmed as a real
+                # collision against a real render, not a hypothetical one
+                # (see pick_map_overlay_corner's own parameter doc).
+                corner = pick_map_overlay_corner(
+                    gauge=args.gauge, scoreboard=args.fsd_scoreboard,
+                    friction_circle=args.fsd_friction_circle,
+                    note_highway=args.fsd_note_highway,
+                    clock_bottom_left=args.landscape and tools.has_text)
+                # Persist the composited hero (not tmpdir): same rationale as
+                # every overlay above -- a real, potentially slow, standalone
+                # artifact, and it replaces angle_paths[hero_angle] below so
+                # both build_filter and build_filter_landscape pick it up
+                # without either needing to know a map overlay was
+                # composited. Chains after every other hero-tile overlay
+                # above (if any also ran), same pattern this file already
+                # uses throughout -- it's the newest of the five, so it goes
+                # last.
+                map_overlay_out = out_dir / f"{session_name}_{hero_angle}_map-overlay.mp4"
+                built = build_map_overlay(
+                    angle_paths[hero_angle], gpx_path, dims[hero_angle], corner,
+                    args.map_zoom, ffmpeg, tools.map_venv_py, tools.map_gopro,
+                    tools.map_font, map_overlay_out, tmpdir, args.dry_run, progress,
+                    bg_alpha=args.map_overlay_alpha)
+                stats["map_overlay_s"] += time.monotonic() - t0
+                angle_paths[hero_angle] = built
+                stats["map_overlay_built"] = True
+
     if len(angle_paths) < 2:
         log("\nOnly one camera angle found -- skipping grid, per-angle concat above is the "
             "final output.")
@@ -2654,6 +3004,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     suffix += "_friction-circle" if stats.get("friction_circle_built") else ""
     suffix += "_note-highway" if stats.get("note_highway_built") else ""
     suffix += "_map" if MAP_TILE_KEY in angle_paths else ""
+    suffix += "_map-overlay" if stats.get("map_overlay_built") else ""
     out_grid = out_dir / f"{session_name}_grid{suffix}.mp4"
     cmd += ["-an", "-movflags", "+faststart", str(out_grid)]
 
@@ -2690,8 +3041,8 @@ def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
     log(f"  footage          {human_time(grid_dur)} of combined video")
     log(f"  concat           {human_time(stats['concat_s'])} "
         f"({stats['built']} built, {stats['reused']} reused)")
-    if ((args.map or args.gauge or args.fsd_scoreboard or args.fsd_friction_circle
-            or args.fsd_note_highway) and stats["gps_s"] > 0):
+    if ((args.map or args.gauge or args.map_overlay or args.fsd_scoreboard
+            or args.fsd_friction_circle or args.fsd_note_highway) and stats["gps_s"] > 0):
         log(f"  GPS extract      {human_time(stats['gps_s'])}")
     if args.map:
         map_built = MAP_TILE_KEY in angle_paths
@@ -2709,6 +3060,9 @@ def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
     if args.fsd_note_highway:
         log(f"  FSD note highway {human_time(stats['note_highway_s'])}"
             f"{'' if stats['note_highway_built'] else '  (no GPS -- overlay skipped)'}")
+    if args.map_overlay:
+        log(f"  map overlay      {human_time(stats['map_overlay_s'])}"
+            f"{'' if stats['map_overlay_built'] else '  (no GPS -- overlay skipped)'}")
     if args.blur_faces:
         log(f"  face blur        {human_time(stats['blur_s'])} "
             f"({stats['blurred']} blurred, {stats['blur_reused']} reused)")
@@ -2766,7 +3120,8 @@ def main(argv=None) -> int:
              "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
              "scoreboard_s": 0.0, "scoreboard_built": False,
              "friction_circle_s": 0.0, "friction_circle_built": False,
-             "note_highway_s": 0.0, "note_highway_built": False}
+             "note_highway_s": 0.0, "note_highway_built": False,
+             "map_overlay_s": 0.0, "map_overlay_built": False}
 
     folder = args.folder.resolve()
     if not folder.is_dir():

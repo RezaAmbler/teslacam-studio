@@ -61,6 +61,17 @@ traces where you drove.
   `--fsd-scoreboard`/`--fsd-friction-circle` (shared). Can be combined with
   any of the other three — all four overlays occupy non-overlapping regions
   of the hero tile.
+- **HUD-style map inset** (`--map-overlay`) — a small, translucent live route
+  map composited directly onto a corner of the hero camera tile, instead of
+  (or alongside) `--map`'s sidebar tile. Same moving map/route-trace widget
+  as `--map`, same GPS telemetry (shared — requesting several overlays
+  together only extracts GPS once), reuses `--map-zoom`. Prefers the hero
+  tile's bottom-right corner; if `--fsd-friction-circle` is also active (the
+  one other overlay that also defaults there), it falls back to another free
+  corner automatically. Additive with `--map` — a sidebar tile AND a HUD
+  inset together is a valid combination. Translucency is tunable with
+  `--map-overlay-alpha 0-255` (default 110, ~43% opaque) — lower is more
+  see-through.
 - **Landscape layout** (`--landscape`) — the featured camera at full native
   resolution on the left, every other camera (and the map, if any) in a thin
   sidebar column on the right, sized to match. Produces a real landscape
@@ -137,7 +148,7 @@ predicted from that measurement).
   ```
   The script auto-detects `ffmpeg-full` and falls back gracefully.
 - **Python 3.9+** for the core tool (standard library only).
-- For `--map` / `--gauge` / `--fsd-scoreboard` / `--fsd-friction-circle` / `--fsd-note-highway`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
+- For `--map` / `--gauge` / `--map-overlay` / `--fsd-scoreboard` / `--fsd-friction-circle` / `--fsd-note-highway`: **Python 3.10+** and `gopro-overlay` in a local venv (below).
 - For `--blur-faces`: `pip install deface` (optional).
 
 ## Setup
@@ -147,17 +158,18 @@ git clone https://github.com/RezaAmbler/teslacam-studio.git
 cd teslacam-studio
 
 # Optional — only needed for the --map route overlay / --gauge dashboard overlay /
-# --fsd-scoreboard streak scoreboard / --fsd-friction-circle G-meter /
-# --fsd-note-highway cornering ribbon:
+# --map-overlay HUD map inset / --fsd-scoreboard streak scoreboard /
+# --fsd-friction-circle G-meter / --fsd-note-highway cornering ribbon:
 python3.12 -m venv .venv
 ./.venv/bin/python -m pip install gopro-overlay
 ```
 
-The `--map`/`--gauge` features look for `gopro-dashboard.py` inside `./.venv`;
-`--fsd-scoreboard`/`--fsd-friction-circle`/`--fsd-note-highway` look for their
-own driver script (`tesla_fsd_overlay.py`) and the `gopro-overlay` library
-installed there. `--map` downloads OpenStreetMap tiles on first use (so it
-needs network access); `--gauge`/`--fsd-scoreboard`/`--fsd-friction-circle`/
+The `--map`/`--gauge`/`--map-overlay` features look for `gopro-dashboard.py`
+inside `./.venv`; `--fsd-scoreboard`/`--fsd-friction-circle`/
+`--fsd-note-highway` look for their own driver script
+(`tesla_fsd_overlay.py`) and the `gopro-overlay` library installed there.
+`--map`/`--map-overlay` download OpenStreetMap tiles on first use (so they
+need network access); `--gauge`/`--fsd-scoreboard`/`--fsd-friction-circle`/
 `--fsd-note-highway` composite onto your own footage and need no network
 access.
 
@@ -209,6 +221,11 @@ python3 tesla_combine.py /path/to/event/folder --fsd-friction-circle
 # Composite an FSD note-highway cornering ribbon onto the hero tile (needs gopro-overlay in ./.venv)
 python3 tesla_combine.py /path/to/event/folder --fsd-note-highway
 
+# Composite a small translucent HUD map inset onto the hero tile's corner,
+# instead of (or alongside) the sidebar tile (needs gopro-overlay in ./.venv)
+python3 tesla_combine.py /path/to/event/folder --map-overlay
+python3 tesla_combine.py /path/to/event/folder --map --map-overlay
+
 # All four hero-tile overlays together (each occupies its own region)
 python3 tesla_combine.py /path/to/event/folder --gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway
 
@@ -240,6 +257,8 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--fsd-scoreboard` | Composite an FSD streak scoreboard (hands-free time, corner count, peak G, takeovers) onto the hero tile (solo `--feature` only) |
 | `--fsd-friction-circle` | Composite an FSD friction-circle G-meter (lateral vs. longitudinal G, fading trail, peak-this-corner) onto the hero tile (solo `--feature` only) |
 | `--fsd-note-highway` | Composite an FSD note-highway cornering ribbon (scrolling signed lateral-G severity, "now" fixed at center) onto the hero tile (solo `--feature` only) |
+| `--map-overlay` | Composite a small translucent HUD-style route map onto a corner of the hero tile — additive with `--map` (solo `--feature` only) |
+| `--map-overlay-alpha` | Translucency of the `--map-overlay` panel, `0` (invisible) to `255` (fully opaque) (default `110`) |
 | `--landscape` | Hero camera at native res + thin sidebar column, instead of the tall grid |
 | `--native` | True native resolution (skips the hardware-fit scale-down) |
 | `--quality` | `fast` (default, hardware) or `high` (software libx264, CRF 18) |
@@ -272,7 +291,8 @@ Written next to the input folder unless `--output-dir` is given:
 | `<session>_<hero-angle>_scoreboard.mp4` | (with `--fsd-scoreboard`) that hero tile, streak scoreboard composited on |
 | `<session>_<hero-angle>_friction-circle.mp4` | (with `--fsd-friction-circle`) that hero tile, friction-circle G-meter composited on |
 | `<session>_<hero-angle>_note-highway.mp4` | (with `--fsd-note-highway`) that hero tile, note-highway cornering ribbon composited on |
-| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map].mp4` | the labeled multi-camera composite |
+| `<session>_<hero-angle>_map-overlay.mp4` | (with `--map-overlay`) that hero tile, translucent HUD map inset composited on |
+| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4` | the labeled multi-camera composite |
 
 `playcheck.sh <file.mp4>` runs headless playback sanity checks (decode integrity,
 faststart index, hardware-decodable dimensions, constant frame rate).
