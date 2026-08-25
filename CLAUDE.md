@@ -622,25 +622,45 @@ scoreboard overlay.
     highway" bullet above for why it doesn't literally call `g_to_offset`
     itself, which is a two-axis function this single-axis ribbon doesn't
     need.)
-  - **Design note, now revisited**: at the time this was originally written,
-    `--gauge` → `--fsd-scoreboard` → `--fsd-friction-circle` already chained
-    as three sequential subprocess renders of the hero tile (each a full
-    decode + draw + re-encode generation), and landing the note-highway
-    ribbon and pace-notes the same way was flagged as something that would
-    make five generations — worth combining `create_widgets_for`'s multiple
-    FSD widgets into one compositing pass before a third FSD widget landed,
-    not after. Note-highway has now landed the same sequential-subprocess
-    way anyway (a fourth `build_fsd_overlay` call chained through
-    `angle_paths[hero_angle]`, not a combined pass), so
-    `--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`
-    together now really does mean four sequential hero-tile re-encode
-    generations. This is worth revisiting for real now that all four
-    showcase visuals exist (only pace-notes remains) — `create_widgets_for`
-    already returns a widget *list*, so one `tesla_fsd_overlay.py`
-    invocation could draw multiple FSD widgets (not `--gauge`, a different
-    tool, which is its own subprocess and layout system entirely) in a
-    single pass if `--widget` took multiple values, cutting four re-encodes
-    to one regardless of how many of the four flags are combined.
+  - **Design note, now revisited — and actually done, not just planned**: at
+    the time this was originally written, `--gauge` → `--fsd-scoreboard` →
+    `--fsd-friction-circle` already chained as three sequential subprocess
+    renders of the hero tile (each a full decode + draw + re-encode
+    generation), and note-highway then landed the same sequential-subprocess
+    way too (a fourth `build_fsd_overlay` call chained through
+    `angle_paths[hero_angle]`), so `--gauge --fsd-scoreboard
+    --fsd-friction-circle --fsd-note-highway` together meant FOUR sequential
+    hero-tile re-encode generations — measured for real on a real ~47-minute
+    session, one such pass alone projected to ~3h09m, so four sequentially
+    ran well over half a day. The `fsd-consolidated-overlay-pass` branch did
+    the consolidation this note anticipated: `tesla_fsd_overlay.py`'s
+    `--widget` flag is now `nargs="+"` (accepts multiple values),
+    `create_widgets_for` builds and returns ALL requested widgets in one
+    list (it always returned a list, just of length 1 before), and
+    `tesla_combine.py`'s `build_fsd_overlay`/`build_grid` now collect every
+    active `--fsd-*` flag and make exactly ONE `tesla_fsd_overlay.py` call
+    carrying all of them — cutting those three-or-fewer sequential FSD
+    passes down to ONE regardless of how many of the three flags are
+    combined. `--gauge` deliberately stays its OWN separate pass (a
+    genuinely different tool/subprocess, `gopro-dashboard.py`, not
+    `tesla_fsd_overlay.py`) — so the ceiling drops from 4 sequential
+    hero-tile passes to 2 (gauge, then one combined FSD pass), not to 1.
+    `FSD_OVERLAY_META` was correspondingly trimmed to hold only per-widget
+    *display* info (flag name, log label) — `kind`/`step_label`/`run_what`
+    became fixed values (`FSD_OVERLAY_KIND` etc.) since there's only ever
+    one combined kind now, not a per-widget lookup. The pre-existing
+    per-flag filename suffix convention and `stats["*_built"]` flags were
+    deliberately preserved byte-for-byte (only the *timing* accumulator
+    consolidated, from three `stats["*_s"]` counters to one
+    `stats["fsd_overlay_s"]`) — confirmed by rerunning every pre-existing
+    filename/suffix-order test with only its stats-dict *fixture* updated
+    to the new key shape (the tests' own assertions on filename/suffix/
+    `*_built` shape needed no change at all), the same "confirm the
+    consolidation alone changes nothing about the existing flags' behavior"
+    discipline the original `build_fsd_overlay` consolidation (scoreboard →
+    friction-circle → note-highway, described above) already established.
+    See "Verification status" below for what a real render and an
+    independent Fable review confirmed about this.
 - `--fsd-note-highway`/`NoteHighway`: the central architectural claim — that
   draw-call index N and `lateral_g_timeline[N]` stay in lockstep — was
   checked empirically, not just by reading `framemeta.py`/`framemeta_gpx.py`:
@@ -888,6 +908,138 @@ scoreboard overlay.
       untested corner combination, the no-GPS degradation path) below the
       "real bug" bar this project's reviews use to gate a fix, some of
       which were still added anyway since they were cheap.
+- **FSD overlay consolidation (`fsd-consolidated-overlay-pass` branch):**
+  the four-sequential-hero-tile-passes problem the friction-circle branch's
+  own "Design note, now revisited" flagged is fixed for real, not just
+  replanned again -- see that note (above, under the friction-circle
+  bullet) for the mechanism. Confirmed multiple independent ways, not just
+  by reading the diff:
+  - **`--dry-run --verbose`** with all three `--fsd-*` flags plus `--gauge`
+    together prints exactly ONE `tesla_fsd_overlay.py` command line (`grep
+    -c tesla_fsd_overlay.py` on the output == 1), carrying
+    `--widget scoreboard friction-circle note-highway` as one invocation --
+    not three separate command lines. The job plan line also collapsed from
+    what would have been three separate step labels to one: `Plan: 12 steps
+    (6 concat, GPS extract, map render, map upscale, gauge render, FSD
+    overlay render, grid)` -- one `FSD overlay render` step, not three.
+  - **A real render** (`--landscape --quality high --map --map-zoom 16
+    --gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`, the
+    same real footage/trim-window every overlay branch in this file has
+    been verified against, 60s of real drive) completed in 2m57s wall clock
+    total. The STATS section shows exactly the structural change this
+    branch claims: `gauge overlay 54s` and ONE consolidated
+    `FSD overlay (scoreboard+friction-circle+note-highway) 59s` line -- not
+    three separate FSD timing lines -- i.e. 2 hero-tile re-encode passes for
+    this run (gauge, then one combined FSD pass), down from what would have
+    been 4 before this branch (gauge + 3 separate FSD passes). The
+    intermediate hero-tile filename also reflects one combined FSD pass:
+    `..._front_scoreboard_friction-circle_note-highway.mp4`, a single file,
+    not three. The FINAL grid filename kept its pre-existing per-flag
+    suffix shape unchanged, confirming the "preserve the naming convention,
+    consolidate only the timing/pass count" design held for real, not just
+    in the unit tests: `..._grid_landscape_gauge_scoreboard_friction-circle_
+    note-highway_map.mp4`.
+  - `playcheck.sh` clean on the real render's output (decode integrity,
+    faststart, hw-decodable dims at 3378x1876, CFR at 1321 frames).
+  - **Visual regression check**: a frame extracted from partway through the
+    real render's output and cropped to the hero tile shows all four
+    hero-tile overlays rendering exactly as designed, with no collisions
+    and no visible change from their pre-consolidation appearance -- the
+    whole point being identical visual output via a cheaper pipeline, not a
+    different one: hero label top-left ("FRONT"), `StreakScoreboard`
+    top-right ("FSD ENGAGED", hands-free/corner/peak-G/takeover stats),
+    `NoteHighway` ribbon directly below both top-anchored elements (with its
+    full PAST/NOW/AHEAD/CORNERING SEVERITY legend intact), `--gauge`'s
+    dashboard bottom-left (dial/compass/speed/chart, plus the burned-in
+    clock in the same corner), and `FrictionCircle` bottom-right (ringed
+    target, current dot, "peak this corner" readout) -- all five hero-tile
+    overlays (four FSD/gauge + the burned-in clock) coexisting exactly as
+    the pre-existing corner/collision design intended.
+  - Regression coverage: all pre-existing FSD/gauge/map-overlay tests
+    (filename suffix, `_built` flags, dry-run `--widget` command
+    assertions) pass unmodified after updating only their stats-dict
+    fixture shape (three `_s` timing keys -> one `fsd_overlay_s`, the three
+    `_built` flags kept as-is) -- confirming the consolidation really is
+    behavior-preserving for every pre-existing flag combination, the same
+    way the original `build_fsd_overlay` generalization (scoreboard ->
+    friction-circle -> note-highway) was confirmed. New tests were added
+    specifically for the consolidation itself (not covered by any
+    pre-existing test, which only ever exercised one `--fsd-*` flag at a
+    time or checked filename shape): monkeypatching `build_fsd_overlay` to
+    count/inspect calls confirms `--gauge --fsd-scoreboard
+    --fsd-friction-circle --fsd-note-highway` together produces exactly ONE
+    call carrying all three widget names in order, and a second test
+    confirms a partial combination (two of three flags) also collapses to
+    one call carrying just those two names, not a spurious third.
+  - **Independent Fable review**: read the full diff plus the surrounding
+    unchanged code it touches (`Progress`, `build_grid`, `plan_steps`,
+    `print_stats`, the suffix-construction block, `tesla_fsd_overlay.py`'s
+    whole `main()`), reran the test suite independently, and exercised the
+    new `nargs="+"` argparse behavior for real under `./.venv` rather than
+    just reading it. Found no real bugs in the consolidation logic itself —
+    the widget build order (fixed by build_grid's own
+    `(scoreboard, friction-circle, note-highway)` tuple, not CLI argument
+    order, and confirmed to reproduce the old sequential passes' painter's-
+    algorithm layering), the `lateral_g_timeline` membership-check plumbing,
+    the `diagnostic`-combination rejection, the ETA/rate-tracking math (one
+    `fsd_overlay_render` step's `work` correctly covers what used to be up
+    to three steps' work, since `Progress` costs/recalibrates purely by
+    `kind`, not step count), and the `stats["*_built"]`/filename-suffix
+    preservation across every flag combination (including zero-flags/
+    no-GPS) were all independently confirmed correct — including confirming
+    for real that `--widget`'s new `nargs="+"` doesn't reintroduce the
+    positional-argument mis-assignment class of bug this project's own
+    `gopro-dashboard.py` history warns about (build_fsd_overlay's command
+    shape keeps positionals first, `--widget` last with its values
+    trailing; `choices=` also rejects a malformed invocation loudly instead
+    of silently mis-parsing).
+
+    It did catch three real, pre-commit issues, all fixed and re-verified:
+    - A dangling `[see below]` placeholder in this very file (this bullet
+      you're reading now is the fill-in).
+    - `tesla_combine.py`'s own module docstring (its `Output:` block) still
+      listed the three old separate per-widget intermediate filenames
+      (`..._scoreboard.mp4`, `..._friction-circle.mp4`,
+      `..._note-highway.mp4`) even though `README.md`'s equivalent table
+      had already been updated to the new combined `<widgets>`-joined form
+      — fixed to match.
+    - **A real dead-code bug**: `plan_steps` built a widget-detailed step
+      label (`f"FSD overlay render ({'+'.join(active_fsd)})"`), but
+      `build_fsd_overlay` called `progress.begin()` with the fixed
+      `FSD_OVERLAY_STEP_LABEL` constant instead — and `Progress._advance`
+      always overwrites the planned label with whatever `begin()` passes,
+      so the widget detail silently never reached the running/done log
+      lines (a real information loss vs. the old three-separate-steps
+      design, which showed which widget was rendering). Fixed by building
+      the same `f"{FSD_OVERLAY_STEP_LABEL} ({'+'.join(widgets)})"` label
+      inside `build_fsd_overlay` itself and passing that to `begin()` —
+      confirmed with a direct call against a stubbed `Progress`/`run` that
+      the label reaching `begin()` now really does carry the widget names
+      (`"FSD overlay render (scoreboard+friction-circle+note-highway)"`),
+      not just that the string is built somewhere unused.
+
+    Also flagged, and judged worth fixing since they were cheap (below the
+    "real bug" bar, same convention every prior review's cheap-fixes have
+    followed): a garbled sentence in `create_widgets_for`'s own docstring
+    (rewritten); a CLAUDE.md sentence claiming pre-existing tests were
+    rerun "unmodified" when their stats-dict *fixtures* (not their
+    assertions) had in fact been updated to the new key shape (reworded to
+    say precisely that); and two test-coverage gaps — no test pinned the
+    exact `kind` string `build_grid`'s no-GPS `progress.abandon(...)` call
+    passes (a typo there would leave a step stuck "pending" forever with
+    nothing to fail), and no dry-run command-string test covered a
+    two-of-three widget subset (only the all-three and single-widget cases
+    had one) — both added as new tests (`test_fsd_overlay_step_abandoned_
+    when_no_gps`, `test_fsd_overlay_dry_run_two_widget_subset_command`,
+    `tests/test_combine_layout.py`). Not flagged as bugs, only recorded:
+    the `else` fallback in `create()` maps any unrecognized widget name to
+    `StreakScoreboard` (pre-existing shape from before this branch, and
+    unreachable from `tesla_combine.py` since its own three flags are the
+    only source of widget names — a direct caller bypassing `main()`'s
+    `choices=` validation is the only way to hit it) and duplicate widget
+    names are silently accepted by the same unreachable path. Full test
+    suite: 318 passing after these fixes (up from 313 at the start of this
+    branch, up from 316 before this review's two added tests).
 
 ## Gotchas
 - Never commit footage or rendered outputs.

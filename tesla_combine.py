@@ -38,9 +38,10 @@ Output (written next to the input folder unless --output-dir is given):
     <session>_<angle>_blurred.mp4    -- (with --blur-faces) that concat, faces anonymized
     <session>_maptile.mp4            -- (with --map) the standalone live route-map tile
     <session>_<hero-angle>_gauge.mp4 -- (with --gauge) that hero tile, dashboard overlay composited on
-    <session>_<hero-angle>_scoreboard.mp4 -- (with --fsd-scoreboard) that hero tile, streak scoreboard composited on
-    <session>_<hero-angle>_friction-circle.mp4 -- (with --fsd-friction-circle) that hero tile, friction-circle G-meter composited on
-    <session>_<hero-angle>_note-highway.mp4 -- (with --fsd-note-highway) that hero tile, note-highway cornering ribbon composited on
+    <session>_<hero-angle>_<widgets>.mp4 -- (with any of --fsd-scoreboard/--fsd-friction-circle/
+        --fsd-note-highway) that hero tile, with every requested FSD widget composited on in ONE
+        pass; <widgets> is the active widget names joined by _, e.g. _scoreboard, or
+        _scoreboard_friction-circle_note-highway if all three are requested together
     <session>_<hero-angle>_map-overlay.mp4 -- (with --map-overlay) that hero tile, translucent HUD map inset composited on
     <session>_grid[_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4 -- labeled multi-camera composite w/ clock
 """
@@ -60,7 +61,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-SCRIPT_VERSION = "2.8"
+SCRIPT_VERSION = "2.9"
 # Separate from SCRIPT_VERSION so feature releases can bump the script version
 # without invalidating every cached per-camera concat (concat semantics are
 # unchanged). Bump this ONLY when the concat output itself would change.
@@ -259,7 +260,7 @@ def human_time(sec):
 class Step:
     """One unit of work in the job plan. `work` is in seconds of footage (output
     seconds for the grid), the unit every rate below is relative to."""
-    kind: str        # concat | blur | map_gps | map_render | map_scale | gauge_render | scoreboard_render | friction_circle_render | note_highway_render | map_overlay_render | grid
+    kind: str        # concat | blur | map_gps | map_render | map_scale | gauge_render | fsd_overlay_render | map_overlay_render | grid
     label: str
     work: float
 
@@ -275,17 +276,13 @@ RATE_PRIORS = {
     "map_render": 1.0,   # gopro-overlay route render
     "map_scale": 8.0,    # small libx264 upscale pass
     "gauge_render": 1.0, # gopro-overlay dashboard-panel render + ffmpeg overlay
-    "scoreboard_render": 1.0, # tesla_fsd_overlay.py FSD scoreboard render + composite
-    "friction_circle_render": 1.0, # tesla_fsd_overlay.py FSD friction-circle render + composite
-    "note_highway_render": 1.0, # tesla_fsd_overlay.py FSD note-highway render + composite
+    "fsd_overlay_render": 1.0, # tesla_fsd_overlay.py combined FSD widget(s) render + composite
     "map_overlay_render": 1.0, # gopro-overlay HUD map-inset render + ffmpeg overlay
     "grid": 2.0,         # VideoToolbox hardware encode
 }
 KIND_LABELS = {"concat": "concat", "blur": "blur", "map_gps": "GPS extract",
                "map_render": "map render", "map_scale": "map upscale",
-               "gauge_render": "gauge render", "scoreboard_render": "scoreboard render",
-               "friction_circle_render": "friction circle render",
-               "note_highway_render": "note highway render",
+               "gauge_render": "gauge render", "fsd_overlay_render": "FSD overlay render",
                "map_overlay_render": "map overlay render",
                "grid": "grid"}
 BAR_FULL, BAR_EMPTY = "█", "░"
@@ -1516,64 +1513,84 @@ def build_map_overlay(hero_video_path, gpx_path, tile_dims, corner, zoom, ffmpeg
         step_label="map overlay render", run_what="gopro-dashboard (map overlay)")
 
 
-# Per-widget log/progress labels for build_fsd_overlay -- the only thing that
-# actually differs between the FSD showcase overlays (everything else about
-# invoking tesla_fsd_overlay.py is identical). Keyed by the same `widget`
-# string tesla_fsd_overlay.py's own --widget flag takes.
+# Per-widget DISPLAY info only (flag name + log label) for build_fsd_overlay --
+# the small bits that differ per requested widget. `kind`/`step_label`/
+# `run_what` used to live here too, back when each FSD widget got its own
+# sequential subprocess pass; now that build_fsd_overlay always composites
+# every requested widget in ONE tesla_fsd_overlay.py invocation (see that
+# function's docstring), there's only ever one combined kind/step/run_what,
+# so those became fixed values (FSD_OVERLAY_KIND/_STEP_LABEL/_RUN_WHAT below)
+# instead of a per-widget lookup. Keyed by the same widget name strings
+# tesla_fsd_overlay.py's own --widget flag takes.
 FSD_OVERLAY_META = {
     "scoreboard": {
         "flag": "--fsd-scoreboard",
         "log_label": "FSD streak scoreboard",
-        "kind": "scoreboard_render",
-        "step_label": "scoreboard overlay render",
-        "run_what": "tesla_fsd_overlay (FSD scoreboard)",
     },
     "friction-circle": {
         "flag": "--fsd-friction-circle",
         "log_label": "FSD friction circle",
-        "kind": "friction_circle_render",
-        "step_label": "friction circle render",
-        "run_what": "tesla_fsd_overlay (FSD friction circle)",
     },
     "note-highway": {
         "flag": "--fsd-note-highway",
         "log_label": "FSD note highway",
-        "kind": "note_highway_render",
-        "step_label": "note highway render",
-        "run_what": "tesla_fsd_overlay (FSD note highway)",
     },
 }
+FSD_OVERLAY_KIND = "fsd_overlay_render"
+FSD_OVERLAY_STEP_LABEL = "FSD overlay render"
+FSD_OVERLAY_RUN_WHAT = "tesla_fsd_overlay (FSD overlay)"
 
 
-def build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widget, ffmpeg, venv_py,
+def build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widgets, ffmpeg, venv_py,
                       out_path, tmpdir, dry_run, progress):
-    """Composite an FSD showcase overlay -- the streak scoreboard
-    (widget="scoreboard", --fsd-scoreboard), the friction-circle G-meter
-    (widget="friction-circle", --fsd-friction-circle), or the note-highway
-    cornering ribbon (widget="note-highway", --fsd-note-highway) -- onto the
-    hero camera tile, via tesla_fsd_overlay.py -- a separate driver script
-    under ./.venv (same venv-boundary reason build_gauge_overlay subprocesses
-    out to gopro-dashboard.py) rather than a gopro-overlay XML layout: all
-    three widgets are directly-drawn PIL widgets (StreakScoreboard/
-    FrictionCircle/NoteHighway), not composable from gopro-overlay's
-    built-in component types. Returns out_path.
+    """Composite one or more FSD showcase overlays -- any combination of the
+    streak scoreboard ("scoreboard", --fsd-scoreboard), the friction-circle
+    G-meter ("friction-circle", --fsd-friction-circle), and the note-highway
+    cornering ribbon ("note-highway", --fsd-note-highway) -- onto the hero
+    camera tile, via tesla_fsd_overlay.py -- a separate driver script under
+    ./.venv (same venv-boundary reason build_gauge_overlay subprocesses out
+    to gopro-dashboard.py) rather than a gopro-overlay XML layout: all three
+    widgets are directly-drawn PIL widgets (StreakScoreboard/FrictionCircle/
+    NoteHighway), not composable from gopro-overlay's built-in component
+    types. Returns out_path.
 
-    Generalized from the original --fsd-scoreboard-only
-    build_fsd_scoreboard_overlay -- a second near-identical function per
-    showcase idea would just be copy-paste with one word changed, and a
-    third and fourth idea (note-highway ribbon, then pace-notes) were already
-    known to be coming; note-highway has now landed through this same
-    function, no new build_* function needed. `widget` is passed straight
-    through to tesla_fsd_overlay.py's own --widget flag; FSD_OVERLAY_META
-    supplies the per-widget log/progress labels this function itself needs.
+    `widgets` is a non-empty list of widget names, passed straight through
+    as tesla_fsd_overlay.py's own `--widget` flag's (now `nargs="+"`)
+    trailing arguments -- e.g. widgets=["scoreboard", "friction-circle"]
+    becomes `--widget scoreboard friction-circle` on the subprocess command
+    line, and tesla_fsd_overlay.py draws ALL of them in one decode/draw/
+    encode pass (one Overlay() with a multi-widget create_widgets list),
+    not one pass per widget.
+
+    THIS IS THE CONSOLIDATION: originally each active FSD flag got its own
+    sequential build_fsd_overlay call (own subprocess, own full decode +
+    draw + re-encode generation) chained through angle_paths[hero_angle],
+    the same "generalized, not copy-pasted" shape build_gauge_overlay/
+    build_map_overlay's own build_gopro_layout_overlay consolidation later
+    reused for a *different* pair of overlays. With
+    `--gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`
+    together that meant FOUR full-native-resolution hero-tile re-encode
+    passes (--gauge is a genuinely different tool/subprocess, so it stays
+    separate) -- measured on a real ~47-minute session at ~3h09m projected
+    for ONE such pass alone, so four sequentially was well over half a day.
+    Since all three --fsd-* flags already went through this SAME driver
+    script, and create_widgets_for() already returned a *list* of widgets
+    to Overlay() (this function's docstring flagged combining them as
+    exactly this kind of win, deferred until a second/third widget existed
+    to make it concrete -- see CLAUDE.md's "Design note, now revisited"),
+    build_grid now collects every active --fsd-* flag into one `widgets`
+    list and calls this function ONCE, cutting those three-or-fewer passes
+    to exactly one regardless of how many of the three flags are combined --
+    4 hero-tile passes total (gauge + one combined FSD pass) down from a
+    possible 4 FSD passes alone (plus gauge) before this branch.
 
     `tile_dims` is accepted (mirroring build_gauge_overlay's/build_map_tile's
     shape) but not passed to the subprocess -- unlike the map tile, this
     doesn't need a synthetic --overlay-size render: tesla_fsd_overlay.py hands
     gopro-overlay's find_recording() the real hero video and reads its actual
     dimensions/duration via ffprobe, mirroring build_gauge_overlay's own
-    --use-gpx-only + video-input path. All four widgets resolve their own
-    panel geometry from the real composited frame size at draw time, so no
+    --use-gpx-only + video-input path. All widgets resolve their own panel
+    geometry from the real composited frame size at draw time, so no
     tile-size plumbing into the subprocess call is needed either.
 
     Positional input/output are adjacent, before any --flags -- tesla_fsd_
@@ -1587,26 +1604,38 @@ def build_fsd_overlay(hero_video_path, gpx_path, tile_dims, widget, ffmpeg, venv
     files that would need a caller-provided tmpdir.
     """
     tile_w, tile_h = tile_dims  # noqa: F841 -- unused; see docstring
-    meta = FSD_OVERLAY_META[widget]
+    log_label = " + ".join(FSD_OVERLAY_META[w]["log_label"] for w in widgets)
+    flags = " ".join(FSD_OVERLAY_META[w]["flag"] for w in widgets)
     script_path = Path(__file__).resolve().parent / "tesla_fsd_overlay.py"
     cmd = [
         str(venv_py), str(script_path), str(hero_video_path), str(out_path),
         "--gpx", str(gpx_path), "--ffmpeg-dir", str(Path(ffmpeg).parent),
-        "--widget", widget,
-    ]
+        "--widget",
+    ] + list(widgets)
 
     if dry_run:
-        log(f"== [{meta['flag']}] would composite the {meta['log_label']} "
+        log(f"== [{flags}] would composite the {log_label} "
             "onto the hero camera tile ==")
         printable = " ".join(f"'{a}'" if " " in a else a for a in cmd)
         log(f"$ {printable}")
         return out_path
 
-    log(f"== [{meta['flag']}] compositing {meta['log_label']} onto {Path(hero_video_path).name} ==")
+    log(f"== [{flags}] compositing {log_label} onto {Path(hero_video_path).name} ==")
     # Same as the gauge render: tesla_fsd_overlay.py's own ProgressBarProgress
     # reports no parseable progress on our own progress stream.
-    progress.begin(meta["kind"], meta["step_label"], determinate=False, out=out_path)
-    run(cmd, dry_run=False, what=meta["run_what"], progress=progress)
+    #
+    # The label passed here -- not FSD_OVERLAY_STEP_LABEL alone -- is what
+    # actually reaches the running/done progress lines: Progress._advance
+    # overwrites whatever label plan_steps planned the step with, using
+    # begin()'s label instead (an independent review caught this: the
+    # widget-detailed label plan_steps built was dead code, silently
+    # replaced here by the bare "FSD overlay render" constant). Matching
+    # plan_steps' own f"...({'+'.join(...)})" format keeps the planned and
+    # actually-displayed labels the same, and restores the per-widget
+    # detail the old three-separate-steps design used to show.
+    step_label = f"{FSD_OVERLAY_STEP_LABEL} ({'+'.join(widgets)})"
+    progress.begin(FSD_OVERLAY_KIND, step_label, determinate=False, out=out_path)
+    run(cmd, dry_run=False, what=FSD_OVERLAY_RUN_WHAT, progress=progress)
     progress.end()
     return out_path
 
@@ -2635,12 +2664,18 @@ def plan_steps(args, selections, footage):
                 steps.append(Step("map_scale", f"map upscale ({args.map_mag}x)", map_work))
         if args.gauge:
             steps.append(Step("gauge_render", "gauge overlay render", map_work))
-        if args.fsd_scoreboard:
-            steps.append(Step("scoreboard_render", "FSD scoreboard render", map_work))
-        if args.fsd_friction_circle:
-            steps.append(Step("friction_circle_render", "friction circle render", map_work))
-        if args.fsd_note_highway:
-            steps.append(Step("note_highway_render", "note highway render", map_work))
+        # All active --fsd-* widgets are drawn in ONE combined
+        # tesla_fsd_overlay.py pass (see build_fsd_overlay's docstring for
+        # why), so this is one Step regardless of how many of the three
+        # flags are active -- not one Step per flag.
+        active_fsd = [name for name, flag in (
+            ("scoreboard", args.fsd_scoreboard),
+            ("friction-circle", args.fsd_friction_circle),
+            ("note-highway", args.fsd_note_highway),
+        ) if flag]
+        if active_fsd:
+            steps.append(Step("fsd_overlay_render",
+                              f"FSD overlay render ({'+'.join(active_fsd)})", map_work))
         if args.map_overlay:
             steps.append(Step("map_overlay_render", "map overlay render", map_work))
     if len(selections) > 1 or args.map:
@@ -2805,8 +2840,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
             # built. Drop their still-pending steps so the job ETA stops
             # counting work that isn't coming.
             progress.abandon("map_render", "map_scale", "gauge_render",
-                             "scoreboard_render", "friction_circle_render",
-                             "note_highway_render", "map_overlay_render")
+                             "fsd_overlay_render", "map_overlay_render")
         else:
             if args.map:
                 t0 = time.monotonic()
@@ -2855,7 +2889,25 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                 angle_paths[hero_angle] = built
                 stats["gauge_built"] = True
 
-            if args.fsd_scoreboard:
+            # All active --fsd-* flags are composited in ONE combined
+            # tesla_fsd_overlay.py pass (build_fsd_overlay), not one pass
+            # per flag -- see that function's docstring for why (measured
+            # ~3h09m projected for a single such pass alone on a real
+            # ~47-minute session; four sequential passes was well over half
+            # a day). The filename still carries every active widget's own
+            # suffix, same convention the old per-flag files used, just
+            # combined onto one intermediate file; the FINAL grid filename
+            # and print_stats output below are UNCHANGED in shape -- each
+            # widget still gets its own stats["*_built"] flag and its own
+            # "_scoreboard"/"_friction-circle"/"_note-highway" suffix
+            # component, only the *timing* now accumulates into one shared
+            # stats["fsd_overlay_s"] instead of three separate counters.
+            active_fsd_widgets = [name for name, flag in (
+                ("scoreboard", args.fsd_scoreboard),
+                ("friction-circle", args.fsd_friction_circle),
+                ("note-highway", args.fsd_note_highway),
+            ) if flag]
+            if active_fsd_widgets:
                 t0 = time.monotonic()
                 # A solo hero is guaranteed by setup_tools (dies early on a
                 # paired --feature), same as --gauge above.
@@ -2864,66 +2916,26 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                 # the gauge overlay -- a real, potentially slow, standalone
                 # artifact, and it replaces angle_paths[hero_angle] below so
                 # both build_filter and build_filter_landscape pick it up
-                # without either needing to know a scoreboard was composited.
-                # If --gauge ALSO ran above, angle_paths[hero_angle] is
-                # already the gauge-composited video at this point, so the
-                # scoreboard composites onto THAT -- --gauge --fsd-scoreboard
+                # without either needing to know an FSD overlay was
+                # composited. If --gauge ALSO ran above, angle_paths[hero_angle]
+                # is already the gauge-composited video at this point, so the
+                # FSD overlay(s) composite onto THAT -- --gauge --fsd-*
                 # together chain sequentially through angle_paths, same
                 # pattern --blur-faces -> --gauge already chains through it.
-                scoreboard_out = out_dir / f"{session_name}_{hero_angle}_scoreboard.mp4"
+                fsd_overlay_out = out_dir / (
+                    f"{session_name}_{hero_angle}_{'_'.join(active_fsd_widgets)}.mp4")
                 built = build_fsd_overlay(
-                    angle_paths[hero_angle], gpx_path, dims[hero_angle], "scoreboard",
-                    ffmpeg, tools.map_venv_py, scoreboard_out, tmpdir,
+                    angle_paths[hero_angle], gpx_path, dims[hero_angle], active_fsd_widgets,
+                    ffmpeg, tools.map_venv_py, fsd_overlay_out, tmpdir,
                     args.dry_run, progress)
-                stats["scoreboard_s"] += time.monotonic() - t0
+                stats["fsd_overlay_s"] += time.monotonic() - t0
                 angle_paths[hero_angle] = built
-                stats["scoreboard_built"] = True
-
-            if args.fsd_friction_circle:
-                t0 = time.monotonic()
-                # A solo hero is guaranteed by setup_tools (dies early on a
-                # paired --feature), same as --gauge/--fsd-scoreboard above.
-                hero_angle = hero_angles_for(args.feature)[0]
-                # Persist the composited hero (not tmpdir): same rationale as
-                # --gauge/--fsd-scoreboard -- a real, potentially slow,
-                # standalone artifact, and it replaces angle_paths[hero_angle]
-                # below so both build_filter and build_filter_landscape pick
-                # it up without either needing to know a friction circle was
-                # composited. Chains after --gauge/--fsd-scoreboard through
-                # angle_paths[hero_angle] if either of those also ran, same
-                # pattern every overlay in this file already uses.
-                friction_circle_out = out_dir / f"{session_name}_{hero_angle}_friction-circle.mp4"
-                built = build_fsd_overlay(
-                    angle_paths[hero_angle], gpx_path, dims[hero_angle], "friction-circle",
-                    ffmpeg, tools.map_venv_py, friction_circle_out, tmpdir,
-                    args.dry_run, progress)
-                stats["friction_circle_s"] += time.monotonic() - t0
-                angle_paths[hero_angle] = built
-                stats["friction_circle_built"] = True
-
-            if args.fsd_note_highway:
-                t0 = time.monotonic()
-                # A solo hero is guaranteed by setup_tools (dies early on a
-                # paired --feature), same as --gauge/--fsd-scoreboard/
-                # --fsd-friction-circle above.
-                hero_angle = hero_angles_for(args.feature)[0]
-                # Persist the composited hero (not tmpdir): same rationale as
-                # --gauge/--fsd-scoreboard/--fsd-friction-circle -- a real,
-                # potentially slow, standalone artifact, and it replaces
-                # angle_paths[hero_angle] below so both build_filter and
-                # build_filter_landscape pick it up without either needing to
-                # know a note highway was composited. Chains after
-                # --gauge/--fsd-scoreboard/--fsd-friction-circle through
-                # angle_paths[hero_angle] if any of those also ran, same
-                # pattern every overlay in this file already uses.
-                note_highway_out = out_dir / f"{session_name}_{hero_angle}_note-highway.mp4"
-                built = build_fsd_overlay(
-                    angle_paths[hero_angle], gpx_path, dims[hero_angle], "note-highway",
-                    ffmpeg, tools.map_venv_py, note_highway_out, tmpdir,
-                    args.dry_run, progress)
-                stats["note_highway_s"] += time.monotonic() - t0
-                angle_paths[hero_angle] = built
-                stats["note_highway_built"] = True
+                if args.fsd_scoreboard:
+                    stats["scoreboard_built"] = True
+                if args.fsd_friction_circle:
+                    stats["friction_circle_built"] = True
+                if args.fsd_note_highway:
+                    stats["note_highway_built"] = True
 
             if args.map_overlay:
                 t0 = time.monotonic()
@@ -3060,15 +3072,22 @@ def print_stats(args, tools: Tools, plan: Plan, stats: dict, drifts: dict,
     if args.gauge:
         log(f"  gauge overlay    {human_time(stats['gauge_s'])}"
             f"{'' if stats['gauge_built'] else '  (no GPS -- overlay skipped)'}")
-    if args.fsd_scoreboard:
-        log(f"  FSD scoreboard   {human_time(stats['scoreboard_s'])}"
-            f"{'' if stats['scoreboard_built'] else '  (no GPS -- overlay skipped)'}")
-    if args.fsd_friction_circle:
-        log(f"  FSD friction circle {human_time(stats['friction_circle_s'])}"
-            f"{'' if stats['friction_circle_built'] else '  (no GPS -- overlay skipped)'}")
-    if args.fsd_note_highway:
-        log(f"  FSD note highway {human_time(stats['note_highway_s'])}"
-            f"{'' if stats['note_highway_built'] else '  (no GPS -- overlay skipped)'}")
+    active_fsd = [name for name, flag in (
+        ("scoreboard", args.fsd_scoreboard),
+        ("friction-circle", args.fsd_friction_circle),
+        ("note-highway", args.fsd_note_highway),
+    ) if flag]
+    if active_fsd:
+        # ONE combined timing line -- all active --fsd-* widgets are drawn
+        # in a single build_fsd_overlay pass now (see that function's
+        # docstring), so there's only one stats["fsd_overlay_s"] timer to
+        # report, not three. Each widget still gets its own "(no GPS --
+        # overlay skipped)" signal via its own stats["*_built"] flag, so
+        # the line only claims success for widgets that actually built.
+        any_built = (stats["scoreboard_built"] or stats["friction_circle_built"]
+                     or stats["note_highway_built"])
+        log(f"  FSD overlay ({'+'.join(active_fsd)})  {human_time(stats['fsd_overlay_s'])}"
+            f"{'' if any_built else '  (no GPS -- overlay skipped)'}")
     if args.map_overlay:
         log(f"  map overlay      {human_time(stats['map_overlay_s'])}"
             f"{'' if stats['map_overlay_built'] else '  (no GPS -- overlay skipped)'}")
@@ -3127,9 +3146,9 @@ def main(argv=None) -> int:
     stats = {"concat_s": 0.0, "grid_s": 0.0, "reused": 0, "built": 0,
              "blur_s": 0.0, "blurred": 0, "blur_reused": 0, "gps_s": 0.0,
              "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
-             "scoreboard_s": 0.0, "scoreboard_built": False,
-             "friction_circle_s": 0.0, "friction_circle_built": False,
-             "note_highway_s": 0.0, "note_highway_built": False,
+             "fsd_overlay_s": 0.0,
+             "scoreboard_built": False, "friction_circle_built": False,
+             "note_highway_built": False,
              "map_overlay_s": 0.0, "map_overlay_built": False}
 
     folder = args.folder.resolve()

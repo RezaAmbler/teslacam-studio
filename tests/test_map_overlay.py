@@ -447,10 +447,13 @@ def _map_overlay_grid_plan(tmp_path):
 
 
 def _map_overlay_stats(**overrides):
+    # All three --fsd-* widgets share ONE timing counter (fsd_overlay_s --
+    # see build_fsd_overlay's consolidation), but each still gets its own
+    # "*_built" flag.
     stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
-             "scoreboard_s": 0.0, "scoreboard_built": False,
-             "friction_circle_s": 0.0, "friction_circle_built": False,
-             "note_highway_s": 0.0, "note_highway_built": False,
+             "fsd_overlay_s": 0.0,
+             "scoreboard_built": False, "friction_circle_built": False,
+             "note_highway_built": False,
              "map_overlay_s": 0.0, "map_overlay_built": False, "grid_s": 0.0}
     stats.update(overrides)
     return stats
