@@ -291,6 +291,7 @@ def _map_overlay_tools_args(**kw):
     a.gauge = False
     a.gauge_units = "mph"
     a.map_overlay = False
+    a.map_overlay_alpha = tc.MAP_OVERLAY_BG_ALPHA
     a.fsd_scoreboard = False
     a.fsd_friction_circle = False
     a.fsd_note_highway = False
@@ -363,6 +364,66 @@ def test_map_overlay_alone_ignores_map_mag_range(monkeypatch, tmp_path):
 
     tools = tc.setup_tools(_map_overlay_tools_args(map_overlay=True, map_mag=99.0))
     assert tools.map_venv_py == tmp_path / "py"
+
+
+def test_map_overlay_alpha_out_of_range_dies(monkeypatch, tmp_path):
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_map_overlay_tools_args(map_overlay=True, map_overlay_alpha=256))
+    with pytest.raises(SystemExit):
+        tc.setup_tools(_map_overlay_tools_args(map_overlay=True, map_overlay_alpha=-1))
+
+
+def test_map_overlay_alpha_endpoints_are_accepted(monkeypatch, tmp_path):
+    # 0 and 255 are the inclusive ends of the documented range -- neither
+    # should die.
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+    monkeypatch.setattr(tc, "find_map_tooling",
+                        lambda script_dir: (tmp_path / "py", tmp_path / "gopro", []))
+    monkeypatch.setattr(tc, "find_map_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+
+    for endpoint in (0, 255):
+        tools = tc.setup_tools(_map_overlay_tools_args(map_overlay=True,
+                                                        map_overlay_alpha=endpoint))
+        assert tools.map_venv_py == tmp_path / "py"
+
+
+def test_map_overlay_alpha_ignored_when_map_overlay_off(monkeypatch, tmp_path):
+    # Out-of-range alpha shouldn't die if --map-overlay itself isn't set --
+    # matches --map-zoom/--map-mag's own "only validated when relevant" style.
+    monkeypatch.setattr(tc, "find_ffmpeg", lambda: ("/bin/ffmpeg", True))
+    monkeypatch.setattr(tc, "find_font", lambda: "/System/Library/Fonts/Menlo.ttc")
+    monkeypatch.setattr(tc.shutil, "which", lambda name: "/bin/ffprobe")
+
+    tools = tc.setup_tools(_map_overlay_tools_args(map_overlay=False, map_overlay_alpha=999))
+    assert tools.map_venv_py is None
+
+
+def test_write_map_overlay_layout_default_alpha(tmp_path):
+    path = tmp_path / "layout.xml"
+    tc.write_map_overlay_layout(path, 1000, 800, corner="bottom-right", zoom=19)
+    text = path.read_text()
+    assert f'bg="0,0,0,{tc.MAP_OVERLAY_BG_ALPHA}"' in text
+    assert f'opacity="{tc.MAP_OVERLAY_BG_ALPHA / 255:.3f}"' in text
+
+
+def test_write_map_overlay_layout_custom_alpha(tmp_path):
+    # The override actually reaches the XML -- both bg='s alpha component
+    # AND the separate opacity= attribute (see MAP_OVERLAY_BG_ALPHA's own
+    # comment on why gopro-overlay's Frame widget needs both).
+    path = tmp_path / "layout.xml"
+    tc.write_map_overlay_layout(path, 1000, 800, corner="bottom-right", zoom=19, bg_alpha=40)
+    text = path.read_text()
+    assert 'bg="0,0,0,40"' in text
+    assert 'opacity="0.157"' in text
 
 
 # --- --map-overlay: filename suffix / chaining (build_grid, --dry-run) -------

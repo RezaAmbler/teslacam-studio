@@ -1148,7 +1148,8 @@ def pick_map_overlay_corner(gauge, scoreboard, friction_circle, note_highway,
 
 
 def write_map_overlay_layout(path, tile_w, tile_h, corner, zoom,
-                             line_width=MAP_OVERLAY_LINE_WIDTH):
+                             line_width=MAP_OVERLAY_LINE_WIDTH,
+                             bg_alpha=MAP_OVERLAY_BG_ALPHA):
     """Write a gopro-overlay layout holding the --map-overlay HUD panel: a
     square moving_journey_map -- the same widget the sidebar --map tile uses
     (see write_map_layout), just smaller and positioned in one hero-tile
@@ -1157,6 +1158,12 @@ def write_map_overlay_layout(path, tile_w, tile_h, corner, zoom,
     MAP_OVERLAY_BG_ALPHA's own comment for why both are needed, and
     write_gauge_layout's matching fix) makes the WHOLE panel translucent,
     map raster included, not just a translucent border around an opaque map.
+
+    `bg_alpha` (0-255) defaults to MAP_OVERLAY_BG_ALPHA but is overridable
+    per-call -- see --map-overlay-alpha, which threads a user-chosen value
+    all the way through build_map_overlay to here, letting the CLI default
+    (tuned once against a real render, see CLAUDE.md) be a starting point
+    rather than the only option.
 
     Unlike write_map_layout, no crop/centre-offset trick is needed here: the
     panel itself is deliberately square (MAP_OVERLAY_SIZE_FRAC of the tile's
@@ -1180,8 +1187,8 @@ def write_map_overlay_layout(path, tile_w, tile_h, corner, zoom,
     Path(path).write_text(
         "<layout>\n"
         f'    <frame x="{panel_x}" y="{panel_y}" width="{panel}" height="{panel}" '
-        f'cr="{pad}" bg="0,0,0,{MAP_OVERLAY_BG_ALPHA}" '
-        f'opacity="{MAP_OVERLAY_BG_ALPHA / 255:.3f}">\n'
+        f'cr="{pad}" bg="0,0,0,{bg_alpha}" '
+        f'opacity="{bg_alpha / 255:.3f}">\n'
         f'        <translate x="{pad}" y="{pad}">\n'
         f'            <component type="moving_journey_map" name="route" '
         f'size="{map_size}" zoom="{zoom}" line-width="{line_width}"/>\n'
@@ -1485,12 +1492,17 @@ def build_gauge_overlay(hero_video_path, gpx_path, tile_dims, units, ffmpeg, ven
 
 
 def build_map_overlay(hero_video_path, gpx_path, tile_dims, corner, zoom, ffmpeg, venv_py,
-                      gopro_script, font, out_path, tmpdir, dry_run, progress):
+                      gopro_script, font, out_path, tmpdir, dry_run, progress,
+                      bg_alpha=MAP_OVERLAY_BG_ALPHA):
     """Composite the translucent HUD-style route-map inset onto a corner of
     the hero camera tile. Returns out_path. See build_gopro_layout_overlay
     for how the actual gopro-dashboard.py compositing (shared with
     build_gauge_overlay) works; see pick_map_overlay_corner for how `corner`
     is chosen when other hero-tile overlays are also active.
+
+    `bg_alpha` (0-255) is the panel's translucency -- see --map-overlay-alpha
+    and write_map_overlay_layout's own docstring; defaults to
+    MAP_OVERLAY_BG_ALPHA, the CLI's own default.
 
     Additive alongside --map (the sidebar tile): both use the exact same
     already-extracted/re-timed GPX (build_route_gpx, called once by
@@ -1502,7 +1514,8 @@ def build_map_overlay(hero_video_path, gpx_path, tile_dims, corner, zoom, ffmpeg
     """
     tile_w, tile_h = tile_dims
     layout_path = tmpdir / "map_overlay_layout.xml"
-    write_map_overlay_layout(layout_path, tile_w, tile_h, corner=corner, zoom=zoom)
+    write_map_overlay_layout(layout_path, tile_w, tile_h, corner=corner, zoom=zoom,
+                             bg_alpha=bg_alpha)
     return build_gopro_layout_overlay(
         hero_video_path, gpx_path, layout_path, ffmpeg, venv_py, gopro_script, font,
         out_path, dry_run, progress, flag="--map-overlay",
@@ -2352,6 +2365,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "--fsd-friction-circle (which also uses bottom-right) is also active. "
                          "Can be combined with --map -- both a sidebar tile AND a HUD inset is "
                          "a valid, if unusual, combination.")
+    ap.add_argument("--map-overlay-alpha", type=int, default=MAP_OVERLAY_BG_ALPHA,
+                    help=f"translucency of the --map-overlay HUD panel, 0 (invisible) to 255 "
+                         f"(fully opaque). Default {MAP_OVERLAY_BG_ALPHA} (~"
+                         f"{round(MAP_OVERLAY_BG_ALPHA / 255 * 100)}% opaque), tuned against a "
+                         f"real render -- see CLAUDE.md. Ignored unless --map-overlay is set.")
     ap.add_argument("--force-concat", action="store_true",
                     help="rebuild the per-camera concats even if matching ones already exist")
     ap.add_argument("--skip-space-check", action="store_true", help="don't pre-flight free disk space")
@@ -2461,6 +2479,10 @@ def setup_tools(args) -> Tools:
             if not 1.0 <= args.map_mag <= 4.0:
                 die(f"--map-mag {args.map_mag} is out of range; use 1.0 (off) to 4.0. "
                     f"Higher magnifies more (tighter) but softer.")
+        if args.map_overlay:
+            if not 0 <= args.map_overlay_alpha <= 255:
+                die(f"--map-overlay-alpha {args.map_overlay_alpha} is out of range; use "
+                    f"0 (invisible) to 255 (fully opaque).")
         tools.map_venv_py, tools.map_gopro = map_venv_py, map_gopro
         tools.map_font = find_map_font()
 
@@ -2936,7 +2958,8 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                 built = build_map_overlay(
                     angle_paths[hero_angle], gpx_path, dims[hero_angle], corner,
                     args.map_zoom, ffmpeg, tools.map_venv_py, tools.map_gopro,
-                    tools.map_font, map_overlay_out, tmpdir, args.dry_run, progress)
+                    tools.map_font, map_overlay_out, tmpdir, args.dry_run, progress,
+                    bg_alpha=args.map_overlay_alpha)
                 stats["map_overlay_s"] += time.monotonic() - t0
                 angle_paths[hero_angle] = built
                 stats["map_overlay_built"] = True

@@ -69,7 +69,9 @@ traces where you drove.
   tile's bottom-right corner; if `--fsd-friction-circle` is also active (the
   one other overlay that also defaults there), it falls back to another free
   corner automatically. Additive with `--map` — a sidebar tile AND a HUD
-  inset together is a valid combination.
+  inset together is a valid combination. Translucency is tunable with
+  `--map-overlay-alpha 0-255` (default 110, ~43% opaque) — lower is more
+  see-through.
 - **Landscape layout** (`--landscape`) — the featured camera at full native
   resolution on the left, every other camera (and the map, if any) in a thin
   sidebar column on the right, sized to match. Produces a real landscape
@@ -256,6 +258,7 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--fsd-friction-circle` | Composite an FSD friction-circle G-meter (lateral vs. longitudinal G, fading trail, peak-this-corner) onto the hero tile (solo `--feature` only) |
 | `--fsd-note-highway` | Composite an FSD note-highway cornering ribbon (scrolling signed lateral-G severity, "now" fixed at center) onto the hero tile (solo `--feature` only) |
 | `--map-overlay` | Composite a small translucent HUD-style route map onto a corner of the hero tile — additive with `--map` (solo `--feature` only) |
+| `--map-overlay-alpha` | Translucency of the `--map-overlay` panel, `0` (invisible) to `255` (fully opaque) (default `110`) |
 | `--landscape` | Hero camera at native res + thin sidebar column, instead of the tall grid |
 | `--native` | True native resolution (skips the hardware-fit scale-down) |
 | `--quality` | `fast` (default, hardware) or `high` (software libx264, CRF 18) |

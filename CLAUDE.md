@@ -778,7 +778,15 @@ scoreboard overlay.
     from ~71%) after a user review of a real render asked for the HUD to
     read as more see-through — re-verified against a real render at 110:
     the panel border/edges now visibly blend with the live video
-    underneath at a glance, not just measurably in a pixel sample.
+    underneath at a glance, not just measurably in a pixel sample. This is
+    now the CLI *default*, not the only option: `--map-overlay-alpha
+    0-255` (validated, same pattern as `--map-zoom`'s range check) threads
+    a user-chosen value through `build_map_overlay`/`write_map_overlay_
+    layout`'s `bg_alpha` parameter — added after the same user review
+    asked whether translucency was overridable at all. Verified end-to-end
+    at a deliberately extreme value (40, far below the default) against a
+    real render: the map genuinely reads as far more see-through, not just
+    a number that changed in the XML.
     Verified against real Tesla footage (a real mountain drive,
     `--landscape --quality high`, the same footage/window every other
     overlay in this file was verified against): route line, position dot,
