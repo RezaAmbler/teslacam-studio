@@ -966,11 +966,71 @@ def find_map_font():
     return find_font()
 
 
+# Web Mercator's north/south cutoff. The projection stretches latitude by an
+# amount that runs to infinity at the poles (see the y formula below), so every
+# slippy-map implementation has to stop somewhere. The universal choice is the
+# latitude at which the vertical stretch equals half a world-width, which makes
+# the whole map exactly SQUARE -- convenient, because it means one 2**zoom grid
+# indexes both axes. That latitude is atan(sinh(pi)) = 85.05112878 degrees.
+# Antarctica and the high Arctic are simply off the map; irrelevant for cars.
+WEB_MERCATOR_MAX_LAT = 85.05112878
+
+
 def _tile_xy(lat, lon, zoom):
-    """Web Mercator tile coordinates (float) for a lat/lon at `zoom`."""
+    """Where a lat/lon falls on the OSM tile grid at `zoom`, in tile units.
+
+    Returns FLOATS -- fractional tile positions, e.g. x=1234.7 means "70% of
+    the way across tile column 1234". Callers take int() to get the containing
+    tile's index; keeping the fraction here lets tile_count_for_bounds work out
+    how many whole tiles a bounding box actually straddles.
+
+    Some notes on the arithmetic, since none of it is self-evident:
+
+    `n` -- the grid is n x n tiles, n = 2**zoom. At zoom 0 the entire planet is
+    one 256px tile; each zoom level splits every tile into four. That doubling
+    per axis is exactly why tile cost is quadratic in the area covered, and so
+    why derive_map_zoom exists at all: one zoom level up costs 4x, two costs
+    16x, and z19 vs z16 is 4**3 = 64x. (4x is the ideal ratio; a real bounding
+    box rarely lands on tile boundaries, so the partial tiles along its edges
+    make the measured ratio a little under that -- 3.7x on the test drive.)
+
+    `x` -- longitude is the easy axis: Mercator leaves it perfectly linear, so
+    this is just a rescale of the number line.
+        lon        is  -180 .. +180   (west .. east, 0 at Greenwich)
+        lon + 180  is     0 .. 360    (shift the origin to the antimeridian,
+                                       so the grid starts at a corner rather
+                                       than the middle)
+        / 360.0    is     0 .. 1      (normalize: "fraction of the way east
+                                       around the world")
+        * n        is     0 .. n      (scale that fraction into tile units)
+    So x is "how many tiles east of the antimeridian". Greenwich lands at n/2.
+
+    `y` -- latitude is the hard axis, because Mercator is the projection that
+    keeps SHAPES locally correct (a right angle on the ground is a right angle
+    on the map). To pay for that it has to stretch north-south by more and more
+    as you approach the poles, matching how longitude lines converge. The
+    stretch factor works out to the integral of sec(lat), whose closed form is
+    the log term below -- ln(tan(lat) + sec(lat)), the inverse Gudermannian
+    function. Unpacking it the same way:
+        ln(tan + sec)  is  -pi .. +pi  (south edge .. north edge, 0 at equator;
+                                        this is the "infinity at the poles"
+                                        part, which is why lat is clamped
+                                        to WEB_MERCATOR_MAX_LAT first -- at
+                                        exactly 90 degrees cos is 0 and this
+                                        would divide by zero)
+        / pi           is    -1 .. +1
+        1 - that       is     2 .. 0   (FLIPS the axis: tile y counts DOWNWARD
+                                        from the north edge, the opposite of
+                                        latitude, because raster grids are
+                                        indexed from the top-left corner)
+        / 2.0          is     1 .. 0
+        * n            is     n .. 0   (tile units, 0 at the north edge)
+    So y is "how many tiles south of the north edge". The equator lands at n/2,
+    the same as Greenwich does on x -- the square map the clamp above buys us.
+    """
     n = 2.0 ** zoom
     x = (lon + 180.0) / 360.0 * n
-    lat = max(-85.05112878, min(85.05112878, lat))  # Mercator's own limits
+    lat = max(-WEB_MERCATOR_MAX_LAT, min(WEB_MERCATOR_MAX_LAT, lat))
     rad = math.radians(lat)
     y = (1.0 - math.log(math.tan(rad) + 1.0 / math.cos(rad)) / math.pi) / 2.0 * n
     return x, y

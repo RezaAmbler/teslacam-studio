@@ -24,6 +24,58 @@ def square_bbox(km, lat=LAT):
     return (lat, -120.0, lat + dlat, -120.0 + dlon)
 
 
+# --- _tile_xy: the boundary values its comments claim -------------------------
+
+def test_tile_xy_longitude_endpoints():
+    # x is "tiles east of the antimeridian": -180 is the origin, Greenwich the
+    # middle, +180 the far edge. Pins the (lon + 180) / 360 * n rescale.
+    n = 2.0 ** 10
+    assert tc._tile_xy(0.0, -180.0, 10)[0] == pytest.approx(0.0)
+    assert tc._tile_xy(0.0, 0.0, 10)[0] == pytest.approx(n / 2)
+    assert tc._tile_xy(0.0, 180.0, 10)[0] == pytest.approx(n)
+
+
+def test_tile_xy_latitude_endpoints_and_flip():
+    # y is "tiles SOUTH of the north edge" -- the axis is flipped relative to
+    # latitude, which is what the (1 - ...) does. The cutoff latitude landing
+    # exactly on 0 and n is what makes the map square.
+    n = 2.0 ** 10
+    L = tc.WEB_MERCATOR_MAX_LAT
+    assert tc._tile_xy(L, 0.0, 10)[1] == pytest.approx(0.0, abs=1e-6)
+    assert tc._tile_xy(0.0, 0.0, 10)[1] == pytest.approx(n / 2)
+    assert tc._tile_xy(-L, 0.0, 10)[1] == pytest.approx(n, abs=1e-6)
+    # Northern latitudes sit above southern ones on screen, i.e. smaller y.
+    assert tc._tile_xy(40.0, 0.0, 10)[1] < tc._tile_xy(30.0, 0.0, 10)[1]
+
+
+def test_tile_xy_clamps_at_the_poles_instead_of_dividing_by_zero():
+    # cos(90 degrees) is 0, so without the clamp this raises ZeroDivisionError
+    # (and tan runs to infinity). Nothing in a car's GPS gets near this, but a
+    # crash here would be a silly way to lose a render.
+    n = 2.0 ** 10
+    assert tc._tile_xy(90.0, 0.0, 10)[1] == pytest.approx(0.0, abs=1e-6)
+    assert tc._tile_xy(-90.0, 0.0, 10)[1] == pytest.approx(n, abs=1e-6)
+
+
+def test_tile_xy_grid_is_square_at_every_zoom():
+    # The whole point of the WEB_MERCATOR_MAX_LAT cutoff: one 2**zoom grid
+    # indexes both axes, so x and y share a scale.
+    # Tolerance is RELATIVE: the y term goes through log/tan, so its float
+    # error scales with n, and an absolute epsilon that's generous at z8
+    # (n=256) is far too tight at z19 (n=524288).
+    for z in (0, 8, 16, 19):
+        n = 2.0 ** z
+        assert tc._tile_xy(0.0, 180.0, z)[0] == pytest.approx(n, rel=1e-9)
+        assert tc._tile_xy(-tc.WEB_MERCATOR_MAX_LAT, 0.0, z)[1] == pytest.approx(n, rel=1e-9)
+
+
+def test_tile_xy_returns_fractional_positions():
+    # Callers int() this to get a tile index; the fraction is what lets
+    # tile_count_for_bounds see that a bbox straddles two tiles.
+    x, _ = tc._tile_xy(0.0, -179.9, 10)
+    assert 0.0 < x < 1.0
+
+
 # --- tile_count_for_bounds ---------------------------------------------------
 
 @pytest.mark.parametrize("km,zoom,measured", [
