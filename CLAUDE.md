@@ -52,19 +52,36 @@ scoreboard overlay.
   true video `frame_index`, not the SEI ordinal.
 - **Grid:** per-camera lossless concat (cached in `.tesla_combine_cache.json`,
   keyed by `CONCAT_CACHE_VERSION` — kept separate from `SCRIPT_VERSION` so feature
-  bumps don't invalidate concats), then two composable layouts (`build_filter`
-  default / `build_filter_landscape` for `--landscape`, chosen by `build_grid`)
-  with per-input `fps=OUTPUT_FPS` normalization, a burned-in clock, and a hw-fit
-  scale to stay ≤4096px (VideoToolbox limit). Default is a tall `hstack`/`vstack`
-  of rows top to bottom, which can push canvas *height* past the cap on a full
-  6-camera+map session — forcing a whole-canvas downscale that also softens the
-  featured camera. `--landscape` avoids this structurally: the hero tile(s) stay
-  at native resolution with no scale filter at all, and every other present
-  camera (+ map) is stacked single-file into a thin sidebar column
-  (`landscape_layout` — the shared geometry used by the filter builder, the
-  map-tile pre-sizing, and the pre-flight space estimate) sized so the sidebar's
-  stacked height matches the hero's height exactly, keeping total canvas height
-  bounded by the hero alone.
+  bumps don't invalidate concats), then two composable layouts
+  (`build_filter_landscape` — **the default** — / `build_filter` for `--tall`,
+  chosen by `build_grid`) with per-input `fps=OUTPUT_FPS` normalization, a
+  burned-in clock, and a hw-fit scale to stay ≤4096px (VideoToolbox limit).
+  `--tall` is a tall `hstack`/`vstack` of rows top to bottom, which can push
+  canvas *height* past the cap on a full 6-camera+map session — forcing a
+  whole-canvas downscale that also softens the featured camera (measured for
+  real: that session lands at 2530x4096, i.e. against the cap). The landscape
+  layout avoids this structurally: the hero tile(s) stay at native resolution
+  with no scale filter at all, and every other present camera (+ map) is
+  stacked single-file into a thin sidebar column (`landscape_layout` — the
+  shared geometry used by the filter builder, the map-tile pre-sizing, and the
+  pre-flight space estimate) sized so the sidebar's stacked height matches the
+  hero's height exactly, keeping total canvas height bounded by the hero alone.
+  - **Default flip (`default-landscape` branch):** landscape became the default
+    because every hero-tile overlay (`--gauge`, the three `--fsd-*` widgets,
+    `--map-overlay`) is designed against it and the hero tile can't inherit a
+    whole-canvas downscale there. `--tall` and `--landscape` deliberately share
+    one argparse `dest="landscape"` with an explicit `default=True` on BOTH
+    actions — so there is exactly one source of truth, every `args.landscape`
+    read site is unchanged, and any test that parses real CLI args picks up the
+    new default automatically instead of silently pinning the old one.
+    `--landscape` survives as an accepted no-op (`help=argparse.SUPPRESS`)
+    because it appears throughout this repo's history, README examples and the
+    verification notes below. The `_landscape` filename suffix was deliberately
+    NOT flipped to `_tall`: it still marks landscape, so a `--tall` render keeps
+    byte-identical filenames to what the tall grid produced when it was the
+    default, and a default render keeps byte-identical filenames to what
+    `--landscape` produced. Both layouts' outputs therefore overwrite their own
+    prior renders rather than accumulating near-duplicates.
 - **`--quality high`:** forces the software libx264/veryfast path (`encoder_args`)
   at CRF 18 for its own sake, reusing the same CRF already used for the map-tile
   upscale pass — distinct from the CRF 20 fallback that only fires when
@@ -1054,3 +1071,11 @@ scoreboard overlay.
   under `--trim-end` too.
 - Anything printed mid-run must go through `log()` — it clears and redraws the
   progress display around the print. A bare `print()` will be scribbled over.
+- **Never put a bare `%` in an argparse `help=` string.** argparse expands every
+  one through `help % params` (`HelpFormatter._expand_help`), so a literal `%`
+  is read as a conversion spec and raises `TypeError`, taking down the ENTIRE
+  `--help` output — not just that one line. This actually shipped: the
+  `--map-overlay-alpha` help interpolated `~43% opaque`, and `python3
+  tesla_combine.py --help` crashed outright from commit `cbb36db` until the
+  `default-landscape` branch escaped it as `%%`. Nothing caught it because no
+  test rendered the help; `test_cli_help_renders` now does.

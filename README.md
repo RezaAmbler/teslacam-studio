@@ -7,25 +7,33 @@ route map, a speed/compass dashboard, and three FSD driving-showcase panels.
 
 ![teslacam-studio — landscape layout: the front camera at native resolution with every overlay active (FSD streak scoreboard top-right, note-highway cornering ribbon below it, translucent speed/compass dashboard bottom-left, friction-circle G-meter bottom-right, burned-in clock), the other five cameras and the live GPS route map in the sidebar column](docs/example.jpg)
 
-*`--landscape --quality high --map --gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`*
+*`--quality high --map --gauge --fsd-scoreboard --fsd-friction-circle --fsd-note-highway`*
 
 Tesla saves each camera as its own ~1-minute clip. teslacam-studio stitches them
 per-camera, then composites them into one video you can actually watch.
 
 ## Two layouts
 
-- **`--landscape`** — the featured camera at **full native resolution** on the
-  left, every other present camera (and the route map, if any) stacked
+- **landscape (the default)** — the featured camera at **full native resolution**
+  on the left, every other present camera (and the route map, if any) stacked
   single-file in a thin sidebar column on the right, sized so the sidebar's
   height matches the hero's exactly. A real landscape aspect ratio, and the
-  layout the hero-tile overlays are designed around. This is what you want for
-  YouTube/social feed video, and what the screenshot above shows.
-- **default (tall grid)** — cameras stacked in rows: the featured camera large,
-  repeaters and pillars paired, back paired with the moving map. Fine for a quick
-  look at an incident, but on a full six-camera session the stacked height can
-  push the canvas past the hardware encoder's 4096px cap, forcing a whole-canvas
-  downscale that softens the featured camera along with everything else.
-  `--landscape` avoids that structurally — the hero tile is never scaled at all.
+  layout the hero-tile overlays are designed around. What the screenshot above
+  shows.
+- **`--tall`** — the older stacked-row grid: cameras in rows top to bottom, the
+  featured one large, repeaters and pillars paired, back paired with the moving
+  map. More compact for a quick look at an incident, and it keeps all six
+  cameras at a similar size rather than favouring one.
+
+Landscape is the default because the tall grid inflates *height*: on a
+six-camera session with the map, `--tall` lands at 2530x4096 — against the
+hardware encoder's 4096px cap, so the whole canvas gets scaled down and the
+featured camera softens along with everything else. Landscape avoids that
+structurally: the hero tile carries no scale filter at all, so total height is
+bounded by one camera's native resolution.
+
+`--landscape` is still accepted — it just doesn't do anything any more, since
+it's the default.
 
 ---
 
@@ -66,7 +74,7 @@ overlay.
 
 | Flag | What it draws | Where |
 |------|---------------|-------|
-| `--map` | A moving route map that follows the car and traces where you drove. Tunable zoom (`--map-zoom`) and magnification beyond OSM's limit (`--map-mag`). | Its own tile — paired with the back camera in the grid, or in the sidebar under `--landscape` |
+| `--map` | A moving route map that follows the car and traces where you drove. Tunable zoom (`--map-zoom`) and magnification beyond OSM's limit (`--map-mag`). | Its own tile — paired with the back camera in the grid, or in the sidebar column |
 | `--map-overlay` | The *same* moving map widget, small and translucent, as a HUD panel. Reuses `--map-zoom`; translucency via `--map-overlay-alpha 0-255` (default 110, ~43% opaque). Additive with `--map` — a sidebar tile **and** a HUD inset together is valid. | A free corner of the hero tile (see corner allocation below) |
 | `--gauge` | Speedometer dial, compass, big speed readout, and a recent-speed sparkline chart. `--gauge-units mph\|kph`. | Bottom-left of the hero tile |
 | `--fsd-scoreboard` | A color-coded "FSD ENGAGED"/"FSD OFF" badge, hands-free time, corner count, peak cornering G, and takeover count. | Top-right of the hero tile |
@@ -80,8 +88,9 @@ note-highway ribbon in the band below the two top-anchored elements. All four
 can be combined with no collisions. `--map-overlay` picks whichever corner is
 still free at render time, preferring bottom-right, then bottom-left, then
 top-right — accounting for the burned-in clock, which lands in the hero tile's
-bottom-left corner under `--landscape`. Ask for *everything* at once and it runs
-out of corners; see [Known limitations](#known-limitations).
+bottom-left corner in the default landscape layout. Ask for *everything* at
+once and it runs out of corners; see
+[Known limitations](#known-limitations).
 
 **One compositing pass.** `--fsd-scoreboard`, `--fsd-friction-circle` and
 `--fsd-note-highway` composite together in a **single** pass over the hero tile
@@ -199,8 +208,8 @@ CI runs the suite on every push (Python 3.9 and 3.12).
 # Basic: combine an event folder into a labeled grid
 python3 tesla_combine.py /path/to/event/folder
 
-# Landscape layout (real 16:9-ish aspect ratio) instead of the tall grid
-python3 tesla_combine.py /path/to/event/folder --landscape --map
+# The older tall stacked-row grid instead of the default landscape layout
+python3 tesla_combine.py /path/to/event/folder --tall --map
 
 # Trim to a wall-clock window
 python3 tesla_combine.py /path/to/event/folder --trim-start 18:59:00 --trim-end 19:02:00
@@ -252,7 +261,7 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--trim-start` / `--trim-end` | `HH:MM:SS` wall-clock or seconds offset |
 | `--speed` | Playback speed multiplier |
 | `--feature` | Which camera/pair gets the large hero row |
-| `--landscape` | Hero camera at native res + thin sidebar column, instead of the tall grid |
+| `--tall` | Use the stacked-row grid instead of the default landscape layout |
 | `--no-labels` | Skip the per-tile labels and the burned-in clock |
 | `--blur-faces` | Anonymize faces (`--blur-mode blur\|solid\|mosaic`) |
 | `--blur-thresh` | Face-detection confidence 0–1 (default `0.2`) — raise it if too much gets blurred |
@@ -314,7 +323,7 @@ Written next to the input folder unless `--output-dir` is given:
 | `<session>_<hero-angle>_gauge.mp4` | (with `--gauge`) that hero tile, dashboard overlay composited on |
 | `<session>_<hero-angle>_<widgets>.mp4` | (with any of `--fsd-scoreboard`/`--fsd-friction-circle`/`--fsd-note-highway`) that hero tile, with every requested FSD widget composited on in a single pass — `<widgets>` is the active widget names joined by `_`, e.g. `_scoreboard`, or `_scoreboard_friction-circle_note-highway` if all three are requested together |
 | `<session>_<hero-angle>_map-overlay.mp4` | (with `--map-overlay`) that hero tile, translucent HUD map inset composited on |
-| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4` | the labeled multi-camera composite |
+| `<session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4` | the labeled multi-camera composite. `_landscape` marks the default layout, so `--tall` renders *omit* it — a `--tall` render keeps the exact filename the tall grid produced back when it was the default |
 
 `playcheck.sh <file.mp4>` runs headless playback sanity checks (decode integrity,
 faststart index, hardware-decodable dimensions, constant frame rate).
@@ -335,13 +344,13 @@ faststart index, hardware-decodable dimensions, constant frame rate).
   `--map-overlay` is combined with `--gauge` + `--fsd-friction-circle` + either
   `--fsd-scoreboard` or `--fsd-note-highway`, nothing is left and the HUD map
   inset falls back to sharing bottom-right with the friction circle. Under
-  `--landscape` it takes one flag fewer, since the burned-in clock already
-  claims bottom-left. Known and documented, not a silent bug — drop a flag, or
+  the default landscape layout it takes one flag fewer, since the burned-in
+  clock already claims bottom-left. Known and documented, not a silent bug — drop a flag, or
   use `--no-labels`, to avoid it.
 - **The burned-in clock shares bottom-left with `--gauge`'s panel.** The clock is
-  drawn on the *final canvas*, so under `--landscape` — where the hero tile spans
-  the full canvas height at the left edge — it lands on the gauge panel's bottom
-  edge. The same can happen in the tall grid when the hero row ends up as the
+  drawn on the *final canvas*, so in the default landscape layout — where the
+  hero tile spans the full canvas height at the left edge — it lands on the gauge
+  panel's bottom edge. The same can happen under `--tall` when the hero row is the
   bottom row (a low-camera-count session). `--map-overlay` accounts for the clock
   when picking its corner; `--gauge` itself doesn't move. `--no-labels` sidesteps
   it.

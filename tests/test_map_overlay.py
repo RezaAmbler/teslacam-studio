@@ -477,7 +477,7 @@ def test_map_overlay_filename_suffix(tmp_path):
                                                tmp_path, progress)
 
     assert stats["map_overlay_built"] is True
-    assert out_grid.name == "session_grid_map-overlay.mp4"
+    assert out_grid.name == "session_grid_landscape_map-overlay.mp4"
 
 
 def test_map_overlay_and_sidebar_map_both_present(tmp_path):
@@ -501,7 +501,7 @@ def test_map_overlay_and_sidebar_map_both_present(tmp_path):
 
     assert stats["map_overlay_built"] is True
     assert tc.MAP_TILE_KEY in angle_paths
-    assert out_grid.name == "session_grid_map_map-overlay.mp4"
+    assert out_grid.name == "session_grid_landscape_map_map-overlay.mp4"
 
 
 def test_map_overlay_chains_after_other_hero_overlays(tmp_path):
@@ -531,7 +531,7 @@ def test_map_overlay_chains_after_other_hero_overlays(tmp_path):
     assert stats["note_highway_built"] is True
     assert stats["map_overlay_built"] is True
     assert out_grid.name == (
-        "session_grid_gauge_scoreboard_friction-circle_note-highway_map-overlay.mp4")
+        "session_grid_landscape_gauge_scoreboard_friction-circle_note-highway_map-overlay.mp4")
 
     # And the collision-avoidance logic actually fired for real inside
     # build_grid, not just in isolation: with gauge (bottom-left) and
