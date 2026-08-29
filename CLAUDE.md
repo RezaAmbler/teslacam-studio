@@ -95,9 +95,57 @@ scoreboard overlay.
   `setpts`/`fps` filter scales every tile (map included) together, so `--speed`
   stays locked. GPS comes from ORIGINAL source clips (SEI isn't in the concat/
   deface outputs).
-- **`--map-zoom` (OSM 1–19, default 19) + `--map-mag` (1.0–4.0, default 2.0):**
+- **`--map-zoom` (OSM 1–19, default: DERIVED) + `--map-mag` (1.0–4.0, default 2.0):**
   OSM tiles cap at z19 (~358m across the small grid cell); `--map-mag` renders the
   map smaller then upscales to fill the tile — tighter/navigation-style but softer.
+  `--map-mag` is a *display* knob only and does NOT change tile cost — a
+  distinction worth keeping straight, since both flags read like "zoom".
+  - **Derived zoom (`map-auto-zoom` branch, closing the top BACKLOG.md item):**
+    `MovingJourneyMap._redraw()` (gopro-overlay) renders the WHOLE route bbox
+    into one backing image before drawing a single frame, fetching tiles as
+    individual HTTP requests at a network-bound ~6/sec — and cost grows with
+    the SQUARE of the area roamed, not the distance driven. So z19 is right for
+    a driveway clip and catastrophic for a real drive: measured on this repo's
+    own 54km/47-minute test drive, z19 = 69,460 tiles = **3h 13m of silent
+    fetching before the first frame**, vs z16 = 1,216 tiles = 3m 22s. An
+    earlier observed run fetched for 116 minutes at z19 and never started
+    drawing (`docs/map-zoom-findings.md`). `--map-zoom` therefore defaults to
+    `None` and `resolve_map_zoom` picks the highest zoom whose
+    `tile_count_for_bounds` fits `MAP_TILE_BUDGET` (2000), from
+    `gpx_bounds(gpx_path)` — the GPX is already built before the map renders,
+    so the bbox is free. Resolved ONCE in `build_grid` and shared by `--map`
+    and `--map-overlay` (same widget, same route, so they'd derive the same
+    number). An explicit `--map-zoom` still wins, and the extent/tile-count/
+    fetch-ETA line is logged either way; an override needing >5x the budget
+    also warns, because gopro-overlay prints NOTHING while fetching and a run
+    at ~1% CPU with no growing file is indistinguishable from a hang.
+    - The tile math (`tile_count_for_bounds`, plain Web Mercator) is pinned by
+      tests against the doc's three REAL measured drives, with tolerance stated
+      per-axis rather than per-area — the two error sources (a bbox rarely
+      lands on tile boundaries, so each axis can need +1 tile; and the test
+      fixture only *reconstructs* each bbox from the doc's single "extent"
+      figure, leaving a consistent ~3%) both look alarming when squared on a
+      small route and invisible on a big one. Over-counting is the safe
+      direction: it can only make the derived zoom more conservative.
+    - Worth knowing when reading `docs/map-zoom-findings.md`: its proposal
+      predicted "z16 on the 92-minute drive", and a ~2,000 budget on a *square*
+      bbox of that extent actually yields z15. Both are right — the real drive
+      is a thin 38.6x7.2 km highway corridor, far smaller in area than a square
+      of the same span, and it does derive z16. That gap is the doc's own
+      "cost scales with the area roamed, not the distance driven" point showing
+      up in practice, not a discrepancy in the implementation.
+  - **Pre-flight space estimate, same branch:** `check_space`'s estimate counted
+    concats, the final grid and blur copies, but NOT the hero-tile overlay
+    intermediates — and each of `--gauge` / the combined FSD pass /
+    `--map-overlay` writes its own full-length re-encode of the hero camera,
+    all of which coexist on disk because they chain. On the real 47-minute
+    session that was ~10.6 GB unreserved (a 5.6 GB `_gauge.mp4` plus a 5.0 GB
+    combined-FSD file) against a 3.4 GB concat, so the pre-flight waved the run
+    through and ffmpeg died mid-write on a full disk — which reads as a crash
+    rather than the clean "not enough space" `die()` this check exists to
+    produce. Now added at `auto_bitrate(hero_dims) * seconds / 8` per active
+    pass. Still an estimate: a 90s verification render measured 691 MB actual
+    against 606 MB estimated (~12% under, vs ~38% under before the fix).
 - **Design constraint:** cameras are NOT frame-locked on `frame_seq_no` — extract
   GPS from the specific camera being overlaid; don't join cameras on it.
 - **Gauge dashboard overlay (`--gauge`):** a speedometer dial, compass, big speed

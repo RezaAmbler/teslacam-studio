@@ -74,7 +74,7 @@ overlay.
 
 | Flag | What it draws | Where |
 |------|---------------|-------|
-| `--map` | A moving route map that follows the car and traces where you drove. Tunable zoom (`--map-zoom`) and magnification beyond OSM's limit (`--map-mag`). | Its own tile — paired with the back camera in the grid, or in the sidebar column |
+| `--map` | A moving route map that follows the car and traces where you drove. Zoom is derived from the route by default (`--map-zoom` overrides); `--map-mag` magnifies beyond OSM's limit. | Its own tile — paired with the back camera in the grid, or in the sidebar column |
 | `--map-overlay` | The *same* moving map widget, small and translucent, as a HUD panel. Reuses `--map-zoom`; translucency via `--map-overlay-alpha 0-255` (default 110, ~43% opaque). Additive with `--map` — a sidebar tile **and** a HUD inset together is valid. | A free corner of the hero tile (see corner allocation below) |
 | `--gauge` | Speedometer dial, compass, big speed readout, and a recent-speed sparkline chart. `--gauge-units mph\|kph`. | Bottom-left of the hero tile |
 | `--fsd-scoreboard` | A color-coded "FSD ENGAGED"/"FSD OFF" badge, hands-free time, corner count, peak cornering G, and takeover count. | Top-right of the hero tile |
@@ -125,6 +125,37 @@ python3 tesla_gps.py /path/to/clips --probe
 
 If a folder has no telemetry, the overlay flags print a notice and the grid is
 built without them — nothing breaks.
+
+### Map zoom is derived from the route
+
+`gopro-overlay` renders the **whole route's bounding box into one image** before
+drawing a single frame, and OSM tiles are fetched one HTTP request at a time at
+about **6 tiles/sec**. Tile cost grows with the *square* of the area the drive
+roamed — so a zoom that's right for a driveway clip is ruinous for a real drive:
+
+| Real 54 km drive (47 min) | tiles | time before the first frame |
+|---|---:|---:|
+| zoom 19 | 69,460 | **3h 13m** |
+| zoom 17 | 4,560 | 12m 40s |
+| **zoom 16 (derived)** | **1,216** | **3m 22s** |
+
+Nothing is printed during that fetch, so a high zoom on a long drive is
+indistinguishable from a hang — one measured run sat for 116 minutes and never
+started drawing.
+
+So `--map-zoom` now defaults to **the highest zoom whose tile count fits a
+~2,000-tile budget**, computed from the GPX that's already built before the map
+renders. A driveway clip still gets zoom 19; a cross-town drive gets 16.
+
+This isn't a quality compromise — it's the better map. At zoom 19 a car at
+highway speed crosses the entire visible map in **7 seconds**, with no context
+and no sense of direction of travel; at zoom 16 it takes 52 seconds. Zoom 19
+suits clips where the car barely moves.
+
+Pass `--map-zoom N` to override. The route extent, tile count and estimated
+fetch time are logged either way, and an override that would take hours warns
+first. Note `--map-mag` is a *display* knob (it renders smaller then upscales) —
+it does not change tile cost.
 
 ## Watching a long run
 
@@ -223,9 +254,9 @@ python3 tesla_combine.py /path/to/event/folder --blur-faces
 # Add a live GPS route-map tile (needs gopro-overlay in ./.venv)
 python3 tesla_combine.py /path/to/event/folder --map
 
-# Tighter, navigation-style map; or wider & sharper for highway
+# Tighter, navigation-style map; or pin the zoom yourself
 python3 tesla_combine.py /path/to/event/folder --map --map-mag 3
-python3 tesla_combine.py /path/to/event/folder --map --map-mag 1 --map-zoom 16
+python3 tesla_combine.py /path/to/event/folder --map --map-mag 1 --map-zoom 17
 
 # Composite a speed/compass dashboard onto the hero tile
 python3 tesla_combine.py /path/to/event/folder --gauge
@@ -267,7 +298,7 @@ Run `python3 tesla_combine.py --help` for the full flag list.
 | `--blur-thresh` | Face-detection confidence 0–1 (default `0.2`) — raise it if too much gets blurred |
 | `--blur-scale` | Downscale `WxH` for the detection pass only; output stays full-res (faster) |
 | `--map` | Add the live GPS route-map tile |
-| `--map-zoom` | OSM tile zoom 1–19 (default 19) |
+| `--map-zoom` | OSM tile zoom 1–19. Default: **derived from the route** (see below) |
 | `--map-mag` | Magnify beyond OSM's limit, 1.0–4.0 (default 2.0; 1 = off) |
 | `--map-overlay` | Composite a small translucent HUD-style route map onto a corner of the hero tile — additive with `--map` (solo `--feature` only) |
 | `--map-overlay-alpha` | Translucency of the `--map-overlay` panel, `0` (invisible) to `255` (fully opaque) (default `110`) |
