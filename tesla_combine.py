@@ -52,6 +52,7 @@ Output (written next to the input folder unless --output-dir is given):
 import argparse
 import collections
 import json
+import math
 import re
 import shutil
 import signal
@@ -59,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -208,6 +210,19 @@ MAP_OVERLAY_BG_ALPHA = 110    # actual translucency comes from the separate `opa
                               # was verified legible against a real render at this value (see
                               # Verification status).
 MAP_OVERLAY_LINE_WIDTH = 4    # route line width -- thinner than the sidebar tile's default
+
+# --map-zoom auto-derivation. gopro-overlay's MovingJourneyMap renders the
+# WHOLE route's bounding box into one backing image before drawing a single
+# frame, and cost grows with the SQUARE of the area roamed -- so a zoom that is
+# right for a driveway clip is ruinous for a real drive. Measured on real
+# drives (docs/map-zoom-findings.md): a 40.6km-extent 92-minute drive wants
+# 401,956 tiles at z19 but 6,400 at z16, and tiles are individual HTTP requests
+# at a network-bound ~6/sec -- 18 hours vs 18 minutes before the first frame.
+# One observed z19 run fetched for 116 minutes and never started drawing.
+OSM_MIN_ZOOM = 1
+OSM_MAX_ZOOM = 19             # OSM publishes no tiles above this
+MAP_TILE_BUDGET = 2000        # target tile count for the derived zoom
+MAP_TILE_FETCH_RATE = 6.0     # tiles/sec, measured (~1.1s latency, ~6 in flight)
                               # (6, write_map_layout) since this panel is smaller and a
                               # thick line would eat a larger share of its small map area
 
@@ -949,6 +964,180 @@ def find_map_font():
             return f
     # gopro only needs *a* loadable TTF -- the map-only layout has no text.
     return find_font()
+
+
+# Web Mercator's north/south cutoff. The projection stretches latitude by an
+# amount that runs to infinity at the poles (see the y formula below), so every
+# slippy-map implementation has to stop somewhere. The universal choice is the
+# latitude at which the vertical stretch equals half a world-width, which makes
+# the whole map exactly SQUARE -- convenient, because it means one 2**zoom grid
+# indexes both axes. That latitude is atan(sinh(pi)) = 85.05112878 degrees.
+# Antarctica and the high Arctic are simply off the map; irrelevant for cars.
+WEB_MERCATOR_MAX_LAT = 85.05112878
+
+
+def _tile_xy(lat, lon, zoom):
+    """Where a lat/lon falls on the OSM tile grid at `zoom`, in tile units.
+
+    Returns FLOATS -- fractional tile positions, e.g. x=1234.7 means "70% of
+    the way across tile column 1234". Callers take int() to get the containing
+    tile's index; keeping the fraction here lets tile_count_for_bounds work out
+    how many whole tiles a bounding box actually straddles.
+
+    Some notes on the arithmetic, since none of it is self-evident:
+
+    `n` -- the grid is n x n tiles, n = 2**zoom. At zoom 0 the entire planet is
+    one 256px tile; each zoom level splits every tile into four. That doubling
+    per axis is exactly why tile cost is quadratic in the area covered, and so
+    why derive_map_zoom exists at all: one zoom level up costs 4x, two costs
+    16x, and z19 vs z16 is 4**3 = 64x. (4x is the ideal ratio; a real bounding
+    box rarely lands on tile boundaries, so the partial tiles along its edges
+    make the measured ratio a little under that -- 3.7x on the test drive.)
+
+    `x` -- longitude is the easy axis: Mercator leaves it perfectly linear, so
+    this is just a rescale of the number line.
+        lon        is  -180 .. +180   (west .. east, 0 at Greenwich)
+        lon + 180  is     0 .. 360    (shift the origin to the antimeridian,
+                                       so the grid starts at a corner rather
+                                       than the middle)
+        / 360.0    is     0 .. 1      (normalize: "fraction of the way east
+                                       around the world")
+        * n        is     0 .. n      (scale that fraction into tile units)
+    So x is "how many tiles east of the antimeridian". Greenwich lands at n/2.
+
+    `y` -- latitude is the hard axis, because Mercator is the projection that
+    keeps SHAPES locally correct (a right angle on the ground is a right angle
+    on the map). To pay for that it has to stretch north-south by more and more
+    as you approach the poles, matching how longitude lines converge. The
+    stretch factor works out to the integral of sec(lat), whose closed form is
+    the log term below -- ln(tan(lat) + sec(lat)), the inverse Gudermannian
+    function. Unpacking it the same way:
+        ln(tan + sec)  is  -pi .. +pi  (south edge .. north edge, 0 at equator;
+                                        this is the "infinity at the poles"
+                                        part, which is why lat is clamped
+                                        to WEB_MERCATOR_MAX_LAT first -- at
+                                        exactly 90 degrees cos is 0 and this
+                                        would divide by zero)
+        / pi           is    -1 .. +1
+        1 - that       is     2 .. 0   (FLIPS the axis: tile y counts DOWNWARD
+                                        from the north edge, the opposite of
+                                        latitude, because raster grids are
+                                        indexed from the top-left corner)
+        / 2.0          is     1 .. 0
+        * n            is     n .. 0   (tile units, 0 at the north edge)
+    So y is "how many tiles south of the north edge". The equator lands at n/2,
+    the same as Greenwich does on x -- the square map the clamp above buys us.
+    """
+    n = 2.0 ** zoom
+    x = (lon + 180.0) / 360.0 * n
+    lat = max(-WEB_MERCATOR_MAX_LAT, min(WEB_MERCATOR_MAX_LAT, lat))
+    rad = math.radians(lat)
+    y = (1.0 - math.log(math.tan(rad) + 1.0 / math.cos(rad)) / math.pi) / 2.0 * n
+    return x, y
+
+
+def tile_count_for_bounds(bounds, zoom):
+    """How many OSM tiles cover `bounds` at `zoom`.
+
+    bounds is (min_lat, min_lon, max_lat, max_lon). This is the number
+    gopro-overlay's MovingJourneyMap will fetch for its backing image -- the
+    whole bbox, not a corridor along the route (that would be an upstream
+    change, see docs/map-zoom-findings.md), so a drive that wanders across a
+    county pulls mostly-empty tiles it never displays.
+    """
+    min_lat, min_lon, max_lat, max_lon = bounds
+    x0, y0 = _tile_xy(max_lat, min_lon, zoom)   # north-west: min x, min y
+    x1, y1 = _tile_xy(min_lat, max_lon, zoom)   # south-east: max x, max y
+    nx = int(x1) - int(x0) + 1
+    ny = int(y1) - int(y0) + 1
+    return max(1, nx) * max(1, ny)
+
+
+def derive_map_zoom(bounds, budget=MAP_TILE_BUDGET, max_zoom=OSM_MAX_ZOOM):
+    """Highest OSM zoom whose tile count for `bounds` fits `budget`.
+
+    Zoom is the ONLY knob that changes tile cost -- --map-mag is a display
+    knob (it renders the tile at tile_w/mag then upscales), so it can't help
+    here. Deriving from the route's own bbox gives z19 on a driveway clip and
+    z16 on a 92-minute drive with no flag from the user, which is strictly
+    better than any fixed default (docs/map-zoom-findings.md).
+
+    Never returns below OSM_MIN_ZOOM: at z1 the whole world is 4 tiles, so the
+    budget is always satisfiable and the floor is a formality -- but an
+    explicit floor beats relying on that.
+    """
+    for zoom in range(max_zoom, OSM_MIN_ZOOM, -1):
+        if tile_count_for_bounds(bounds, zoom) <= budget:
+            return zoom
+    return OSM_MIN_ZOOM
+
+
+def bounds_extent_km(bounds):
+    """(width_km, height_km) of `bounds` -- for the log line, not the math."""
+    min_lat, min_lon, max_lat, max_lon = bounds
+    mean_lat = math.radians((min_lat + max_lat) / 2.0)
+    return ((max_lon - min_lon) * 111.32 * math.cos(mean_lat),
+            (max_lat - min_lat) * 110.57)
+
+
+def gpx_bounds(gpx_path):
+    """Bounding box (min_lat, min_lon, max_lat, max_lon) of a GPX's trackpoints,
+    or None if it has none. Read back from the written GPX rather than threaded
+    out of build_route_gpx so this works for any GPX on disk and keeps
+    build_route_gpx's return contract (path | None) unchanged."""
+    try:
+        root = ET.parse(str(gpx_path)).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    lats, lons = [], []
+    for pt in root.iter():
+        if not pt.tag.endswith("trkpt"):
+            continue
+        try:
+            lats.append(float(pt.get("lat")))
+            lons.append(float(pt.get("lon")))
+        except (TypeError, ValueError):
+            continue
+    if not lats:
+        return None
+    return (min(lats), min(lons), max(lats), max(lons))
+
+
+def resolve_map_zoom(gpx_path, requested, dry_run=False):
+    """Settle the zoom --map/--map-overlay will render at, and say what it costs.
+
+    An explicit --map-zoom always wins; the cost is still reported, so an
+    expensive choice is visible in seconds rather than discovered hours later
+    (gopro-overlay itself prints nothing while it fetches -- a run at ~1% CPU
+    with no growing file is indistinguishable from a hang).
+    """
+    bounds = None if dry_run else gpx_bounds(gpx_path)
+    if bounds is None:
+        # --dry-run (no GPX yet) or a GPX with no trackpoints. Don't invent a
+        # zoom: fall back to the OSM max, the pre-derivation default.
+        if requested is None and not dry_run:
+            log("NOTE: could not read a route bounding box from the GPX; "
+                f"falling back to --map-zoom {OSM_MAX_ZOOM}.")
+        zoom = requested if requested is not None else OSM_MAX_ZOOM
+        if dry_run:
+            log(f"== [--map] zoom {zoom} "
+                f"({'explicit' if requested is not None else 'auto-derived at render time'}) ==")
+        return zoom
+
+    zoom = requested if requested is not None else derive_map_zoom(bounds)
+    tiles = tile_count_for_bounds(bounds, zoom)
+    w_km, h_km = bounds_extent_km(bounds)
+    eta = tiles / MAP_TILE_FETCH_RATE
+    log(f"== [--map] route spans {w_km:.1f}x{h_km:.1f} km | zoom {zoom} "
+        f"({'explicit' if requested is not None else 'auto'}) | ~{tiles:,} OSM tiles "
+        f"| ~{human_time(int(eta))} to fetch at ~{MAP_TILE_FETCH_RATE:g}/s ==")
+    if requested is not None and tiles > MAP_TILE_BUDGET * 5:
+        auto = derive_map_zoom(bounds)
+        log(f"WARNING: --map-zoom {zoom} needs ~{tiles:,} tiles for this route. "
+            f"gopro-overlay prints nothing while it fetches, so this will look "
+            f"like a hang. Auto would pick zoom {auto} "
+            f"(~{tile_count_for_bounds(bounds, auto):,} tiles).")
+    return zoom
 
 
 def write_map_layout(path, tile_w, tile_h, zoom=18, line_width=6):
@@ -2361,11 +2550,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "recorded while driving) plus the gopro-overlay tool in ./.venv "
                          "(python3.12 -m venv .venv && ./.venv/bin/python -m pip install gopro-overlay). "
                          "Downloads OpenStreetMap tiles on first use, so it needs network access.")
-    ap.add_argument("--map-zoom", type=int, default=19,
-                    help="OpenStreetMap tile zoom for the --map tile (default: 19, the OSM max). "
-                         "Higher = more street detail; lower = wider area (better for highway). "
-                         "The whole route is rendered into one image, so high zoom on a long "
-                         "multi-km drive gets slow. To go TIGHTER than zoom 19, use --map-mag.")
+    ap.add_argument("--map-zoom", type=int, default=None,
+                    help="OpenStreetMap tile zoom for --map/--map-overlay (default: derived from "
+                         "the route's own bounding box, targeting ~%d tiles). Higher = more "
+                         "street detail over a smaller area; lower = wider. The WHOLE route is "
+                         "rendered into one backing image before the first frame is drawn and "
+                         "cost grows with the square of the area roamed, so a fixed high zoom on "
+                         "a long drive means hours of tile fetching with no output -- hence the "
+                         "derived default (see docs/map-zoom-findings.md). Pass a number to "
+                         "override; the tile cost is logged either way. To go TIGHTER than the "
+                         "OSM max (%d), use --map-mag." % (MAP_TILE_BUDGET, OSM_MAX_ZOOM))
     ap.add_argument("--map-mag", type=float, default=2.0,
                     help="magnify the map tile beyond OSM's zoom limit for a tighter, "
                          "navigation-style view (default: 2.0; 1.0 = off/sharpest). The map is "
@@ -2529,9 +2723,10 @@ def setup_tools(args) -> Tools:
             # --map-overlay's compositing path (build_gopro_layout_overlay)
             # doesn't have build_map_tile's separate synthetic-render+upscale
             # pass to hang a magnification step off of.
-            if not 1 <= args.map_zoom <= 19:
-                die(f"--map-zoom {args.map_zoom} is out of range; OSM tiles support 1-19 "
-                    f"(default 19; use --map-mag to go tighter).")
+            if args.map_zoom is not None and not OSM_MIN_ZOOM <= args.map_zoom <= OSM_MAX_ZOOM:
+                die(f"--map-zoom {args.map_zoom} is out of range; OSM tiles support "
+                    f"{OSM_MIN_ZOOM}-{OSM_MAX_ZOOM} (omit it to derive one from the route; "
+                    f"use --map-mag to go tighter than {OSM_MAX_ZOOM}).")
         if args.map:
             if not 1.0 <= args.map_mag <= 4.0:
                 die(f"--map-mag {args.map_mag} is out of range; use 1.0 (off) to 4.0. "
@@ -2641,6 +2836,22 @@ def plan_job(args, tools: Tools, folder: Path, out_dir: Path,
         # is usually a bit smaller than the source, so the concats' size is a
         # safe upper bound to reserve for them.
         est += sel_bytes
+    # Every hero-tile overlay writes its OWN full-length re-encode of the hero
+    # camera, and they chain (gauge -> combined FSD -> map-overlay), so all of
+    # them exist on disk at once. These were missing from the estimate entirely:
+    # on a real 47-minute session that was ~10.6 GB unreserved (a 5.6 GB
+    # _gauge.mp4 plus a 5.0 GB combined-FSD file) against a 3.4 GB concat -- so
+    # the pre-flight passed and ffmpeg then died mid-write on a full disk, which
+    # reads as a crash rather than as the clean "not enough space" die() this
+    # check exists to produce.
+    hero_passes = ((1 if args.gauge else 0)
+                   + (1 if (args.fsd_scoreboard or args.fsd_friction_circle
+                            or args.fsd_note_highway) else 0)
+                   + (1 if args.map_overlay else 0))
+    if hero_passes:
+        hero = hero_angles_for(args.feature)[0]
+        hero_w, hero_h = dims.get(hero, (1280, 960))
+        est += hero_passes * auto_bitrate(hero_w, hero_h) * est_seconds / 8
     if not args.dry_run:
         check_space(out_dir, est, args.skip_space_check)
 
@@ -2861,6 +3072,11 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
             progress.abandon("map_render", "map_scale", "gauge_render",
                              "fsd_overlay_render", "map_overlay_render")
         else:
+            # Settle the zoom ONCE for both --map and --map-overlay: they render
+            # the same widget over the same route, so they'd derive the same
+            # number anyway, and one log line beats two identical ones.
+            map_zoom = resolve_map_zoom(gpx_path, args.map_zoom, args.dry_run) \
+                if (args.map or args.map_overlay) else args.map_zoom
             if args.map:
                 t0 = time.monotonic()
                 if args.landscape:
@@ -2883,7 +3099,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                 map_out = out_dir / f"{session_name}_maptile.mp4"
                 built = build_map_tile(gpx_path, grid_dur, map_dims, ffmpeg,
                                        tools.map_venv_py, tools.map_gopro, tools.map_font,
-                                       args.map_zoom, args.map_mag, map_out, tmpdir,
+                                       map_zoom, args.map_mag, map_out, tmpdir,
                                        args.dry_run, progress)
                 stats["map_s"] += time.monotonic() - t0
                 angle_paths[MAP_TILE_KEY] = built
@@ -2997,7 +3213,7 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
                 map_overlay_out = out_dir / f"{session_name}_{hero_angle}_map-overlay.mp4"
                 built = build_map_overlay(
                     angle_paths[hero_angle], gpx_path, dims[hero_angle], corner,
-                    args.map_zoom, ffmpeg, tools.map_venv_py, tools.map_gopro,
+                    map_zoom, ffmpeg, tools.map_venv_py, tools.map_gopro,
                     tools.map_font, map_overlay_out, tmpdir, args.dry_run, progress,
                     bg_alpha=args.map_overlay_alpha)
                 stats["map_overlay_s"] += time.monotonic() - t0
