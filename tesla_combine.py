@@ -14,6 +14,7 @@ Usage:
     python3 tesla_combine.py /path/to/event/folder --speed 2
     python3 tesla_combine.py /path/to/event/folder --feature back      # feature back solo
     python3 tesla_combine.py /path/to/event/folder --feature repeaters # feature both repeaters
+    python3 tesla_combine.py /path/to/event/folder --tall      # the old tall stacked-row grid instead of landscape
     python3 tesla_combine.py /path/to/event/folder --native   # true native res, slow software encode
     python3 tesla_combine.py /path/to/event/folder --blur-faces # auto-blur people's faces (needs `deface`)
     python3 tesla_combine.py /path/to/event/folder --map      # add a live GPS route-map tile (needs gopro-overlay in ./.venv)
@@ -43,7 +44,9 @@ Output (written next to the input folder unless --output-dir is given):
         pass; <widgets> is the active widget names joined by _, e.g. _scoreboard, or
         _scoreboard_friction-circle_note-highway if all three are requested together
     <session>_<hero-angle>_map-overlay.mp4 -- (with --map-overlay) that hero tile, translucent HUD map inset composited on
-    <session>_grid[_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4 -- labeled multi-camera composite w/ clock
+    <session>_grid[_landscape][_feature-X][_blurred][_gauge][_scoreboard][_friction-circle][_note-highway][_map][_map-overlay].mp4 -- labeled multi-camera composite w/ clock
+        (_landscape marks the default layout; --tall omits it, so a --tall render keeps the exact
+        filename the tall grid produced back when it was the default)
 """
 
 import argparse
@@ -1117,7 +1120,7 @@ def pick_map_overlay_corner(gauge, scoreboard, friction_circle, note_highway,
     `--landscape --fsd-friction-circle --map-overlay` render (labels on,
     no --gauge) showed the clock's text box drawn directly over the map
     inset's bottom edge before this parameter existed. The equivalent risk
-    in the DEFAULT (non-landscape) grid -- the hero row can also end up as
+    in the --tall stacked-row grid -- the hero row can also end up as
     the canvas's last/bottom row on a low-camera-count session, e.g. only
     front+back present -- is NOT modeled here: it depends on which OTHER
     camera angles are present, not just which overlay flags are active, so
@@ -2122,14 +2125,15 @@ def landscape_layout(dims, feature):
 
 def build_filter_landscape(dims, angle_paths, has_text, font, epoch, max_dim, native, speed, feature):
     """
-    Sibling to build_filter for the --landscape layout: the hero tile(s) at
-    full native resolution (NO scale filter -- that's the whole point, unlike
-    the tall grid's hero-row upscale-to-canvas-width) hstacked on the left,
-    every other present tile scaled to a common sidebar width and vstacked
-    single-file on the right, then hero+sidebar hstacked into the final grid.
-    Kept as a separate function (not a branch inside build_filter) so the
-    default tall-mode path can't regress, and each composition algorithm
-    stays readable on its own. Same return shape as build_filter:
+    Sibling to build_filter for the landscape layout (the default since the
+    default-landscape branch; build_filter now serves --tall): the hero
+    tile(s) at full native resolution (NO scale filter -- that's the whole
+    point, unlike the tall grid's hero-row upscale-to-canvas-width) hstacked
+    on the left, every other present tile scaled to a common sidebar width
+    and vstacked single-file on the right, then hero+sidebar hstacked into
+    the final grid. Kept as a separate function (not a branch inside
+    build_filter) so the --tall path can't regress, and each composition
+    algorithm stays readable on its own. Same return shape as build_filter:
     (filter_text, input_order, final_width, final_height).
 
     The map tile needs no special-casing here: once dims[MAP_TILE_KEY] exists
@@ -2308,13 +2312,25 @@ def build_parser() -> argparse.ArgumentParser:
                          "camera large, its old pair-partner (if any) gets its own row instead of "
                          "being dropped. Pair: pillars, repeaters -- both L/R cameras large "
                          "together. e.g. --feature back if you got rear-ended.")
-    ap.add_argument("--landscape", action="store_true",
-                    help="landscape layout instead of the tall stacked-row grid: the featured "
-                         "camera at full native resolution on the left, every other present "
-                         "camera (and the map, if any) in a thin single-file sidebar column on "
-                         "the right, sized to match the hero's height. Produces a real landscape "
-                         "aspect ratio (good for YouTube/social feed video) and, for the common "
-                         "case, avoids the tall grid's height-inflation softness by construction.")
+    # --tall and --landscape deliberately share one dest with an explicit
+    # default=True on BOTH, so the layout has exactly one source of truth and
+    # every args.landscape read site below stays unchanged. Landscape became
+    # the default because it is what the layout should have been all along:
+    # the hero tile is never scaled, so it can't inherit the tall grid's
+    # whole-canvas downscale, and the hero-tile overlays (--gauge, the --fsd-*
+    # widgets, --map-overlay) are all designed against it. --landscape itself
+    # is kept as an accepted no-op rather than removed: it appears in this
+    # repo's own git history, README examples and CLAUDE.md verification
+    # notes, and breaking those commands buys nothing.
+    ap.add_argument("--tall", action="store_false", dest="landscape", default=True,
+                    help="the tall stacked-row grid instead of the default landscape layout: "
+                         "cameras stacked in rows top to bottom, the featured one large, "
+                         "repeaters and pillars paired, the map (if any) beside back. More "
+                         "compact for a quick look at an incident, but a full six-camera "
+                         "session can stack past --max-dim, forcing a whole-canvas downscale "
+                         "that softens the featured camera along with everything else.")
+    ap.add_argument("--landscape", action="store_true", dest="landscape", default=True,
+                    help=argparse.SUPPRESS)
     ap.add_argument("--native", action="store_true",
                     help="skip the hardware-fit scale-down; true native resolution. Only forces a "
                          "slow software encode if the native size ALSO exceeds --max-dim -- use "
@@ -2406,7 +2422,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--map-overlay-alpha", type=int, default=MAP_OVERLAY_BG_ALPHA,
                     help=f"translucency of the --map-overlay HUD panel, 0 (invisible) to 255 "
                          f"(fully opaque). Default {MAP_OVERLAY_BG_ALPHA} (~"
-                         f"{round(MAP_OVERLAY_BG_ALPHA / 255 * 100)}% opaque), tuned against a "
+                         # %% -- argparse runs every help string through `help % params`
+                         # (HelpFormatter._expand_help), so a bare % here is read as a
+                         # conversion spec and blows up the WHOLE --help output.
+                         f"{round(MAP_OVERLAY_BG_ALPHA / 255 * 100)}%% opaque), tuned against a "
                          f"real render -- see CLAUDE.md. Ignored unless --map-overlay is set.")
     ap.add_argument("--force-concat", action="store_true",
                     help="rebuild the per-camera concats even if matching ones already exist")

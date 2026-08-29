@@ -485,16 +485,40 @@ def test_encrypted_sniff_short_or_missing_file(tmp_path):
     assert tc.looks_tesla_encrypted(tmp_path / "nope.mp4") is False
 
 
-# --- CLI parsing: --landscape / --quality -----------------------------------
+# --- CLI parsing: --tall / --landscape / --quality ---------------------------
 
-def test_cli_landscape_default_off():
+def test_cli_landscape_is_the_default():
     args = tc.build_parser().parse_args(["/some/folder"])
+    assert args.landscape is True
+
+
+def test_cli_tall_flag_selects_the_stacked_grid():
+    args = tc.build_parser().parse_args(["/some/folder", "--tall"])
     assert args.landscape is False
 
 
-def test_cli_landscape_flag():
+def test_cli_landscape_flag_still_accepted_as_a_noop():
+    # --landscape predates the default flip and appears in this repo's own
+    # history/README examples; it must keep parsing, and keep meaning
+    # landscape, rather than becoming an argparse error.
     args = tc.build_parser().parse_args(["/some/folder", "--landscape"])
     assert args.landscape is True
+
+
+def test_cli_tall_and_landscape_share_one_dest_last_wins():
+    # Both flags write the same dest, so a contradictory pair resolves the
+    # ordinary argparse way (last one wins) instead of one silently
+    # shadowing the other depending on which was declared first.
+    p = tc.build_parser()
+    assert p.parse_args(["/some/folder", "--landscape", "--tall"]).landscape is False
+    assert p.parse_args(["/some/folder", "--tall", "--landscape"]).landscape is True
+
+
+def test_cli_help_renders():
+    # argparse expands every help string with `help % params`, so a bare "%"
+    # in any one of them (e.g. "~43% opaque") raises TypeError and takes down
+    # the WHOLE --help output, not just that line.
+    assert "--tall" in tc.build_parser().format_help()
 
 
 def test_cli_quality_default_fast():
@@ -667,6 +691,32 @@ def test_fsd_scoreboard_filename_suffix(tmp_path):
 
     assert stats["scoreboard_built"] is True
     assert "_scoreboard" in out_grid.name
+    assert out_grid.name == "session_grid_landscape_scoreboard.mp4"
+
+
+def test_tall_grid_filename_has_no_landscape_suffix(tmp_path):
+    # The other side of the layout-suffix convention: landscape became the
+    # default but KEPT emitting "_landscape", so --tall reproduces exactly
+    # the filename the old default produced. Re-running a pre-flip --tall
+    # command overwrites its own earlier output instead of leaving a
+    # near-duplicate beside it.
+    import io
+    args = tc.build_parser().parse_args(
+        ["/some/folder", "--tall", "--fsd-scoreboard", "--dry-run"])
+    tools = tc.Tools(ffmpeg="ffmpeg", ffprobe="ffprobe", has_text=False, font=None,
+                     map_venv_py=Path("fake-venv-python"))
+    plan = _scoreboard_grid_plan(tmp_path)
+    angle_paths = {"front": tmp_path / "front_combined.mp4",
+                   "back": tmp_path / "back_combined.mp4"}
+    stats = {"gps_s": 0.0, "map_s": 0.0, "gauge_s": 0.0, "gauge_built": False,
+             "fsd_overlay_s": 0.0, "scoreboard_built": False, "grid_s": 0.0}
+    steps = tc.plan_steps(args, plan.selections, plan.footage)
+    progress = tc.Progress(steps, stream=io.StringIO(), ansi=False, verbose=True)
+
+    out_grid, _, _ = tc.build_grid(args, tools, plan, angle_paths, stats,
+                                   tmp_path, progress)
+
+    assert "_landscape" not in out_grid.name
     assert out_grid.name == "session_grid_scoreboard.mp4"
 
 
@@ -693,7 +743,7 @@ def test_fsd_scoreboard_and_gauge_suffix_order(tmp_path):
 
     assert stats["gauge_built"] is True
     assert stats["scoreboard_built"] is True
-    assert out_grid.name == "session_grid_gauge_scoreboard.mp4"
+    assert out_grid.name == "session_grid_landscape_gauge_scoreboard.mp4"
 
 
 # --- --fsd-friction-circle: CLI parsing/defaults ------------------------------
@@ -783,7 +833,7 @@ def test_fsd_friction_circle_filename_suffix(tmp_path):
 
     assert stats["friction_circle_built"] is True
     assert "_friction-circle" in out_grid.name
-    assert out_grid.name == "session_grid_friction-circle.mp4"
+    assert out_grid.name == "session_grid_landscape_friction-circle.mp4"
 
 
 def test_fsd_friction_circle_gauge_scoreboard_suffix_order(tmp_path):
@@ -810,7 +860,7 @@ def test_fsd_friction_circle_gauge_scoreboard_suffix_order(tmp_path):
     assert stats["gauge_built"] is True
     assert stats["scoreboard_built"] is True
     assert stats["friction_circle_built"] is True
-    assert out_grid.name == "session_grid_gauge_scoreboard_friction-circle.mp4"
+    assert out_grid.name == "session_grid_landscape_gauge_scoreboard_friction-circle.mp4"
 
 
 def test_fsd_friction_circle_dry_run_passes_widget_flag(tmp_path, capsys):
@@ -922,7 +972,7 @@ def test_fsd_note_highway_filename_suffix(tmp_path):
 
     assert stats["note_highway_built"] is True
     assert "_note-highway" in out_grid.name
-    assert out_grid.name == "session_grid_note-highway.mp4"
+    assert out_grid.name == "session_grid_landscape_note-highway.mp4"
 
 
 def test_fsd_note_highway_full_chain_suffix_order(tmp_path):
@@ -953,7 +1003,7 @@ def test_fsd_note_highway_full_chain_suffix_order(tmp_path):
     assert stats["scoreboard_built"] is True
     assert stats["friction_circle_built"] is True
     assert stats["note_highway_built"] is True
-    assert out_grid.name == "session_grid_gauge_scoreboard_friction-circle_note-highway.mp4"
+    assert out_grid.name == "session_grid_landscape_gauge_scoreboard_friction-circle_note-highway.mp4"
 
 
 def test_fsd_note_highway_dry_run_passes_widget_flag(tmp_path, capsys):
