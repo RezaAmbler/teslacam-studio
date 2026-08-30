@@ -2830,7 +2830,11 @@ def plan_job(args, tools: Tools, folder: Path, out_dir: Path,
     est_seconds = sample_dur if sample_dur else 60.0 * max(len(s) for s, _, _ in selections.values())
     est = sel_bytes * (min(1.0, est_seconds / (60.0 * max(len(s) for s, _, _ in selections.values())))
                        if sample_dur else 1.0)
-    est += auto_bitrate(est_w, est_h) * est_seconds / 8
+    # Reserves a second copy of the grid when it will be chunk-encoded: the
+    # chunks sit beside the final grid until the join succeeds. Without this the
+    # pre-flight passes and the join dies mid-write on a full disk -- the same
+    # failure mode the hero-tile omission below already caused once.
+    est += grid_space_estimate(est_w, est_h, est_seconds)
     if args.blur_faces:
         # Each blurred per-camera copy lands alongside its concat; libx264 output
         # is usually a bit smaller than the source, so the concats' size is a
@@ -3024,6 +3028,166 @@ def encoder_args(native, quality, max_dim, final_w, final_h):
         return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"], warning
 
     return ["-c:v", "h264_videotoolbox", "-b:v", str(auto_bitrate(final_w, final_h))], None
+
+
+# ffmpeg 9's CLI scheduler can end a long multi-input filter_complex encode
+# early: the child exits 0, finalizes a valid faststart mp4, and prints nothing
+# even at -loglevel warning, so a grid that lost most of the drive is
+# indistinguishable from a clean run -- STATS just reports the short length as
+# though it were the expected one. Observed on >=1h54m sources stopping between
+# 29% and 57%, non-deterministically, on two different filesystems with hundreds
+# of GB free; the identical graph decoded to `-f null -` completes every time,
+# so it only bites when encoding. Sources <=48m have never truncated.
+#
+# The tolerance is proportional, not absolute: the grid's inputs legitimately
+# differ from each other by a second or two (per-camera concats drift slightly,
+# and `shortest` trims the output to the shortest of them), and that spread
+# grows with clip count -- while a real truncation loses tens of percent.
+GRID_SHORT_TOLERANCE_FRAC = 0.01
+
+
+def grid_output_is_short(actual_seconds, expected_seconds,
+                         tolerance_frac=GRID_SHORT_TOLERANCE_FRAC):
+    """True when a finished grid is materially shorter than its own inputs.
+
+    Pure so it can be tested without ffprobe. An unknown or nonsensical
+    expectation is never treated as a failure -- this guard exists to catch a
+    specific, large loss, not to second-guess the probe.
+    """
+    if actual_seconds is None or not expected_seconds or expected_seconds <= 0:
+        return False
+    return actual_seconds < expected_seconds * (1.0 - tolerance_frac)
+
+
+def verify_grid_output(ffprobe, out_grid, expected_seconds, dry_run):
+    """Die rather than report success on a truncated grid."""
+    if dry_run:
+        return
+    actual = probe_duration(ffprobe, out_grid)
+    if actual is None:
+        die(f"the grid encode reported success but {out_grid.name} can't be "
+            f"probed -- the file is missing or unreadable.")
+    if grid_output_is_short(actual, expected_seconds):
+        die(f"the grid encode exited cleanly but wrote only "
+            f"{human_time(actual)} of the expected "
+            f"{human_time(expected_seconds)} ({actual / expected_seconds:.0%}).\n"
+            f"This is a known ffmpeg failure on long multi-input encodes: it "
+            f"stops early, finalizes a valid file and exits 0, so nothing else "
+            f"catches it.\n"
+            f"The per-camera concats and overlay intermediates in "
+            f"{out_grid.parent} are intact and full-length -- only the grid "
+            f"step needs redoing, not the whole job.")
+
+
+# A long multi-input encode is what trips the ffmpeg bug described above, so the
+# grid is cut into passes short enough to stay clear of it and joined losslessly
+# afterwards. The observed ceiling was ~48 minutes of source (a 47m54s session
+# encoded correctly; every attempt at 1h54m or longer truncated), so 20 minutes
+# leaves real margin without making the join list long.
+GRID_CHUNK_SECONDS = 1200.0
+GRID_CHUNK_TRIGGER_SECONDS = 1800.0
+
+
+class _ChunkProgress:
+    """Maps one chunk's own 0..1 progress onto its slice of the whole grid step.
+
+    Progress.update() deliberately never lets a fraction go backwards, so
+    feeding it each chunk's raw fraction would freeze the bar near the previous
+    chunk's high-water mark instead of advancing. This translates first. Only
+    the two attributes run()/_run_ffmpeg_tracked actually touch are exposed.
+    """
+
+    def __init__(self, progress, base, span):
+        self._progress, self._base, self._span = progress, base, span
+        self.verbose = progress.verbose
+
+    def update(self, frac=None, speed=None):
+        if frac is not None:
+            frac = self._base + self._span * max(0.0, min(1.0, frac))
+        self._progress.update(frac=frac, speed=speed)
+
+
+def grid_space_estimate(width, height, seconds,
+                       chunk_trigger=GRID_CHUNK_TRIGGER_SECONDS):
+    """Bytes to reserve for the grid output, DOUBLED when it will be chunked.
+
+    A chunked encode writes every chunk beside the final grid and only removes
+    them once the join succeeds, so both exist at peak.
+    """
+    grid = auto_bitrate(width, height) * seconds / 8
+    return grid * 2 if seconds > chunk_trigger else grid
+
+
+def grid_chunk_windows(source_seconds, chunk_seconds=GRID_CHUNK_SECONDS):
+    """[(start, duration), ...] in SOURCE seconds, covering the whole grid.
+
+    Contiguous and non-overlapping -- the chunks are joined with -c copy, so a
+    gap drops footage and an overlap duplicates it. The last window is whatever
+    remains; an exact multiple must not produce a trailing zero-length chunk.
+    """
+    if source_seconds <= 0 or chunk_seconds <= 0:
+        return []
+    windows, start = [], 0.0
+    while start < source_seconds - 1e-6:
+        windows.append((start, min(chunk_seconds, source_seconds - start)))
+        start += chunk_seconds
+    return windows
+
+
+def encode_grid_chunked(ffmpeg, filter_fn, dims, angle_paths, tools, args, plan,
+                        enc_args, out_dir, session_name, out_grid,
+                        source_seconds, progress):
+    """Encode the grid as several shorter passes, then join them with -c copy.
+
+    Chunks land next to the final grid rather than in tmpdir: tmpdir is on the
+    boot volume, and a long session's chunks run to tens of GB. They are removed
+    once the join succeeds, and deliberately LEFT if anything fails, so an
+    expensive run can be salvaged rather than silently discarded.
+    """
+    speed = max(0.01, args.speed)
+    windows = grid_chunk_windows(source_seconds, GRID_CHUNK_SECONDS)
+    n = len(windows)
+    log(f"\n== grid is {human_time(source_seconds)} long -- encoding as {n} "
+        f"chunks of up to {human_time(GRID_CHUNK_SECONDS)}, then joining "
+        f"losslessly (works around the ffmpeg long-encode truncation bug) ==")
+    chunks = []
+    for k, (start, source_span) in enumerate(windows):
+        out_seconds = source_span / speed
+        # The burned-in clock renders OUTPUT pts through localtime(), and every
+        # chunk's pts restarts at zero -- so each chunk needs its own epoch,
+        # pushed forward by how far into the output timeline it begins. Without
+        # this every chunk would restart the clock at the session start.
+        epoch = plan.epoch + int(round(start / speed))
+        filter_text, input_order, _, _ = filter_fn(
+            dims, angle_paths, tools.has_text, tools.font, epoch, args.max_dim,
+            args.native, args.speed, args.feature)
+        filter_path = out_dir / f"{session_name}_grid_chunk{k}.filter"
+        filter_path.write_text(filter_text)
+        chunk_path = out_dir / f"{session_name}_grid_chunk{k}.mp4"
+        cmd = [ffmpeg, "-y"]
+        for path in input_order:
+            cmd += ["-ss", f"{start:.6f}", "-i", str(path)]
+        cmd += filter_graph_args(ffmpeg, filter_path) + ["-map", "[out]"]
+        # No +faststart on a chunk -- it is an intermediate, and the join sets it.
+        cmd += enc_args + ["-t", f"{out_seconds:.6f}", "-an", str(chunk_path)]
+        progress.out = chunk_path
+        run(cmd, False, what=f"ffmpeg (grid chunk {k + 1}/{n})",
+            progress=_ChunkProgress(progress, start / source_seconds,
+                                    source_span / source_seconds),
+            total=out_seconds)
+        filter_path.unlink(missing_ok=True)
+        chunks.append(chunk_path)
+
+    listing = out_dir / f"{session_name}_grid_chunks.txt"
+    listing.write_text("".join(f"file '{c}'\n" for c in chunks))
+    progress.out = out_grid
+    run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(listing),
+         "-c", "copy", "-movflags", "+faststart", str(out_grid)],
+        False, what="ffmpeg (grid join)", progress=progress,
+        total=source_seconds / speed)
+    listing.unlink(missing_ok=True)
+    for chunk in chunks:
+        chunk.unlink(missing_ok=True)
 
 
 def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
@@ -3267,15 +3431,31 @@ def build_grid(args, tools: Tools, plan: Plan, angle_paths: dict,
     log(f"\n== building grid -> {out_grid} ==")
     # ffmpeg reports the OUTPUT time, which --speed has already scaled, so the
     # total to measure it against is the source length divided by --speed.
-    grid_seconds = None
+    source_seconds = None
     if not args.dry_run:
-        grid_seconds = probe_duration(ffprobe, next(iter(angle_paths.values())))
-    grid_seconds = (grid_seconds or max(plan.footage.values())) / max(0.01, args.speed)
+        source_seconds = probe_duration(ffprobe, next(iter(angle_paths.values())))
+    source_seconds = source_seconds or max(plan.footage.values())
+    grid_seconds = source_seconds / max(0.01, args.speed)
+    chunked = source_seconds > GRID_CHUNK_TRIGGER_SECONDS
+    if chunked and args.dry_run:
+        # Can't probe under --dry-run, so this is the planned footage rather
+        # than a measured length -- but say so, or the single command printed
+        # below would misrepresent what a long run actually does.
+        log(f"NOTE: at {human_time(source_seconds)} the grid will be encoded as "
+            f"{int(math.ceil(source_seconds / GRID_CHUNK_SECONDS))} chunks and "
+            f"joined; the command below is one representative chunk-less pass.")
     progress.begin("grid", "grid encode", grid_seconds, out=out_grid)
     t0 = time.monotonic()
-    run(cmd, args.dry_run, what="ffmpeg (grid)", progress=progress, total=grid_seconds)
+    if chunked and not args.dry_run:
+        encode_grid_chunked(ffmpeg, filter_fn, dims, angle_paths, tools, args,
+                            plan, enc_args, out_dir, session_name, out_grid,
+                            source_seconds, progress)
+    else:
+        run(cmd, args.dry_run, what="ffmpeg (grid)", progress=progress,
+            total=grid_seconds)
     stats["grid_s"] = time.monotonic() - t0
     progress.end()
+    verify_grid_output(ffprobe, out_grid, grid_seconds, args.dry_run)
     return out_grid, final_w, final_h
 
 

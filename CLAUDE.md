@@ -20,8 +20,17 @@ scoreboard overlay.
 ## Environment & setup
 - **macOS**, uses Apple VideoToolbox (`h264_videotoolbox`) for hardware encode.
 - Needs **ffmpeg with `drawtext`** → `brew install ffmpeg-full` (Homebrew's plain
-  `ffmpeg` lacks libfreetype). The script auto-detects
-  `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` and falls back to PATH.
+  `ffmpeg` lacks libfreetype). `ffmpeg-full` is a homebrew-core **bottle** now --
+  no tap, no source build, ~40s to install. `find_ffmpeg()` does more than the
+  name suggests and does NOT just probe one hardcoded path: it tries both
+  Homebrew prefixes (`/opt/homebrew` and `/usr/local`) plus `ffmpeg-full` and
+  `ffmpeg` on PATH, and **runs `-filters` on each candidate**, preferring one
+  that actually has `drawtext` rather than trusting the filename. Confirmed by
+  running it for real on an Intel machine, where it picked the right binary
+  with no intervention.
+- **ffmpeg 9.0/9.0.1 silently truncates long encodes** -- see the chunked-grid
+  bullet under Architecture. Nothing about the install avoids it; the grid step
+  works around it.
 - `--map` needs **gopro-overlay in `./.venv`** (Python 3.10+), not committed:
   ```bash
   python3.12 -m venv .venv && ./.venv/bin/python -m pip install gopro-overlay
@@ -576,6 +585,58 @@ scoreboard overlay.
     (system Python, no gopro-overlay installed) can test the derivation math
     directly; `tesla_fsd_overlay.py` unwraps gopro-overlay's `pint` `Quantity`
     values to plain floats before calling into it.
+- **Grid encode is CHUNKED, and that is a workaround for an upstream ffmpeg
+  bug, not a design preference (`encode_grid_chunked`, `grid_chunk_windows`,
+  `_ChunkProgress`):** ffmpeg 9.0/9.0.1 can end a long multi-input
+  `filter_complex` encode EARLY -- the child exits 0, finalizes a valid
+  faststart mp4, and prints nothing even at `-loglevel warning`, so a grid that
+  lost most of the drive is indistinguishable from a clean run. Root cause is
+  upstream commit `03dfac5630` ("fftools/ffmpeg_sched: allow throttling decoder
+  outputs", merged 2026-05-23), which pauses decoder threads outrunning a
+  downstream filtergraph -- exactly this tool's topology, 7 decoders feeding one
+  graph -- and under load mis-signals EOF to one of them. Upstream issues
+  #23988 / #24008 / #24135; reverted in `43284b6`, backported to `release/9.0`
+  in PR #24193 (2026-08-17), but **no 9.0.2 was ever tagged**, so no released
+  build contains the fix, and the known-good alternatives (`ffmpeg@7`,
+  homebrew-core `ffmpeg`) have no `drawtext` -- which the grid needs for tile
+  labels and the burned-in clock. Hence a workaround in this repo rather than a
+  version bump. **There is no flag-level escape**: the throttling is an
+  unconditional scheduler heuristic with no opt-out, so `-thread_queue_size`,
+  `-max_muxing_queue_size`, `-filter_threads` etc. do nothing for it.
+  Sources over `GRID_CHUNK_TRIGGER_SECONDS` (30m) are encoded as
+  `GRID_CHUNK_SECONDS` (20m) passes and joined with `-c copy`. The chunk size
+  is empirical, not arbitrary: a 47m54s source encoded correctly in one pass
+  while every attempt at 1h54m+ truncated, so 20m leaves real margin under that
+  ~48m ceiling. Two things are easy to get wrong and are pinned by tests:
+  (1) the burned-in clock renders OUTPUT pts through `localtime()` and every
+  chunk's pts restarts at zero, so each chunk rebuilds the filter with its own
+  epoch pushed forward by `start / speed` -- without that, every chunk restarts
+  the clock at the session start; (2) `Progress.update()` never lets a fraction
+  go backwards, so feeding it each chunk's raw 0..1 would freeze the bar at the
+  previous chunk's high-water mark -- `_ChunkProgress` maps each chunk onto its
+  own slice first. Chunks are written next to the final grid, NOT in `tmpdir`
+  (tmpdir is on the boot volume; a long session's chunks run to tens of GB), and
+  are deleted only after the join succeeds -- deliberately LEFT on failure so an
+  expensive run can be salvaged. Cost of the workaround is one lossless concat
+  pass (minutes on a 2h render) and roughly DOUBLE peak disk for the grid step,
+  since chunks and the finished grid coexist; `check_space` does not currently
+  account for that. When a fixed ffmpeg finally ships, raising or removing
+  `GRID_CHUNK_TRIGGER_SECONDS` is the whole rollback -- but note nothing detects
+  that automatically, and a `brew upgrade` onto another broken 9.0.x would
+  silently reintroduce the bug.
+- **The grid's own output is verified (`verify_grid_output`,
+  `grid_output_is_short`):** independent of the bug above, the tool used to
+  report a truncated render as a SUCCESS -- STATS printed the short length in
+  its `footage` line as though that were the expected figure, and
+  `playcheck.sh` passed the file happily because it validates a truncated file
+  against its own (short) duration. The grid is now probed after encoding and
+  compared against its own inputs, and a short result `die()`s. Tolerance is
+  PROPORTIONAL (1%), not absolute: per-camera concats legitimately differ by a
+  second or two and that spread grows with clip count, while every real
+  truncation lost 43-71%. Keep this guard even after the ffmpeg bug is gone --
+  it is cheap (one ffprobe) and closes a hole that had nothing to do with the
+  specific bug that exposed it.
+
 - **Progress (`Progress`, stdlib only):** the run is planned up front as a list of
   `Step(kind, label, work)` (`plan_steps`), `work` in footage-seconds. Fractions
   are never timer guesses — ffmpeg is run with `-progress pipe:1 -loglevel error`
@@ -1108,6 +1169,10 @@ scoreboard overlay.
 
 ## Gotchas
 - Never commit footage or rendered outputs.
+- **ffmpeg 9.0/9.0.1 silently truncates long multi-input encodes** (exit 0, no
+  warning, valid file). See the chunked-grid bullet above. If you ever see a
+  render whose STATS `footage` line is far short of the `Plan:` line, that is
+  this bug -- and `playcheck.sh` will NOT catch it.
 - The user personally renames clips they've curated for a final video with
   suffixes like `-START`/`-SKIP`/`-END` (their own convention, not
   something this tool interprets) — `discover_clips()` doesn't try to
