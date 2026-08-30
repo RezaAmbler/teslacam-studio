@@ -20,8 +20,17 @@ scoreboard overlay.
 ## Environment & setup
 - **macOS**, uses Apple VideoToolbox (`h264_videotoolbox`) for hardware encode.
 - Needs **ffmpeg with `drawtext`** → `brew install ffmpeg-full` (Homebrew's plain
-  `ffmpeg` lacks libfreetype). The script auto-detects
-  `/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg` and falls back to PATH.
+  `ffmpeg` lacks libfreetype). `ffmpeg-full` is a homebrew-core **bottle** now --
+  no tap, no source build, ~40s to install. `find_ffmpeg()` does more than the
+  name suggests and does NOT just probe one hardcoded path: it tries both
+  Homebrew prefixes (`/opt/homebrew` and `/usr/local`) plus `ffmpeg-full` and
+  `ffmpeg` on PATH, and **runs `-filters` on each candidate**, preferring one
+  that actually has `drawtext` rather than trusting the filename. Confirmed by
+  running it for real on an Intel machine, where it picked the right binary
+  with no intervention.
+- **ffmpeg 9.0/9.0.1 silently truncates long encodes** -- see the chunked-grid
+  bullet under Architecture. Nothing about the install avoids it; the grid step
+  works around it.
 - `--map` needs **gopro-overlay in `./.venv`** (Python 3.10+), not committed:
   ```bash
   python3.12 -m venv .venv && ./.venv/bin/python -m pip install gopro-overlay

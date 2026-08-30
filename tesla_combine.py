@@ -2830,7 +2830,11 @@ def plan_job(args, tools: Tools, folder: Path, out_dir: Path,
     est_seconds = sample_dur if sample_dur else 60.0 * max(len(s) for s, _, _ in selections.values())
     est = sel_bytes * (min(1.0, est_seconds / (60.0 * max(len(s) for s, _, _ in selections.values())))
                        if sample_dur else 1.0)
-    est += auto_bitrate(est_w, est_h) * est_seconds / 8
+    # Reserves a second copy of the grid when it will be chunk-encoded: the
+    # chunks sit beside the final grid until the join succeeds. Without this the
+    # pre-flight passes and the join dies mid-write on a full disk -- the same
+    # failure mode the hero-tile omission below already caused once.
+    est += grid_space_estimate(est_w, est_h, est_seconds)
     if args.blur_faces:
         # Each blurred per-camera copy lands alongside its concat; libx264 output
         # is usually a bit smaller than the source, so the concats' size is a
@@ -3101,6 +3105,17 @@ class _ChunkProgress:
         if frac is not None:
             frac = self._base + self._span * max(0.0, min(1.0, frac))
         self._progress.update(frac=frac, speed=speed)
+
+
+def grid_space_estimate(width, height, seconds,
+                       chunk_trigger=GRID_CHUNK_TRIGGER_SECONDS):
+    """Bytes to reserve for the grid output, DOUBLED when it will be chunked.
+
+    A chunked encode writes every chunk beside the final grid and only removes
+    them once the join succeeds, so both exist at peak.
+    """
+    grid = auto_bitrate(width, height) * seconds / 8
+    return grid * 2 if seconds > chunk_trigger else grid
 
 
 def grid_chunk_windows(source_seconds, chunk_seconds=GRID_CHUNK_SECONDS):

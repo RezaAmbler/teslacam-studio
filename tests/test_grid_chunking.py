@@ -180,3 +180,27 @@ def test_chunk_durations_sum_to_the_source_length(tmp_path, captured_runs):
     run_chunked(tmp_path, captured_runs, source_seconds=6844.7)
     total = sum(float(c["cmd"][c["cmd"].index("-t") + 1]) for c in captured_runs[:6])
     assert total == pytest.approx(6844.7), "chunks must not lose or duplicate footage"
+
+
+# ------------------------------------------------- pre-flight space estimate
+
+def test_short_session_reserves_one_grid():
+    seconds = 1000.0
+    one = tc.auto_bitrate(3378, 1876) * seconds / 8
+    assert tc.grid_space_estimate(3378, 1876, seconds) == pytest.approx(one)
+
+
+def test_chunked_session_reserves_two_grids():
+    # Chunks coexist with the finished grid until the join completes.
+    seconds = 6844.7
+    one = tc.auto_bitrate(3378, 1876) * seconds / 8
+    assert tc.grid_space_estimate(3378, 1876, seconds) == pytest.approx(2 * one)
+
+
+def test_space_estimate_doubles_exactly_at_the_chunk_trigger():
+    w, h = 3378, 1876
+    below = tc.grid_space_estimate(w, h, tc.GRID_CHUNK_TRIGGER_SECONDS)
+    above = tc.grid_space_estimate(w, h, tc.GRID_CHUNK_TRIGGER_SECONDS + 1)
+    # Same boundary the encoder itself uses, so the reservation can't disagree
+    # with what the run actually does.
+    assert above > below * 1.9
