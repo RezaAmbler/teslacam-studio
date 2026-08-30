@@ -25,9 +25,7 @@ scoreboard overlay.
   name suggests and does NOT just probe one hardcoded path: it tries both
   Homebrew prefixes (`/opt/homebrew` and `/usr/local`) plus `ffmpeg-full` and
   `ffmpeg` on PATH, and **runs `-filters` on each candidate**, preferring one
-  that actually has `drawtext` rather than trusting the filename. Confirmed by
-  running it for real on an Intel machine, where it picked the right binary
-  with no intervention.
+  that actually has `drawtext` rather than trusting the filename.
 - **ffmpeg 9.0/9.0.1 silently truncates long encodes** -- see the chunked-grid
   bullet under Architecture. Nothing about the install avoids it; the grid step
   works around it.
