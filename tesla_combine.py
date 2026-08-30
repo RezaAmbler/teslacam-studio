@@ -3149,7 +3149,8 @@ def encode_grid_chunked(ffmpeg, filter_fn, dims, angle_paths, tools, args, plan,
     n = len(windows)
     log(f"\n== grid is {human_time(source_seconds)} long -- encoding as {n} "
         f"chunks of up to {human_time(GRID_CHUNK_SECONDS)}, then joining "
-        f"losslessly (works around the ffmpeg long-encode truncation bug) ==")
+        f"losslessly (works around ffmpeg's long-encode truncation bug -- "
+        f"upstream #23988, affects 9.0.x) ==")
     chunks = []
     for k, (start, source_span) in enumerate(windows):
         out_seconds = source_span / speed
